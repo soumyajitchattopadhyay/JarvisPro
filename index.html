@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>TESrACT // HUD_OVERRIDE</title>
+    <link href="https://fonts.googleapis.com/css2?family=Syncopate:wght@400;700&family=Michroma&family=Orbitron:wght@400;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; font-family: 'Michroma', sans-serif; }
+        #canvas-container { position: fixed; inset: 0; z-index: 1; }
+        #hud { position: relative; z-index: 10; width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; padding: 40px; box-sizing: border-box; }
+        
+        /* STARK ALERT HUD */
+        #system-alert { position: fixed; inset: 0; z-index: 100; display: none; flex-direction: column; align-items: center; justify-content: center; background: rgba(255, 0, 0, 0.1); border: 20px solid rgba(255, 0, 0, 0.4); animation: alert-pulse 0.5s infinite alternate; }
+        .alert-text { font-family: 'Syncopate'; color: #ff0000; font-size: 3rem; text-shadow: 0 0 20px #ff0000; letter-spacing: 15px; }
+        
+        #title-main { font-family: 'Syncopate'; font-size: 4rem; color: #fff; letter-spacing: 30px; text-align: center; text-transform: uppercase; text-shadow: 0 0 15px #00fbff; transition: 0.5s; }
+        .input-wrapper { pointer-events: auto; display: flex; align-items: center; justify-content: center; gap: 20px; margin-bottom: 20px; }
+        #user-input { background: rgba(0, 0, 0, 0.9); border: 1px solid rgba(0, 251, 255, 0.2); color: #00fbff; padding: 18px; width: 500px; font-family: 'Michroma'; outline: none; text-align: center; }
+        .mic-btn { background: none; border: 1px solid #00fbff; color: #00fbff; width: 60px; height: 60px; border-radius: 50%; cursor: pointer; }
+        .mic-btn.active { border-color: #ff0055; color: #ff0055; box-shadow: 0 0 30px #ff0055; }
+        @keyframes alert-pulse { from { opacity: 0.4; } to { opacity: 1; } }
+    </style>
+</head>
+<body>
+    <div id="system-alert"><div class="alert-text">SYSTEM OVERRIDE</div></div>
+    <div id="canvas-container"></div>
+    <div id="hud">
+        <div style="display:flex; justify-content: space-between;">
+            <div class="ui-text" style="color:#00fbff; font-family:'Orbitron'; font-size:9px; letter-spacing:3px;">LATTICE: <span id="agent-status">ONLINE</span><br>CTRL: <span id="ctrl-mode">RESTRICTED</span></div>
+            <div class="ui-text" id="clock" style="color:#00fbff; font-family:'Orbitron';">00:00:00</div>
+        </div>
+        <div id="title-container"><h1 id="title-main">TESrACT</h1><div id="chat-output" style="color: #00fbff; text-align:center; font-size:12px; margin-top:10px;">SYSTEM_READY</div></div>
+        <div class="input-wrapper"><input type="text" id="user-input" placeholder="ACCESS LATTICE..." autocomplete="off"><button id="mic-btn" class="mic-btn"><i class="fa-solid fa-microphone"></i></button></div>
+    </div>
+
+    <script type="importmap">{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }</script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+        let isThinking = false, isListening = false, lerpFactor = 0, currentCtrl = false;
+        const chatOutput = document.getElementById('chat-output'), sysAlert = document.getElementById('system-alert');
+
+        async function processCommand(text) {
+            isThinking = true; document.getElementById('agent-status').innerText = "THINKING";
+            try {
+                const res = await fetch('/chat', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}) });
+                const data = await res.json();
+                chatOutput.innerText = data.reply;
+
+                // STARK ALERT LOGIC
+                if (data.control_status && (data.reply.includes("Execution") || data.reply.includes("opened"))) {
+                    sysAlert.style.display = 'flex'; setTimeout(() => sysAlert.style.display = 'none', 3000);
+                }
+                if (data.control_status !== currentCtrl) {
+                    currentCtrl = data.control_status;
+                    document.getElementById('ctrl-mode').innerText = currentCtrl ? "ACTIVE" : "RESTRICTED";
+                    document.getElementById('ctrl-mode').style.color = currentCtrl ? "#ff0000" : "#00fbff";
+                }
+            } catch(e) { chatOutput.innerText = "LINK_FAILURE"; }
+            isThinking = false; document.getElementById('agent-status').innerText = "IDLE";
+        }
+
+        // --- HIGH PERFORMANCE ENGINE ---
+        const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(65, window.innerWidth/window.innerHeight, 1, 4000), renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+        renderer.setPixelRatio(1); renderer.setSize(window.innerWidth, window.innerHeight); document.getElementById('canvas-container').appendChild(renderer.domElement);
+        const composer = new EffectComposer(renderer); composer.addPass(new RenderPass(scene, camera)); composer.addPass(new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.6, 0.4, 0.85)); composer.addPass(new OutputPass());
+        const COUNT = 2500, brands = ['openai','google','github','python','tesla','nvidia','react','rust','apple','microsoft'], loader = new THREE.TextureLoader(), texturePool = brands.map(b => loader.load(`https://cdn.simpleicons.org/${b}/00fbff`)), geometry = new THREE.PlaneGeometry(5, 5);
+        const instancedMeshes = texturePool.map(tex => { const im = new THREE.InstancedMesh(geometry, new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0.7, side: THREE.DoubleSide }), Math.ceil(COUNT/texturePool.length)); scene.add(im); return im; });
+        const nodes = []; for(let i=0; i<COUNT; i++) nodes.push({ tunnelX: (Math.random()-0.5)*800, tunnelY: (Math.random()-0.5)*800, tunnelZ: -Math.random()*3000, circleAngle: (i/COUNT)*Math.PI*2, speed: 2+Math.random()*5, meshIndex: i%instancedMeshes.length, instanceIndex: Math.floor(i/instancedMeshes.length) });
+        camera.position.z = 300;
+
+        function animate() {
+            requestAnimationFrame(animate); 
+            lerpFactor = THREE.MathUtils.lerp(lerpFactor, isListening ? 1 : 0, 0.08);
+            nodes.forEach(n => {
+                n.tunnelZ += n.speed * (isThinking ? 10 : 1); if(n.tunnelZ > 300) n.tunnelZ = -2700;
+                const r = 120 + Math.sin(Date.now()*0.002)*10;
+                const pos = new THREE.Vector3(n.tunnelX, n.tunnelY, n.tunnelZ).lerp(new THREE.Vector3(Math.cos(n.circleAngle)*r, Math.sin(n.circleAngle)*r, 50), lerpFactor);
+                const mat = new THREE.Matrix4().setPosition(pos); instancedMeshes[n.meshIndex].setMatrixAt(n.instanceIndex, mat);
+            });
+            instancedMeshes.forEach(im => im.instanceMatrix.needsUpdate = true); composer.render();
+            document.getElementById('clock').innerText = new Date().toLocaleTimeString();
+        }
+        animate();
+
+        document.getElementById('user-input').onkeypress = (e) => { if(e.key === 'Enter') { processCommand(e.target.value); e.target.value = ''; } };
+        const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (Speech) {
+            const rec = new Speech(), micBtn = document.getElementById('mic-btn');
+            micBtn.onclick = () => { isListening = true; rec.start(); micBtn.classList.add('active'); };
+            rec.onresult = (e) => processCommand(e.results[0][0].transcript);
+            rec.onend = () => { isListening = false; micBtn.classList.remove('active'); };
+        }
+    </script>
+</body>
+</html>
