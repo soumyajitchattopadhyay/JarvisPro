@@ -10,6 +10,8 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_groq import ChatGroq 
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 
 # FastAPI imports for deployment
 from fastapi import FastAPI
@@ -91,26 +93,52 @@ workflow.add_edge("reviewer", "agent")
 memory = MemorySaver()
 compiled_graph = workflow.compile(checkpointer=memory)
 
-# --- 5. WEB API ENDPOINT ---
-@app.post("/chat")
-async def chat_endpoint(user_input: str, thread_id: str = "web_001"):
-    # Fix: Explicitly define the dictionary as a RunnableConfig type
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
-    
-    inputs = cast(JProState, {
-        "messages": [HumanMessage(content=user_input)], 
-        "control_allowed": False
-    })
-    
-    final_msg = ""
+# --- 5. WEB API ENDPOINT (Bridged to HUD) ---
+@app.get("/", response_class=HTMLResponse)
+async def serve_hud():
+    """Serves the Stark HUD interface at the root URL."""
     try:
-        # Pass the typed config variable here
-        async for event in compiled_graph.astream(inputs, config=config, stream_mode="values"):
-            if "messages" in event and event["messages"]:
-                final_msg = event["messages"][-1].content
-        return {"reply": final_msg}
+        with open("index.html", "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "<h1>TESrACT HUD Error: index.html not found in root.</h1>"
+
+@app.post("/chat")
+async def chat_endpoint(request: Request):
+    """Processes JSON input from the HUD and returns the brain's response."""
+    try:
+        # 1. Parse JSON body from your HUD
+        data = await request.json()
+        user_text = data.get("text", "")
+        thread_id = data.get("thread_id", "web_user_001")
+
+        # 2. Extract control state for the HUD
+        # We check the memory to see if control is active
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        state = compiled_graph.get_state(config)
+        current_allowed = state.values.get("control_allowed", False)
+
+        # 3. If user is explicitly allowing control in this message:
+        if "allow control" in user_text.lower():
+            current_allowed = True
+
+        inputs = cast(JProState, {
+            "messages": [HumanMessage(content=user_text)], 
+            "control_allowed": current_allowed
+        })
+        
+        # 4. Execute Graph (Using invoke for stable web response)
+        result = compiled_graph.invoke(inputs, config=config)
+        final_reply = result["messages"][-1].content
+        
+        # 5. Return JSON in the exact format your HTML script expects
+        return {
+            "reply": final_reply, 
+            "control_status": current_allowed
+        }
     except Exception as e:
-        return {"error": str(e)}
+        return {"reply": f"LATTICE_ERROR: {str(e)}", "control_status": False}
+    
 # --- 6. LOCAL VOICE LOOP (Untouched) ---
 def main_loop():
     if speak: speak("TESrACT system online.", wait_for_speech=True)
