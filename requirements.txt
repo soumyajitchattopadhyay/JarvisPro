@@ -7,10 +7,11 @@ langgraph-checkpoint==3.0.1
 langchain-groq==1.1.1
 langchain-core==1.2.6
 langchain-experimental==0.4.1
+duckduckgo-search==7.3.2
+langchain-community==0.3.18
 python-dotenv==1.2.1
 groq==0.37.1
 httpx==0.28.1
 pydantic==2.12.5
 pydantic-settings==2.12.0
 typing_extensions==4.15.0
-
