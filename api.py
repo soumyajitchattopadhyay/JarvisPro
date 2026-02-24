@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig # Added for type safety
 from fastapi.responses import HTMLResponse
 import uvicorn
 import json
@@ -10,14 +11,13 @@ import threading
 import time
 import traceback
 
-# 1. IMPORT THE COMPILED GRAPH, NOT THE FASTAPI APP
+# 1. IMPORT THE CORRECTED NAME
 try:
-    from main import compiled_app as langgraph_graph 
+    from main import compiled_graph as langgraph_graph 
 except ImportError as e:
-    print(f"CRITICAL: Could not import 'compiled_app' from main.py. \nError: {e}")
+    print(f"CRITICAL: Could not import 'compiled_graph' from main.py. \nError: {e}")
     exit(1)
 
-# Safely import speak
 try:
     from speak import speak 
 except ImportError:
@@ -65,16 +65,17 @@ async def chat_endpoint(request: Request):
 
         current_allowed = get_permission()
         
-        # 2. CALL THE GRAPH CORRECTLY
-        # langgraph_graph is the compiled StateGraph from main.py
+        # FIX: Define the config strictly as a RunnableConfig to satisfy LangGraph
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        
+        # 2. CALL THE GRAPH
         result = langgraph_graph.invoke(
             {"messages": [HumanMessage(content=user_text)], "control_allowed": current_allowed}, 
-            config={"configurable": {"thread_id": thread_id}}
+            config=config
         )
         
         final_reply = result["messages"][-1].content
         
-        # Call speak in background if available
         if speak:
             threading.Thread(target=speak, args=(final_reply, False), daemon=True).start()
         
@@ -89,7 +90,5 @@ def launch_tesseract():
     webbrowser.open("http://127.0.0.1:8000")
 
 if __name__ == "__main__":
-    # Start the browser auto-launcher
     threading.Thread(target=launch_tesseract, daemon=True).start()
-    # Run the server
     uvicorn.run(server, host="0.0.0.0", port=8000)
