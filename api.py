@@ -10,14 +10,18 @@ import threading
 import time
 import traceback
 
-# Ensure main is imported carefully
+# 1. IMPORT THE COMPILED GRAPH, NOT THE FASTAPI APP
 try:
-    from main import app as langgraph_app 
+    from main import compiled_app as langgraph_graph 
 except ImportError as e:
-    print(f"CRITICAL: Could not import 'app' from main.py. Check for syntax errors in main.py. \nError: {e}")
+    print(f"CRITICAL: Could not import 'compiled_app' from main.py. \nError: {e}")
     exit(1)
 
-from speak import speak 
+# Safely import speak
+try:
+    from speak import speak 
+except ImportError:
+    speak = None
 
 server = FastAPI(title="TESrACT Core")
 server.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -43,44 +47,39 @@ def set_permission(status: bool, thread_id="web_user_001"):
 @server.get("/", response_class=HTMLResponse)
 async def serve_interface():
     try:
-        # Uses absolute path to ensure the file is found
         base_path = os.path.dirname(__file__)
         with open(os.path.join(base_path, "index.html"), "r") as f: 
             return f.read()
     except FileNotFoundError:
-        return HTMLResponse(content="<h1>Error: index.html not found in script directory.</h1>", status_code=404)
+        return HTMLResponse(content="<h1>Error: index.html not found.</h1>", status_code=404)
 
 @server.post("/chat")
 async def chat_endpoint(request: Request):
     try:
         data = await request.json()
-        user_text = data.get("text", "").lower()
+        user_text = data.get("text", "")
         thread_id = "web_user_001"
 
-        if "allow control" in user_text: set_permission(True)
-        elif "stop control" in user_text: set_permission(False)
+        if "allow control" in user_text.lower(): set_permission(True)
+        elif "stop control" in user_text.lower(): set_permission(False)
 
         current_allowed = get_permission()
         
-        # NOTE: Using a threadpool for the sync 'invoke' call prevents blocking the API
-        def run_graph():
-            return langgraph_app.invoke(
-                {"messages": [HumanMessage(content=user_text)], "control_allowed": current_allowed}, 
-                config={"configurable": {"thread_id": thread_id}}
-            )
-
-        # In a real production app, use anyio.to_thread.run_sync
-        # For this setup, we call it directly but we've wrapped the error handling
-        result = run_graph()
+        # 2. CALL THE GRAPH CORRECTLY
+        # langgraph_graph is the compiled StateGraph from main.py
+        result = langgraph_graph.invoke(
+            {"messages": [HumanMessage(content=user_text)], "control_allowed": current_allowed}, 
+            config={"configurable": {"thread_id": thread_id}}
+        )
         
         final_reply = result["messages"][-1].content
         
-        # Call speak in a background thread so the API returns immediately
-        threading.Thread(target=speak, args=(final_reply, False), daemon=True).start()
+        # Call speak in background if available
+        if speak:
+            threading.Thread(target=speak, args=(final_reply, False), daemon=True).start()
         
         return {"reply": final_reply, "control_status": current_allowed}
     except Exception as e:
-        # Prints the full error to your console so you can see what actually failed
         print("--- API ERROR TRACEBACK ---")
         traceback.print_exc()
         return {"reply": f"Logic Error: {str(e)}"}
@@ -90,8 +89,7 @@ def launch_tesseract():
     webbrowser.open("http://127.0.0.1:8000")
 
 if __name__ == "__main__":
-    if not os.getenv("GROQ_API_KEY"):
-        print("WARNING: GROQ_API_KEY is not set. The AI will not respond.")
-    
+    # Start the browser auto-launcher
     threading.Thread(target=launch_tesseract, daemon=True).start()
+    # Run the server
     uvicorn.run(server, host="0.0.0.0", port=8000)
