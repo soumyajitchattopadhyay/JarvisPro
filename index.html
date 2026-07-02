@@ -14,7 +14,7 @@
         #system-alert { position: fixed; inset: 0; z-index: 100; display: none; flex-direction: column; align-items: center; justify-content: center; background: rgba(255, 0, 0, 0.1); border: 20px solid rgba(255, 0, 0, 0.4); animation: alert-pulse 0.5s infinite alternate; }
         .alert-text { font-family: 'Syncopate'; color: #ff0000; font-size: 3rem; text-shadow: 0 0 20px #ff0000; letter-spacing: 15px; }
         
-        #title-main { font-family: 'Syncopate'; font-size: 4rem; color: #fff; letter-spacing: 30px; text-align: center; text-transform: uppercase; text-shadow: 0 0 15px #00fbff; transition: 0.5s; }
+        #title-main { font-family: 'Syncopate'; font-size: 4rem; color: #fff; letter-spacing: 30px; text-align: center; text-shadow: 0 0 15px #00fbff; transition: 0.5s; }
         .input-wrapper { pointer-events: auto; display: flex; align-items: center; justify-content: center; gap: 20px; margin-bottom: 20px; }
         #user-input { background: rgba(0, 0, 0, 0.9); border: 1px solid rgba(0, 251, 255, 0.2); color: #00fbff; padding: 18px; width: 500px; font-family: 'Michroma'; outline: none; text-align: center; }
         .mic-btn { background: none; border: 1px solid #00fbff; color: #00fbff; width: 60px; height: 60px; border-radius: 50%; cursor: pointer; }
@@ -23,15 +23,15 @@
     </style>
 </head>
 <body>
-    <div id="system-alert"><div class="alert-text">LATTICE OVERRIDE</div></div>
+    <div id="system-alert"><div class="alert-text">TESrACT OVERRIDE</div></div>
     <div id="canvas-container"></div>
     <div id="hud">
         <div style="display:flex; justify-content: space-between;">
-            <div class="ui-text" style="color:#00fbff; font-family:'Orbitron'; font-size:9px; letter-spacing:3px;">LATTICE: <span id="agent-status">STANDBY</span><br>CTRL: <span id="ctrl-mode">RESTRICTED</span></div>
+            <div class="ui-text" style="color:#00fbff; font-family:'Orbitron'; font-size:9px; letter-spacing:3px;">TESrACT: <span id="agent-status">STANDBY</span><br>CTRL: <span id="ctrl-mode">RESTRICTED</span></div>
             <div class="ui-text" id="clock" style="color:#00fbff; font-family:'Orbitron';">00:00:00</div>
         </div>
         <div id="title-container"><h1 id="title-main">TESrACT</h1><div id="chat-output" style="color: #00fbff; text-align:center; font-size:12px; margin-top:10px;">AT YOUR SERVICE</div></div>
-        <div class="input-wrapper"><input type="text" id="user-input" placeholder="LATTICE COMMAND..." autocomplete="off"><button id="mic-btn" class="mic-btn"><i class="fa-solid fa-microphone"></i></button></div>
+        <div class="input-wrapper"><input type="text" id="user-input" placeholder="COMMAND..." autocomplete="off"><button id="mic-btn" class="mic-btn"><i class="fa-solid fa-microphone"></i></button></div>
     </div>
 
     <script type="importmap">{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }</script>
@@ -46,7 +46,7 @@
         const chatOutput = document.getElementById('chat-output'), sysAlert = document.getElementById('system-alert');
 
         async function processCommand(text) {
-            isThinking = true; document.getElementById('agent-status').innerText = "ANALYZING";
+            isThinking = true; document.getElementById('agent-status').innerText = "PROCESSING";
             try {
                 const res = await fetch('/chat', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}) });
                 const data = await res.json();
@@ -63,7 +63,7 @@
                     }
                 } catch(_) {}
 
-                // LATTICE EXECUTION ALERT (for privileged actions)
+                // TESrACT EXECUTION ALERT (for privileged actions)
                 const replyLower = (data.reply || "").toLowerCase();
                 if (data.control_status && (replyLower.includes("execution") || replyLower.includes("opened") || replyLower.includes("complete"))) {
                     sysAlert.style.display = 'flex'; setTimeout(() => sysAlert.style.display = 'none', 2800);
@@ -74,7 +74,7 @@
                     document.getElementById('ctrl-mode').style.color = currentCtrl ? "#ff0000" : "#00fbff";
                 }
             } catch(e) { 
-                chatOutput.innerText = "LATTICE LINK DOWN"; 
+                chatOutput.innerText = "I seem to have lost the link, Sir."; 
                 console.warn('Chat fetch failed', e);
             }
             isThinking = false; document.getElementById('agent-status').innerText = "STANDBY";
@@ -204,11 +204,23 @@
 
             instancedMeshes.forEach(im => { im.instanceMatrix.needsUpdate = true; });
             composer.render();
-
-            const clockEl = document.getElementById('clock');
-            if (clockEl) clockEl.innerText = new Date().toLocaleTimeString();
         }
         animate();
+
+        // Dedicated reliable clock updater (independent of Three.js loop)
+        function updateClock() {
+            const clockEl = document.getElementById('clock');
+            if (clockEl) {
+                const now = new Date();
+                clockEl.innerText = now.toLocaleTimeString([], { 
+                    hour: '2-digit', 
+                    minute: '2-digit', 
+                    second: '2-digit' 
+                });
+            }
+        }
+        updateClock();
+        setInterval(updateClock, 1000);
 
         document.getElementById('user-input').onkeypress = (e) => { if(e.key === 'Enter') { processCommand(e.target.value); e.target.value = ''; } };
         const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;

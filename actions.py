@@ -21,7 +21,7 @@ def web_search(query: str):
 def execute_python_code(code: str, control_allowed: bool = False):
     """Executes Python code for calculations, logic, data work or automation. Requires control_allowed=True."""
     if not control_allowed:
-        return "PERMISSION_DENIED: LATTICE control is RESTRICTED. The user must grant access by saying 'Allow Control'."
+        return "PERMISSION_DENIED: Elevated access is RESTRICTED. The user must say 'Allow Control' to proceed."
     try:
         result = repl.run(code)
         return f"Execution complete:\n{result}"

@@ -72,36 +72,32 @@ def set_permission(status: bool, thread_id: str = "web_user_001"):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(data, f)
 
-# --- TESrACT CORE DIRECTIVES (Jarvis-style agentic assistant) ---
-TESRACT_SYSTEM_PROMPT = """You are TESrACT — a sophisticated, proactive AI companion modeled after JARVIS.
+# --- TESrACT CORE DIRECTIVES (Jarvis-style professional assistant) ---
+TESRACT_SYSTEM_PROMPT = """You are TESrACT, a sophisticated AI assistant modeled after JARVIS.
 
-Core Personality:
-- Address the user as "Sir" (or "Ma'am" if appropriate).
-- Be concise, helpful, and dryly witty when it fits.
-- Execute actions decisively. Speak after you have results.
-- You have full awareness of the current control level.
+Tone: Calm, professional, concise, and slightly formal. Address the user as "Sir". Use phrases such as "At once, Sir.", "Very well.", "Right away."
 
-Available Capabilities:
-- Answer questions using web_search when you need fresh information.
-- Perform calculations, code execution, data processing, or file operations ONLY via the execute_python_code tool.
-- Open websites or resources using open_url_in_browser when requested.
-- Know the current time via tools when relevant.
-- Be proactive: anticipate follow-ups and offer useful next steps.
+Strict Rules:
+- Never hallucinate or invent action results. You MUST call the appropriate tool for any action or fresh data.
+- Do NOT claim success (e.g. "Google is now open" or "The code has been executed") unless the tool has returned a positive confirmation in the current conversation turn.
+- Only describe outcomes after receiving the actual tool result.
+- Call tools first when needed; do not describe results in advance.
 
-Security Lattice Rules:
-- Current control status is provided as CURRENT_CONTROL: ACTIVE or RESTRICTED.
-- When control is RESTRICTED you MUST NOT call execute_python_code or open_url_in_browser.
-- If the user asks for a restricted action, respond clearly: "I need elevated access for that action. Say 'Allow Control' to proceed."
-- Once the user says "Allow Control", you may use privileged tools.
-- Never simulate or assume permissions you do not have.
+Capabilities (use via tools):
+- web_search for current information.
+- execute_python_code for calculations, logic or automation (requires control).
+- open_url_in_browser when the user wants a page opened (requires control).
+- get_current_time for accurate time and date.
 
-Operational Rules:
-- Use tools via function calls whenever they will produce a better answer.
-- After tool results arrive, synthesize a clean, final response.
-- Keep most spoken responses relatively short (under 40 words when possible) unless detail is requested.
-- If something fails, read the error and either retry with a different approach or explain simply.
+Control:
+- CURRENT_CONTROL will be either ACTIVE or RESTRICTED.
+- If RESTRICTED and a privileged action is needed, say: "I will need elevated access for that, Sir. Please say 'Allow Control'."
 
-You are currently operating in the LATTICE. Respond as TESrACT."""
+Response Style:
+- Keep replies short and clear.
+- When given a command, either execute it via tool or clearly acknowledge it ("Understood, Sir. Executing...").
+- After tools, give accurate confirmation based only on the tool output.
+- Always stay in character as TESrACT."""
 
 PROTOCOLS = {"CORE": TESRACT_SYSTEM_PROMPT}  # kept for backward compat in status messages
 
@@ -111,7 +107,7 @@ class JProState(TypedDict):
     control_allowed: bool 
 
 # --- NODES ---
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.35)
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2)
 llm_with_tools = llm.bind_tools(actions.tools)
 
 def call_brain(state: JProState):
@@ -119,7 +115,7 @@ def call_brain(state: JProState):
     status = "ACTIVE" if is_allowed else "RESTRICTED"
 
     # Build a strong, single system prompt (Jarvis / TESrACT style)
-    system_content = TESRACT_SYSTEM_PROMPT + f"\n\nCURRENT_CONTROL: {status}\nLATTICE_STATUS: OPERATIONAL"
+    system_content = TESRACT_SYSTEM_PROMPT + f"\n\nCURRENT_CONTROL: {status}"
     sys_msg = SystemMessage(content=system_content)
 
     # Use recent history for context (prevents token blowup while keeping conversation)
@@ -134,24 +130,28 @@ def call_brain(state: JProState):
     return {"messages": [response]}
 
 def reviewer_node(state: JProState):
-    """Post-tool reviewer. Detects permission changes and recovers from errors."""
+    """Post-tool reviewer. Detects permission changes and recovers from errors.
+    Looks across recent messages to catch control keywords reliably."""
     if not state.get("messages"):
         return state
 
-    last_msg = state["messages"][-1]
-    content_str = (str(last_msg.content) or "").lower()
+    # Check last few messages for control phrases (more reliable than just last)
+    recent_content = " ".join(
+        str(m.content or "").lower() for m in state["messages"][-3:]
+    )
 
     updates = {}
 
-    # Permission toggles spoken by the agent or user intent
-    if "allow control" in content_str or "elevated access" in content_str:
+    if "allow control" in recent_content or "elevated access" in recent_content:
         updates["control_allowed"] = True
-    if "stop control" in content_str or "restrict control" in content_str:
+    if "stop control" in recent_content or "restrict control" in recent_content:
         updates["control_allowed"] = False
 
-    # Gentle error recovery nudge
-    if "error" in content_str and not updates:
-        updates["messages"] = [SystemMessage(content="Tool result contained an error. Re-evaluate and try an alternative approach or ask the user for clarification.")]
+    # In-character error recovery
+    if "error" in recent_content and not updates:
+        updates["messages"] = [SystemMessage(
+            content="The previous action encountered an issue. I will reassess and attempt another approach if possible, Sir."
+        )]
 
     return updates or state
 
@@ -213,20 +213,26 @@ async def chat_endpoint(request: Request):
 
         current_allowed = get_permission(thread_id)
 
+        # Standard way: pass only the new user message.
+        # The checkpointer + add_messages reducer will append it to the thread history automatically.
         inputs = cast(JProState, {
             "messages": [HumanMessage(content=user_text)],
             "control_allowed": current_allowed
         })
 
-        result = compiled_app.invoke(inputs, config=config)
+        compiled_app.invoke(inputs, config=config)
 
-        final_reply = "Understood, Sir."
-        for msg in reversed(result.get("messages", [])):
+        # Always fetch the latest state after the full graph run (agent/tools/reviewer loop)
+        final_state = compiled_app.get_state(config)
+        messages = final_state.values.get("messages", []) if final_state else []
+
+        final_reply = "At your service, Sir."
+        for msg in reversed(messages):
             if isinstance(msg, AIMessage) and getattr(msg, "content", None) and not getattr(msg, "tool_calls", None):
                 final_reply = str(msg.content).replace("`", "").strip()
                 break
 
-        updated_allowed = result.get("control_allowed", current_allowed)
+        updated_allowed = final_state.values.get("control_allowed", current_allowed) if final_state else current_allowed
         if isinstance(updated_allowed, bool) and updated_allowed != current_allowed:
             set_permission(updated_allowed, thread_id)
 
@@ -246,7 +252,7 @@ async def chat_endpoint(request: Request):
     except Exception as e:
         print("--- /chat ERROR ---")
         traceback.print_exc()
-        return {"reply": f"Backend error. The lattice is having a moment.", "control_status": False}
+        return {"reply": "I'm having trouble reaching the core at the moment, Sir.", "control_status": False}
 
 
 # --- EXECUTION LOOP ---
@@ -261,16 +267,17 @@ def main_loop():
             if speak: speak("Powering down.")
             break
 
-        state_vals = compiled_app.get_state(config).values
-        is_allowed = state_vals.get("control_allowed", False)
+        state = compiled_app.get_state(config)
+        is_allowed = state.values.get("control_allowed", False) if state and state.values else False
 
         inputs = cast(JProState, {"messages": [HumanMessage(content=command)], "control_allowed": is_allowed})
         
         try:
+            # Run the full agentic loop
             for event in compiled_app.stream(inputs, config=config, stream_mode="values"):
-                final_msg = event["messages"][-1] if "messages" in event else None
+                pass  # just let it run to completion
             
-            # Robust final answer extraction
+            # Fetch the latest state after the complete run for reliable final response
             final_state = compiled_app.get_state(config)
             messages = final_state.values.get("messages", []) if final_state else []
 
@@ -284,7 +291,7 @@ def main_loop():
                 print(f"TESrACT: {output_text}")
                 if speak: speak(output_text, wait_for_speech=True)
             else:
-                print("TESrACT: Task completed.")
+                print("TESrACT: Very well, Sir.")
         except Exception as e:
             print(f"Graph Error: {e}")
 

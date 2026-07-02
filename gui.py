@@ -14,7 +14,7 @@ class TESrACTUI(ctk.CTk):
         ctk.set_appearance_mode("dark")
         self.attributes("-topmost", True) 
 
-        self.status_label = ctk.CTkLabel(self, text="TESrACT • LATTICE", font=("Orbitron", 22, "bold"), text_color="#00FFCC")
+        self.status_label = ctk.CTkLabel(self, text="TESrACT • ONLINE", font=("Orbitron", 22, "bold"), text_color="#00FFCC")
         self.status_label.pack(pady=40)
 
         self.log_box = ctk.CTkTextbox(self, width=550, height=550, corner_radius=15, font=("Consolas", 13))
@@ -43,7 +43,7 @@ class TESrACTUI(ctk.CTk):
                 self.update_log(command, tag="USER")
                 self.set_status("ANALYZING...", "#FFFF00")
                 try:
-                    # Simple control sync for the desktop GUI (full lattice in web version)
+                    # Simple control sync for the desktop GUI (full privileges handled in main web flow)
                     current_state = graph.get_state({"configurable": {"thread_id": "gui_session"}})
                     ctrl = current_state.values.get("control_allowed", False) if current_state else False
                     result = graph.invoke({
