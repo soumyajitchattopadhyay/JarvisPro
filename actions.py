@@ -9,7 +9,7 @@ repl = PythonREPL()
 
 @tool
 def web_search(query: str):
-    """Search for information without opening a browser window."""
+    """Search the web for current information, facts, or news."""
     try:
         with DDGS() as ddgs:
             results = ddgs.text(query, max_results=3, backend="lite")
@@ -19,14 +19,14 @@ def web_search(query: str):
 
 @tool
 def execute_python_code(code: str, control_allowed: bool = False):
-    """Executes Python code. Requires 'control_allowed=True'."""
+    """Executes Python code for calculations, logic, data work or automation. Requires control_allowed=True."""
     if not control_allowed:
-        return "PERMISSION_DENIED: System control is RESTRICTED. Please ask the user for 'Allow Control'."
+        return "PERMISSION_DENIED: LATTICE control is RESTRICTED. The user must grant access by saying 'Allow Control'."
     try:
         result = repl.run(code)
-        return f"Execution Result:\n{result}"
+        return f"Execution complete:\n{result}"
     except Exception as e:
-        return f"Execution Error: {str(e)}"
+        return f"Execution failed: {str(e)}"
 
 @tool
 def open_url_in_browser(url: str, control_allowed: bool = False):
@@ -36,4 +36,12 @@ def open_url_in_browser(url: str, control_allowed: bool = False):
     webbrowser.open(url)
     return f"Browser opened to {url}."
 
-tools = [execute_python_code, web_search, open_url_in_browser]
+
+@tool
+def get_current_time() -> str:
+    """Returns the current local date and time. Use this when the user asks about time, date, or 'what day is it'."""
+    now = datetime.datetime.now()
+    return now.strftime("It is %A, %B %d %Y, %I:%M %p.")
+
+
+tools = [web_search, execute_python_code, open_url_in_browser, get_current_time]

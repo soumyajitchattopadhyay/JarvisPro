@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: tesract-hud
+    env: python
+    region: oregon   # change if you prefer another
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: GROQ_API_KEY
+        description: "Your Groq API key (required for the agent brain)"
+        sync: false
+      # Optional: if you have a different Colab/ngrok speak endpoint for server TTS
+      # - key: SPEAK_COLAB_URL
+      #   sync: false
+    healthCheckPath: /health

@@ -23,15 +23,15 @@
     </style>
 </head>
 <body>
-    <div id="system-alert"><div class="alert-text">SYSTEM OVERRIDE</div></div>
+    <div id="system-alert"><div class="alert-text">LATTICE OVERRIDE</div></div>
     <div id="canvas-container"></div>
     <div id="hud">
         <div style="display:flex; justify-content: space-between;">
-            <div class="ui-text" style="color:#00fbff; font-family:'Orbitron'; font-size:9px; letter-spacing:3px;">LATTICE: <span id="agent-status">ONLINE</span><br>CTRL: <span id="ctrl-mode">RESTRICTED</span></div>
+            <div class="ui-text" style="color:#00fbff; font-family:'Orbitron'; font-size:9px; letter-spacing:3px;">LATTICE: <span id="agent-status">STANDBY</span><br>CTRL: <span id="ctrl-mode">RESTRICTED</span></div>
             <div class="ui-text" id="clock" style="color:#00fbff; font-family:'Orbitron';">00:00:00</div>
         </div>
-        <div id="title-container"><h1 id="title-main">TESrACT</h1><div id="chat-output" style="color: #00fbff; text-align:center; font-size:12px; margin-top:10px;">SYSTEM_READY</div></div>
-        <div class="input-wrapper"><input type="text" id="user-input" placeholder="ACCESS LATTICE..." autocomplete="off"><button id="mic-btn" class="mic-btn"><i class="fa-solid fa-microphone"></i></button></div>
+        <div id="title-container"><h1 id="title-main">TESrACT</h1><div id="chat-output" style="color: #00fbff; text-align:center; font-size:12px; margin-top:10px;">AT YOUR SERVICE</div></div>
+        <div class="input-wrapper"><input type="text" id="user-input" placeholder="LATTICE COMMAND..." autocomplete="off"><button id="mic-btn" class="mic-btn"><i class="fa-solid fa-microphone"></i></button></div>
     </div>
 
     <script type="importmap">{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }</script>
@@ -46,45 +46,167 @@
         const chatOutput = document.getElementById('chat-output'), sysAlert = document.getElementById('system-alert');
 
         async function processCommand(text) {
-            isThinking = true; document.getElementById('agent-status').innerText = "THINKING";
+            isThinking = true; document.getElementById('agent-status').innerText = "ANALYZING";
             try {
                 const res = await fetch('/chat', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}) });
                 const data = await res.json();
                 chatOutput.innerText = data.reply;
 
-                // STARK ALERT LOGIC
-                if (data.control_status && (data.reply.includes("Execution") || data.reply.includes("opened"))) {
-                    sysAlert.style.display = 'flex'; setTimeout(() => sysAlert.style.display = 'none', 3000);
+                // Browser TTS for web deployment (no server audio needed)
+                try {
+                    if (window.speechSynthesis && data.reply) {
+                        window.speechSynthesis.cancel();
+                        const utter = new SpeechSynthesisUtterance(data.reply);
+                        utter.rate = 1.05;
+                        utter.pitch = 1.0;
+                        window.speechSynthesis.speak(utter);
+                    }
+                } catch(_) {}
+
+                // LATTICE EXECUTION ALERT (for privileged actions)
+                const replyLower = (data.reply || "").toLowerCase();
+                if (data.control_status && (replyLower.includes("execution") || replyLower.includes("opened") || replyLower.includes("complete"))) {
+                    sysAlert.style.display = 'flex'; setTimeout(() => sysAlert.style.display = 'none', 2800);
                 }
                 if (data.control_status !== currentCtrl) {
                     currentCtrl = data.control_status;
-                    document.getElementById('ctrl-mode').innerText = currentCtrl ? "ACTIVE" : "RESTRICTED";
+                    document.getElementById('ctrl-mode').innerText = currentCtrl ? "ELEVATED" : "RESTRICTED";
                     document.getElementById('ctrl-mode').style.color = currentCtrl ? "#ff0000" : "#00fbff";
                 }
-            } catch(e) { chatOutput.innerText = "LINK_FAILURE"; }
-            isThinking = false; document.getElementById('agent-status').innerText = "IDLE";
+            } catch(e) { 
+                chatOutput.innerText = "LATTICE LINK DOWN"; 
+                console.warn('Chat fetch failed', e);
+            }
+            isThinking = false; document.getElementById('agent-status').innerText = "STANDBY";
         }
 
-        // --- HIGH PERFORMANCE ENGINE ---
-        const scene = new THREE.Scene(), camera = new THREE.PerspectiveCamera(65, window.innerWidth/window.innerHeight, 1, 4000), renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
-        renderer.setPixelRatio(1); renderer.setSize(window.innerWidth, window.innerHeight); document.getElementById('canvas-container').appendChild(renderer.domElement);
-        const composer = new EffectComposer(renderer); composer.addPass(new RenderPass(scene, camera)); composer.addPass(new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.6, 0.4, 0.85)); composer.addPass(new OutputPass());
-        const COUNT = 2500, brands = ['openai','google','github','python','tesla','nvidia','react','rust','apple','microsoft'], loader = new THREE.TextureLoader(), texturePool = brands.map(b => loader.load(`https://cdn.simpleicons.org/${b}/00fbff`)), geometry = new THREE.PlaneGeometry(5, 5);
-        const instancedMeshes = texturePool.map(tex => { const im = new THREE.InstancedMesh(geometry, new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0.7, side: THREE.DoubleSide }), Math.ceil(COUNT/texturePool.length)); scene.add(im); return im; });
-        const nodes = []; for(let i=0; i<COUNT; i++) nodes.push({ tunnelX: (Math.random()-0.5)*800, tunnelY: (Math.random()-0.5)*800, tunnelZ: -Math.random()*3000, circleAngle: (i/COUNT)*Math.PI*2, speed: 2+Math.random()*5, meshIndex: i%instancedMeshes.length, instanceIndex: Math.floor(i/instancedMeshes.length) });
-        camera.position.z = 300;
+        // --- HIGH PERFORMANCE THREE.JS ENGINE (Render-safe) ---
+        const canvasContainer = document.getElementById('canvas-container');
+        let renderer, composer, scene, camera;
+        let instancedMeshes = [];
+        const nodes = [];
+        const COUNT = 2500;
+        const brands = ['openai','google','github','python','tesla','nvidia','react','rust','apple','microsoft'];
+
+        function initThree() {
+            try {
+                scene = new THREE.Scene();
+                camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 1, 4000);
+                renderer = new THREE.WebGLRenderer({ 
+                    antialias: false, 
+                    powerPreference: "high-performance",
+                    alpha: true 
+                });
+                renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // cap for perf
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                canvasContainer.appendChild(renderer.domElement);
+
+                composer = new EffectComposer(renderer);
+                composer.addPass(new RenderPass(scene, camera));
+                window.__bloomPass = new UnrealBloomPass(
+                    new THREE.Vector2(window.innerWidth, window.innerHeight), 
+                    0.65, 0.55, 0.8
+                );
+                composer.addPass(window.__bloomPass);
+                composer.addPass(new OutputPass());
+
+                // Texture loading with graceful fallback
+                const loader = new THREE.TextureLoader();
+                const fallbackMaterial = new THREE.MeshBasicMaterial({ 
+                    color: 0x00fbff, 
+                    transparent: true, 
+                    opacity: 0.65 
+                });
+
+                const geometry = new THREE.PlaneGeometry(5, 5);
+                const perMeshCount = Math.ceil(COUNT / brands.length);
+
+                instancedMeshes = brands.map((brand) => {
+                    const mat = new THREE.MeshBasicMaterial({ 
+                        color: 0x00fbff, 
+                        transparent: true, 
+                        opacity: 0.65,
+                        side: THREE.DoubleSide 
+                    });
+
+                    const im = new THREE.InstancedMesh(geometry, mat, perMeshCount);
+                    scene.add(im);
+
+                    // Try loading icon texture (non-blocking)
+                    loader.load(
+                        `https://cdn.simpleicons.org/${brand}/00fbff`,
+                        (tex) => {
+                            tex.flipY = false;
+                            im.material.map = tex;
+                            im.material.needsUpdate = true;
+                        },
+                        undefined,
+                        () => {
+                            // fallback already applied
+                            im.material.color.setHex(0x00fbff);
+                        }
+                    );
+                    return im;
+                });
+
+                // Initialize node data
+                for (let i = 0; i < COUNT; i++) {
+                    nodes.push({
+                        tunnelX: (Math.random() - 0.5) * 800,
+                        tunnelY: (Math.random() - 0.5) * 800,
+                        tunnelZ: -Math.random() * 3000,
+                        circleAngle: (i / COUNT) * Math.PI * 2,
+                        speed: 2 + Math.random() * 5,
+                        meshIndex: i % instancedMeshes.length,
+                        instanceIndex: Math.floor(i / instancedMeshes.length)
+                    });
+                }
+                camera.position.z = 300;
+
+                // Handle window resize (critical for deployment)
+                function onResize() {
+                    camera.aspect = window.innerWidth / window.innerHeight;
+                    camera.updateProjectionMatrix();
+                    renderer.setSize(window.innerWidth, window.innerHeight);
+                    if (composer && window.__bloomPass) {
+                        window.__bloomPass.resolution.set(window.innerWidth, window.innerHeight);
+                    }
+                }
+                window.addEventListener('resize', onResize, false);
+
+                return true;
+            } catch (err) {
+                console.error('Three.js init failed:', err);
+                canvasContainer.innerHTML = '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#f55;font-family:monospace;font-size:12px;opacity:0.6;">WEBGL_UNAVAILABLE — HUD DEGRADED</div>';
+                return false;
+            }
+        }
+
+        const threeReady = initThree();
 
         function animate() {
-            requestAnimationFrame(animate); 
+            requestAnimationFrame(animate);
+            if (!threeReady || !renderer || !composer) return;
+
             lerpFactor = THREE.MathUtils.lerp(lerpFactor, isListening ? 1 : 0, 0.08);
+
             nodes.forEach(n => {
-                n.tunnelZ += n.speed * (isThinking ? 10 : 1); if(n.tunnelZ > 300) n.tunnelZ = -2700;
-                const r = 120 + Math.sin(Date.now()*0.002)*10;
-                const pos = new THREE.Vector3(n.tunnelX, n.tunnelY, n.tunnelZ).lerp(new THREE.Vector3(Math.cos(n.circleAngle)*r, Math.sin(n.circleAngle)*r, 50), lerpFactor);
-                const mat = new THREE.Matrix4().setPosition(pos); instancedMeshes[n.meshIndex].setMatrixAt(n.instanceIndex, mat);
+                n.tunnelZ += n.speed * (isThinking ? 10 : 1);
+                if (n.tunnelZ > 300) n.tunnelZ = -2700;
+
+                const r = 120 + Math.sin(Date.now() * 0.002) * 10;
+                const pos = new THREE.Vector3(n.tunnelX, n.tunnelY, n.tunnelZ)
+                    .lerp(new THREE.Vector3(Math.cos(n.circleAngle) * r, Math.sin(n.circleAngle) * r, 50), lerpFactor);
+
+                const mat = new THREE.Matrix4().setPosition(pos);
+                instancedMeshes[n.meshIndex].setMatrixAt(n.instanceIndex, mat);
             });
-            instancedMeshes.forEach(im => im.instanceMatrix.needsUpdate = true); composer.render();
-            document.getElementById('clock').innerText = new Date().toLocaleTimeString();
+
+            instancedMeshes.forEach(im => { im.instanceMatrix.needsUpdate = true; });
+            composer.render();
+
+            const clockEl = document.getElementById('clock');
+            if (clockEl) clockEl.innerText = new Date().toLocaleTimeString();
         }
         animate();
 
