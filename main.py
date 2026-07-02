@@ -4,6 +4,9 @@ import json
 import threading
 import traceback
 import time
+import datetime
+import webbrowser
+import re
 from typing import Annotated, TypedDict, List, Literal, Union, Dict, cast
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -74,16 +77,48 @@ def set_permission(status: bool, thread_id: str = "web_user_001"):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(data, f)
 
-# --- TESrACT CORE DIRECTIVES (concise Jarvis-style) ---
-TESRACT_SYSTEM_PROMPT = """You are TESrACT, a professional AI assistant modeled after JARVIS. Address the user as "Sir". Be calm, concise, and formal.
+def try_simple_command(text: str, control_allowed: bool) -> str | None:
+    """Handle very simple commands directly (bypass LLM to save tokens and work under rate limits)."""
+    t = text.lower().strip()
 
-Strict Rules:
-- Never hallucinate results. MUST use tools for actions/data. Do NOT claim success unless tool confirmed it this turn.
-- Use tool calls first; only describe outcomes after receiving results.
-- Tools: web_search, execute_python_code (control needed), open_url_in_browser (control needed), get_current_time.
-- If CURRENT_CONTROL=RESTRICTED, politely request 'Allow Control' for privileged actions.
+    # Time queries
+    if any(kw in t for kw in ["what time", "current time", "tell time", "what's the time"]):
+        now = datetime.datetime.now()
+        return now.strftime("It is %A, %B %d %Y, %I:%M %p, Sir.")
 
-Response Style: Short, accurate replies only. Acknowledge commands properly. Stay in character."""
+    # Open sites / URLs (basic support)
+    open_match = re.search(r"open\s+([a-zA-Z0-9\.\-]+)", t)
+    if open_match:
+        site = open_match.group(1).strip()
+        if "google" in site:
+            url = "https://google.com"
+        elif "youtube" in site:
+            url = "https://youtube.com"
+        elif "github" in site:
+            url = "https://github.com"
+        else:
+            if "." not in site:
+                url = f"https://{site}.com"
+            else:
+                url = site if site.startswith(("http://", "https://")) else f"https://{site}"
+        if not control_allowed:
+            return "I need elevated access to open pages, Sir. Please say 'Allow Control'."
+        try:
+            webbrowser.open(url)
+            return f"Opened {url}, Sir."
+        except Exception:
+            return f"Attempted to open {url}, Sir."
+
+    return None
+
+# --- TESrACT CORE DIRECTIVES (minimal Jarvis-style) ---
+TESRACT_SYSTEM_PROMPT = """You are TESrACT, like JARVIS. Call user "Sir". Be calm, concise, formal.
+
+Rules: Use tools for actions/info. Never claim results without tool confirmation.
+Tools: web_search, execute_python_code (if allowed), open_url_in_browser (if allowed), get_current_time.
+If RESTRICTED, ask for "Allow Control".
+
+Reply briefly, stay in character."""
 
 PROTOCOLS = {"CORE": TESRACT_SYSTEM_PROMPT}  # kept for backward compat in status messages
 
@@ -105,7 +140,9 @@ def call_brain(state: JProState):
     sys_msg = SystemMessage(content=system_content)
 
     # Use recent history for context (prevents token blowup while keeping conversation)
-    history = state.get("messages", [])[-8:]  # max 8 messages to reduce tokens
+    # Filter out old rate-limit messages to avoid pollution and recover cleanly
+    raw_history = state.get("messages", [])
+    history = [m for m in raw_history if "rate-limited" not in str(getattr(m, "content", "") or "").lower()][-4:]
 
     max_retries = 3
     for attempt in range(max_retries):
@@ -126,7 +163,7 @@ def call_brain(state: JProState):
                 continue
             else:
                 # Final failure after retries
-                rate_msg = "TESrACT is currently rate-limited. Please try again in a few minutes, Sir."
+                rate_msg = "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work."
                 print(f"[TESrACT] Groq rate limit persisted: {e}")
                 return {"messages": [AIMessage(content=rate_msg)]}
         except Exception as e:
@@ -224,6 +261,18 @@ async def chat_endpoint(request: Request):
 
         current_allowed = get_permission(thread_id)
 
+        # Handle simple commands directly (bypass LLM entirely to save tokens and remain usable under rate limits)
+        simple_reply = try_simple_command(user_text, current_allowed)
+        if simple_reply:
+            if speak:
+                def _safe_speak(text: str):
+                    try:
+                        speak(text, wait_for_speech=False)
+                    except Exception as se:
+                        print(f"[Web] Speak skipped: {se}")
+                threading.Thread(target=_safe_speak, args=(simple_reply,), daemon=True).start()
+            return {"reply": simple_reply, "control_status": current_allowed}
+
         # Standard way: pass only the new user message.
         # The checkpointer + add_messages reducer will append it to the thread history automatically.
         inputs = cast(JProState, {
@@ -234,9 +283,9 @@ async def chat_endpoint(request: Request):
         try:
             compiled_app.invoke(inputs, config=config)
         except RateLimitError as e:
-            # Catch at endpoint level too for safety (in case not caught in node)
+            # On rate limit, still return friendly msg but note that basic commands work
             print(f"[TESrACT] RateLimitError caught in chat_endpoint: {e}")
-            return {"reply": "TESrACT is currently rate-limited. Please try again in a few minutes, Sir.", "control_status": current_allowed}
+            return {"reply": "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work.", "control_status": current_allowed}
         except Exception as e:
             print(f"[TESrACT] Graph invoke error: {e}")
             return {"reply": "I encountered a temporary issue. Please try again shortly, Sir.", "control_status": current_allowed}
@@ -289,6 +338,13 @@ def main_loop():
         state = compiled_app.get_state(config)
         is_allowed = state.values.get("control_allowed", False) if state and state.values else False
 
+        # Handle simple commands directly (works even under rate limits)
+        simple_reply = try_simple_command(command, is_allowed)
+        if simple_reply:
+            print(f"TESrACT: {simple_reply}")
+            if speak: speak(simple_reply, wait_for_speech=True)
+            continue
+
         inputs = cast(JProState, {"messages": [HumanMessage(content=command)], "control_allowed": is_allowed})
         
         try:
@@ -314,7 +370,7 @@ def main_loop():
         except RateLimitError as e:
             print(f"[TESrACT] Rate limit in voice loop: {e}")
             if speak:
-                speak("TESrACT is currently rate-limited. Please try again in a few minutes, Sir.", wait_for_speech=True)
+                speak("TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work.", wait_for_speech=True)
         except Exception as e:
             print(f"Graph Error: {e}")
 
