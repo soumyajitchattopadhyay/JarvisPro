@@ -3,6 +3,7 @@ import sys
 import json
 import threading
 import traceback
+import time
 from typing import Annotated, TypedDict, List, Literal, Union, Dict, cast
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -13,6 +14,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_groq import ChatGroq 
 from dotenv import load_dotenv
+from groq import RateLimitError
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
@@ -72,32 +74,16 @@ def set_permission(status: bool, thread_id: str = "web_user_001"):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(data, f)
 
-# --- TESrACT CORE DIRECTIVES (Jarvis-style professional assistant) ---
-TESRACT_SYSTEM_PROMPT = """You are TESrACT, a sophisticated AI assistant modeled after JARVIS.
-
-Tone: Calm, professional, concise, and slightly formal. Address the user as "Sir". Use phrases such as "At once, Sir.", "Very well.", "Right away."
+# --- TESrACT CORE DIRECTIVES (concise Jarvis-style) ---
+TESRACT_SYSTEM_PROMPT = """You are TESrACT, a professional AI assistant modeled after JARVIS. Address the user as "Sir". Be calm, concise, and formal.
 
 Strict Rules:
-- Never hallucinate or invent action results. You MUST call the appropriate tool for any action or fresh data.
-- Do NOT claim success (e.g. "Google is now open" or "The code has been executed") unless the tool has returned a positive confirmation in the current conversation turn.
-- Only describe outcomes after receiving the actual tool result.
-- Call tools first when needed; do not describe results in advance.
+- Never hallucinate results. MUST use tools for actions/data. Do NOT claim success unless tool confirmed it this turn.
+- Use tool calls first; only describe outcomes after receiving results.
+- Tools: web_search, execute_python_code (control needed), open_url_in_browser (control needed), get_current_time.
+- If CURRENT_CONTROL=RESTRICTED, politely request 'Allow Control' for privileged actions.
 
-Capabilities (use via tools):
-- web_search for current information.
-- execute_python_code for calculations, logic or automation (requires control).
-- open_url_in_browser when the user wants a page opened (requires control).
-- get_current_time for accurate time and date.
-
-Control:
-- CURRENT_CONTROL will be either ACTIVE or RESTRICTED.
-- If RESTRICTED and a privileged action is needed, say: "I will need elevated access for that, Sir. Please say 'Allow Control'."
-
-Response Style:
-- Keep replies short and clear.
-- When given a command, either execute it via tool or clearly acknowledge it ("Understood, Sir. Executing...").
-- After tools, give accurate confirmation based only on the tool output.
-- Always stay in character as TESrACT."""
+Response Style: Short, accurate replies only. Acknowledge commands properly. Stay in character."""
 
 PROTOCOLS = {"CORE": TESRACT_SYSTEM_PROMPT}  # kept for backward compat in status messages
 
@@ -119,15 +105,40 @@ def call_brain(state: JProState):
     sys_msg = SystemMessage(content=system_content)
 
     # Use recent history for context (prevents token blowup while keeping conversation)
-    history = state.get("messages", [])[-12:]
-    response = llm_with_tools.invoke([sys_msg] + history)
+    history = state.get("messages", [])[-8:]  # max 8 messages to reduce tokens
 
-    # Inject control flag into any tool calls the model decides to make
-    if response.tool_calls:
-        for t in response.tool_calls:
-            t['args']['control_allowed'] = is_allowed
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = llm_with_tools.invoke([sys_msg] + history)
 
-    return {"messages": [response]}
+            # Inject control flag into any tool calls the model decides to make
+            if response.tool_calls:
+                for t in response.tool_calls:
+                    t['args']['control_allowed'] = is_allowed
+
+            return {"messages": [response]}
+        except RateLimitError as e:
+            wait_time = (2 ** attempt)  # 1s, 2s, 4s exponential backoff
+            if attempt < max_retries - 1:
+                print(f"[TESrACT] Groq RateLimitError hit (attempt {attempt+1}/{max_retries}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            else:
+                # Final failure after retries
+                rate_msg = "TESrACT is currently rate-limited. Please try again in a few minutes, Sir."
+                print(f"[TESrACT] Groq rate limit persisted: {e}")
+                return {"messages": [AIMessage(content=rate_msg)]}
+        except Exception as e:
+            # Other errors: one retry, then graceful fallback
+            if attempt < max_retries - 1:
+                print(f"[TESrACT] LLM error (attempt {attempt+1}): {e}. Retrying...")
+                time.sleep(1)
+                continue
+            else:
+                err_msg = "I encountered a temporary issue. Please try again shortly, Sir."
+                print(f"[TESrACT] LLM error after retries: {e}")
+                return {"messages": [AIMessage(content=err_msg)]}
 
 def reviewer_node(state: JProState):
     """Post-tool reviewer. Detects permission changes and recovers from errors.
@@ -220,7 +231,15 @@ async def chat_endpoint(request: Request):
             "control_allowed": current_allowed
         })
 
-        compiled_app.invoke(inputs, config=config)
+        try:
+            compiled_app.invoke(inputs, config=config)
+        except RateLimitError as e:
+            # Catch at endpoint level too for safety (in case not caught in node)
+            print(f"[TESrACT] RateLimitError caught in chat_endpoint: {e}")
+            return {"reply": "TESrACT is currently rate-limited. Please try again in a few minutes, Sir.", "control_status": current_allowed}
+        except Exception as e:
+            print(f"[TESrACT] Graph invoke error: {e}")
+            return {"reply": "I encountered a temporary issue. Please try again shortly, Sir.", "control_status": current_allowed}
 
         # Always fetch the latest state after the full graph run (agent/tools/reviewer loop)
         final_state = compiled_app.get_state(config)
@@ -252,7 +271,7 @@ async def chat_endpoint(request: Request):
     except Exception as e:
         print("--- /chat ERROR ---")
         traceback.print_exc()
-        return {"reply": "I'm having trouble reaching the core at the moment, Sir.", "control_status": False}
+        return {"reply": "TESrACT is having a temporary issue. Please try again shortly, Sir.", "control_status": False}
 
 
 # --- EXECUTION LOOP ---
@@ -292,6 +311,10 @@ def main_loop():
                 if speak: speak(output_text, wait_for_speech=True)
             else:
                 print("TESrACT: Very well, Sir.")
+        except RateLimitError as e:
+            print(f"[TESrACT] Rate limit in voice loop: {e}")
+            if speak:
+                speak("TESrACT is currently rate-limited. Please try again in a few minutes, Sir.", wait_for_speech=True)
         except Exception as e:
             print(f"Graph Error: {e}")
 

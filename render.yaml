@@ -15,3 +15,5 @@ services:
       # - key: SPEAK_COLAB_URL
       #   sync: false
     healthCheckPath: /health
+# Note: Rate limit handling (429 for llama-3.3-70b-versatile) added in main.py
+# with retries + fallback. Redeploy after changes to apply graceful degradation.
