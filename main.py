@@ -1,3 +1,17 @@
+"""
+TESrACT — JARVIS-style agent with smart LLM routing.
+
+Routing (llm_router.py):
+  - Groq  → fast responses + tool calling (web search, code, browser)
+  - Colab T4 → heavy inference (analysis, long-form, deep reasoning)
+  - Automatic fallback keeps the agent online when either backend is down.
+
+Configure via .env: GROQ_API_KEY, COLAB_LLM_URL, LLM_ROUTING_MODE (auto|groq|colab).
+"""
+from dotenv import load_dotenv
+
+load_dotenv()  # Must run before any other import — llm_router reads env at import time.
+
 import os
 import sys
 import json
@@ -15,15 +29,14 @@ from typing_extensions import NotRequired
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_groq import ChatGroq 
-from dotenv import load_dotenv
 from groq import RateLimitError
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-import actions 
+import actions
+from llm_router import route_and_invoke, colab_configured, colab_is_healthy, build_groq_llm
 
 # --- SAFE HARDWARE IMPORTS ---
 # This prevents the "Status 1" crash on Render/Railway
@@ -34,7 +47,15 @@ except Exception:
     speak = None
     listen_for_command = None
 
-load_dotenv()
+# --- ROUTING STARTUP STATUS ---
+_routing_mode = os.getenv("LLM_ROUTING_MODE", "auto")
+print(f"[TESrACT] LLM routing mode: {_routing_mode}")
+if colab_configured():
+    _colab_ok = colab_is_healthy()
+    _colab_host = (os.getenv("COLAB_LLM_URL") or "")[:48]
+    print(f"[TESrACT] Colab uplink: {'online' if _colab_ok else 'offline'} ({_colab_host})")
+else:
+    print("[TESrACT] Colab uplink: not configured — Groq-only unless COLAB_LLM_URL is set")
 
 # --- WEB SERVER INIT (For Render + Full Frontend) ---
 app = FastAPI(title="TESrACT")
@@ -48,7 +69,14 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
-    return {"status": "online", "system": "TESrACT"}
+    # [ROUTING] Surface Colab uplink + routing mode for deploy monitoring.
+    return {
+        "status": "online",
+        "system": "TESrACT",
+        "colab_configured": colab_configured(),
+        "colab_healthy": colab_is_healthy() if colab_configured() else False,
+        "llm_routing_mode": os.getenv("LLM_ROUTING_MODE", "auto"),
+    }
 
 _icons_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
 if os.path.isdir(_icons_dir):
@@ -129,54 +157,50 @@ class JProState(TypedDict):
     control_allowed: bool 
 
 # --- NODES ---
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2)
+# [ROUTING] Groq LLM is built via llm_router; tools stay bound here for the agent graph.
+llm = build_groq_llm()
 llm_with_tools = llm.bind_tools(actions.tools)
 
 def call_brain(state: JProState):
     is_allowed = state.get("control_allowed", False)
     status = "ACTIVE" if is_allowed else "RESTRICTED"
 
-    # Build a strong, single system prompt (Jarvis / TESrACT style)
     system_content = TESRACT_SYSTEM_PROMPT + f"\n\nCURRENT_CONTROL: {status}"
     sys_msg = SystemMessage(content=system_content)
 
-    # Use recent history for context (prevents token blowup while keeping conversation)
-    # Filter out old rate-limit messages to avoid pollution and recover cleanly
     raw_history = state.get("messages", [])
     history = [m for m in raw_history if "rate-limited" not in str(getattr(m, "content", "") or "").lower()][-4:]
+    user_text = ""
+    for msg in reversed(raw_history):
+        if isinstance(msg, HumanMessage):
+            user_text = str(msg.content or "")
+            break
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = llm_with_tools.invoke([sys_msg] + history)
-
-            # Inject control flag into any tool calls the model decides to make
-            if response.tool_calls:
-                for t in response.tool_calls:
-                    t['args']['control_allowed'] = is_allowed
-
-            return {"messages": [response]}
-        except RateLimitError as e:
-            wait_time = (2 ** attempt)  # 1s, 2s, 4s exponential backoff
-            if attempt < max_retries - 1:
-                print(f"[TESrACT] Groq RateLimitError hit (attempt {attempt+1}/{max_retries}). Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            else:
-                # Final failure after retries
-                rate_msg = "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work."
-                print(f"[TESrACT] Groq rate limit persisted: {e}")
-                return {"messages": [AIMessage(content=rate_msg)]}
-        except Exception as e:
-            # Other errors: one retry, then graceful fallback
-            if attempt < max_retries - 1:
-                print(f"[TESrACT] LLM error (attempt {attempt+1}): {e}. Retrying...")
-                time.sleep(1)
-                continue
-            else:
-                err_msg = "I encountered a temporary issue. Please try again shortly, Sir."
-                print(f"[TESrACT] LLM error after retries: {e}")
-                return {"messages": [AIMessage(content=err_msg)]}
+    # Delegate to llm_router — picks Groq or Colab, cross-fallback if one backend fails.
+    try:
+        response, route = route_and_invoke(
+            llm_with_tools=llm_with_tools,
+            sys_msg=sys_msg,
+            history=history,
+            control_allowed=is_allowed,
+            user_text=user_text,
+            history_len=len(raw_history),
+        )
+        print(f"[TESrACT] Agent turn served by: {route.upper()}")
+        return {"messages": [response]}
+    except RateLimitError as e:
+        # Both Groq (rate-limited) and Colab (if configured) failed — agent stays usable via simple commands.
+        rate_msg = "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work."
+        if colab_configured() and not colab_is_healthy(log_failure=False):
+            rate_msg += " Colab GPU uplink is also offline."
+        print(f"[TESrACT] All LLM backends exhausted (Groq rate limit): {e}")
+        return {"messages": [AIMessage(content=rate_msg)]}
+    except Exception as e:
+        # Last-resort graceful reply — graph continues; simple commands still work.
+        err_msg = "I encountered a temporary issue. Please try again shortly, Sir."
+        _colab_up = colab_configured() and colab_is_healthy(log_failure=False)
+        print(f"[TESrACT] All LLM backends failed (Groq error, Colab {'up' if _colab_up else 'down'}): {e}")
+        return {"messages": [AIMessage(content=err_msg)]}
 
 def reviewer_node(state: JProState):
     """Post-tool reviewer. Detects permission changes and recovers from errors.
@@ -375,13 +399,22 @@ def main_loop():
         except Exception as e:
             print(f"Graph Error: {e}")
 
+def run_routing_tests() -> int:
+    """Run LLM routing integration tests (Groq vs Colab + tool calling)."""
+    from test_routing import run_all_tests
+    return run_all_tests()
+
+
 if __name__ == "__main__":
     # === DEPLOYMENT ===
     # Render / production: uvicorn main:app   (or python main.py web)
     # Local voice mode:   python main.py
+    # Routing tests:      python main.py test  (or python test_routing.py)
     if len(sys.argv) > 1 and sys.argv[1] == "web":
         import uvicorn
         port = int(os.environ.get("PORT", 8000))
         uvicorn.run(app, host="0.0.0.0", port=port)
+    elif len(sys.argv) > 1 and sys.argv[1] == "test":
+        raise SystemExit(run_routing_tests())
     else:
         main_loop()
