@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; font-family: 'Michroma', sans-serif; }
-        #canvas-container { position: fixed; inset: 0; z-index: 1; cursor: crosshair; }
+        #canvas-container { position: fixed; inset: 0; z-index: 1; }
         #hud { position: relative; z-index: 10; width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; padding: 40px; box-sizing: border-box; }
         
         /* STARK ALERT HUD */
@@ -80,213 +80,189 @@
             isThinking = false; document.getElementById('agent-status').innerText = "STANDBY";
         }
 
-        // --- PREMIUM THREE.JS BACKGROUND ---
+        // --- HIGH PERFORMANCE THREE.JS ENGINE (Render-safe) ---
         const canvasContainer = document.getElementById('canvas-container');
         let renderer, composer, scene, camera;
-        let particlePoints, particleData = [];
-        let floatingIcons = [];
+        let instancedMeshes = [];
+        const nodes = [];
+        const COUNT = 140;
+        const ICON_POOL = 70;
+        const PARTICLE_SIZE = 2.2;
+        const CAMERA_Z = 90;
+        const CAM_NEAR = 20;
+        const CAM_FAR = 300;
+        const Z_WRAP = 50;
+        const Z_RESET = -175;
+        const TUNNEL_SPREAD = 150;
+        const CIRCLE_Z = 32;
+        const CIRCLE_R = 58;
+        const _animPos = new THREE.Vector3();
+        const _animTarget = new THREE.Vector3();
+        const _animMat = new THREE.Matrix4();
+        const _animScale = new THREE.Vector3();
+        const _animQuat = new THREE.Quaternion();
 
-        const PARTICLE_COUNT = 900;
-        const GLOW_CYAN = new THREE.Color(0x00fbff);
-        const GLOW_GREEN = new THREE.Color(0x00ffaa);
-        const mouse = new THREE.Vector2(-9, -9);
-        const mouseWorld = new THREE.Vector3();
-        const raycaster = new THREE.Raycaster();
-        const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
-        let shapePulse = 0;
-        let shapeCenter = new THREE.Vector3();
-        let shapeRing = 0;
-        const clock = new THREE.Clock();
 
-        const ICON_DEFS = [
-            { slug: 'google',     x: -280, y: 160, z: -420, scale: 22, drift: 0.3 },
-            { slug: 'javascript', x:  320, y:  90, z: -380, scale: 20, drift: 0.45 },
-            { slug: 'intel',      x: -180, y: -140, z: -460, scale: 24, drift: 0.35 },
-            { slug: 'apple',      x:  240, y: -200, z: -500, scale: 22, drift: 0.28 },
-            { slug: 'x',          x:  -60, y:  220, z: -350, scale: 18, drift: 0.5 },
-            { slug: 'python',     x:  420, y: -60, z: -440, scale: 20, drift: 0.38 },
-            { slug: 'react',      x: -380, y:  -30, z: -400, scale: 19, drift: 0.42 },
-            { slug: 'nvidia',     x:   80, y: -260, z: -480, scale: 21, drift: 0.33 }
-        ];
-
-        function applyTextureSettings(tex) {
-            tex.minFilter = THREE.LinearFilter;
-            tex.magFilter = THREE.LinearFilter;
-            tex.generateMipmaps = false;
-            tex.colorSpace = THREE.SRGBColorSpace;
-        }
-
-        function createGlowTexture(label) {
-            const size = 128;
-            const canvas = document.createElement('canvas');
-            canvas.width = size;
-            canvas.height = size;
-            const ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, size, size);
-            ctx.fillStyle = '#00fbff';
-            ctx.font = 'bold 64px Michroma, sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(label, size / 2, size / 2);
-            const tex = new THREE.CanvasTexture(canvas);
-            applyTextureSettings(tex);
-            return tex;
-        }
-
-        function spawnFieldSpread() {
-            const spreadX = Math.max(window.innerWidth * 0.55, 500);
-            const spreadY = Math.max(window.innerHeight * 0.55, 400);
-            return {
-                x: (Math.random() - 0.5) * spreadX * 2,
-                y: (Math.random() - 0.5) * spreadY * 2,
-                z: (Math.random() - 0.5) * 500
-            };
-        }
-
-        function initParticles() {
-            const positions = new Float32Array(PARTICLE_COUNT * 3);
-            const colors = new Float32Array(PARTICLE_COUNT * 3);
-            particleData = [];
-
-            for (let i = 0; i < PARTICLE_COUNT; i++) {
-                const spread = spawnFieldSpread();
-                const tint = Math.random() > 0.45 ? GLOW_CYAN : GLOW_GREEN;
-                const i3 = i * 3;
-
-                positions[i3] = spread.x;
-                positions[i3 + 1] = spread.y;
-                positions[i3 + 2] = spread.z;
-
-                colors[i3] = tint.r;
-                colors[i3 + 1] = tint.g;
-                colors[i3 + 2] = tint.b;
-
-                particleData.push({
-                    x: spread.x, y: spread.y, z: spread.z,
-                    vx: 0, vy: 0, vz: 0,
-                    homeX: spread.x, homeY: spread.y, homeZ: spread.z,
-                    phase: Math.random() * Math.PI * 2,
-                    ringAngle: (i / PARTICLE_COUNT) * Math.PI * 2,
-                    speed: 0.25 + Math.random() * 0.55
-                });
-            }
-
-            const geo = new THREE.BufferGeometry();
-            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-            geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
-            const mat = new THREE.PointsMaterial({
-                size: 2.2,
-                vertexColors: true,
-                transparent: true,
-                opacity: 0.75,
-                blending: THREE.AdditiveBlending,
-                depthWrite: false,
-                sizeAttenuation: true
-            });
-
-            particlePoints = new THREE.Points(geo, mat);
-            scene.add(particlePoints);
-        }
-
-        function initFloatingIcons(loader) {
-            const geo = new THREE.PlaneGeometry(1, 1);
-            ICON_DEFS.forEach((def) => {
-                const fallback = createGlowTexture(def.slug[0].toUpperCase());
-                const mat = new THREE.MeshBasicMaterial({
-                    map: fallback,
-                    color: 0x00fbff,
-                    transparent: true,
-                    opacity: 0.14,
-                    alphaTest: 0.05,
-                    depthWrite: false,
-                    blending: THREE.AdditiveBlending,
-                    side: THREE.DoubleSide
-                });
-                const mesh = new THREE.Mesh(geo, mat);
-                mesh.position.set(def.x, def.y, def.z);
-                mesh.scale.setScalar(def.scale);
-                mesh.userData = { def, baseOpacity: 0.14 };
-                scene.add(mesh);
-                floatingIcons.push(mesh);
-
-                loader.load(
-                    `https://cdn.simpleicons.org/${def.slug}/00fbff`,
-                    (tex) => {
-                        applyTextureSettings(tex);
-                        if (mat.map !== fallback) mat.map.dispose();
-                        else fallback.dispose();
-                        mat.map = tex;
-                        mat.needsUpdate = true;
-                    }
-                );
-            });
-        }
-
-        function updateMouseNDC(clientX, clientY) {
-            mouse.x = (clientX / window.innerWidth) * 2 - 1;
-            mouse.y = -(clientY / window.innerHeight) * 2 + 1;
-            raycaster.setFromCamera(mouse, camera);
-            raycaster.ray.intersectPlane(dragPlane, mouseWorld);
-        }
-
-        function triggerShapePulse(x, y) {
-            updateMouseNDC(x, y);
-            shapeCenter.copy(mouseWorld);
-            shapeRing = 90 + Math.random() * 40;
-            shapePulse = 1;
-        }
-
-        function initThree() {
+        async function initThree() {
             try {
-                scene = new THREE.Scene();
-                scene.fog = new THREE.FogExp2(0x000000, 0.00085);
-                camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 3000);
-                camera.position.z = 520;
-
-                renderer = new THREE.WebGLRenderer({
-                    antialias: false,
-                    powerPreference: 'high-performance',
-                    alpha: false
+                const allBrands = await fetch('/icons/manifest.json').then((res) => {
+                    if (!res.ok) throw new Error(`manifest ${res.status}`);
+                    return res.json();
                 });
-                renderer.setClearColor(0x000000, 1);
-                const pixelRatio = Math.min(window.devicePixelRatio, 1.25);
-                renderer.setPixelRatio(pixelRatio);
+                if (!allBrands.length) throw new Error('manifest empty');
+                const brands = allBrands.slice(0, ICON_POOL);
+                for (let i = brands.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [brands[i], brands[j]] = [brands[j], brands[i]];
+                }
+                scene = new THREE.Scene();
+                scene.fog = new THREE.FogExp2(0x000000, 0.006);
+                camera = new THREE.PerspectiveCamera(58, window.innerWidth / window.innerHeight, CAM_NEAR, CAM_FAR);
+                renderer = new THREE.WebGLRenderer({ 
+                    antialias: false, 
+                    powerPreference: "high-performance",
+                    alpha: true 
+                });
+                renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1));
                 renderer.setSize(window.innerWidth, window.innerHeight);
                 canvasContainer.appendChild(renderer.domElement);
 
                 composer = new EffectComposer(renderer);
-                composer.setPixelRatio(pixelRatio);
                 composer.addPass(new RenderPass(scene, camera));
                 window.__bloomPass = new UnrealBloomPass(
-                    new THREE.Vector2(window.innerWidth, window.innerHeight),
-                    0.55, 0.38, 0.15
+                    new THREE.Vector2(window.innerWidth * 0.5, window.innerHeight * 0.5),
+                    0.38, 0.42, 0.9
                 );
                 composer.addPass(window.__bloomPass);
                 composer.addPass(new OutputPass());
 
-                initParticles();
+                // Local icon textures — rasterize SVG to canvas (TextureLoader + SVG is unreliable in WebGL)
+                const ICON_DIR = '/icons/';
+                const ICON_SIZE = 64;
+                const ICON_LOAD_CONCURRENCY = 12;
 
-                const loader = new THREE.TextureLoader();
-                loader.setCrossOrigin('anonymous');
-                initFloatingIcons(loader);
+                function prepareSvg(svgText) {
+                    let svg = svgText
+                        .replace(/fill="currentColor"/gi, 'fill="#00fbff"')
+                        .replace(/stroke="currentColor"/gi, 'stroke="#00fbff"')
+                        .replace(/fill="#[0-9A-Fa-f]{3,8}"/gi, 'fill="#00fbff"');
+                    if (!/fill="#00fbff"/i.test(svg.slice(0, 240))) {
+                        svg = svg.replace('<svg ', '<svg fill="#00fbff" ');
+                    }
+                    return svg;
+                }
 
-                window.addEventListener('mousemove', (e) => updateMouseNDC(e.clientX, e.clientY), { passive: true });
-                window.addEventListener('mousedown', (e) => {
-                    if (e.target.closest('.input-wrapper, #mic-btn, #user-input')) return;
-                    triggerShapePulse(e.clientX, e.clientY);
+                function canvasHasPixels(ctx, size) {
+                    const data = ctx.getImageData(0, 0, size, size).data;
+                    for (let i = 3; i < data.length; i += 16) {
+                        if (data[i] > 12) return true;
+                    }
+                    return false;
+                }
+
+                function configureIconTexture(tex) {
+                    tex.flipY = false;
+                    tex.colorSpace = THREE.SRGBColorSpace;
+                    tex.minFilter = THREE.LinearFilter;
+                    tex.magFilter = THREE.LinearFilter;
+                    tex.generateMipmaps = false;
+                    return tex;
+                }
+
+                function loadSvgTexture(url) {
+                    return fetch(url)
+                        .then((res) => {
+                            if (!res.ok) throw new Error(`${res.status} ${url}`);
+                            return res.text();
+                        })
+                        .then((svgText) => new Promise((resolve, reject) => {
+                            const img = new Image();
+                            const blobUrl = URL.createObjectURL(
+                                new Blob([prepareSvg(svgText)], { type: 'image/svg+xml' })
+                            );
+                            img.onload = () => {
+                                const canvas = document.createElement('canvas');
+                                canvas.width = ICON_SIZE;
+                                canvas.height = ICON_SIZE;
+                                const ctx = canvas.getContext('2d');
+                                ctx.clearRect(0, 0, ICON_SIZE, ICON_SIZE);
+                                ctx.drawImage(img, 0, 0, ICON_SIZE, ICON_SIZE);
+                                URL.revokeObjectURL(blobUrl);
+                                if (!canvasHasPixels(ctx, ICON_SIZE)) {
+                                    reject(new Error(`empty raster: ${url}`));
+                                    return;
+                                }
+                                resolve(configureIconTexture(new THREE.CanvasTexture(canvas)));
+                            };
+                            img.onerror = () => {
+                                URL.revokeObjectURL(blobUrl);
+                                reject(new Error(`SVG rasterize failed: ${url}`));
+                            };
+                            img.src = blobUrl;
+                        }));
+                }
+
+                const geometry = new THREE.PlaneGeometry(PARTICLE_SIZE, PARTICLE_SIZE);
+                const perMeshCount = Math.ceil(COUNT / brands.length);
+
+                instancedMeshes = brands.map((brand) => {
+                    const mat = new THREE.MeshBasicMaterial({
+                        color: 0x00fbff,
+                        transparent: true,
+                        opacity: 0.42,
+                        side: THREE.DoubleSide,
+                        depthWrite: false
+                    });
+
+                    const im = new THREE.InstancedMesh(geometry, mat, perMeshCount);
+                    im.frustumCulled = false;
+                    scene.add(im);
+                    return im;
                 });
 
+                // Stagger texture rasterization so 1000 icons don't freeze the tab
+                let loadCursor = 0, loadActive = 0;
+                function pumpIconLoads() {
+                    while (loadActive < ICON_LOAD_CONCURRENCY && loadCursor < brands.length) {
+                        const brand = brands[loadCursor++];
+                        const im = instancedMeshes[loadCursor - 1];
+                        loadActive++;
+                        loadSvgTexture(`${ICON_DIR}${brand}.svg`)
+                            .then((tex) => {
+                                im.material.map = tex;
+                                im.material.needsUpdate = true;
+                            })
+                            .catch((err) => console.warn(`Icon fallback for ${brand}:`, err.message))
+                            .finally(() => { loadActive--; pumpIconLoads(); });
+                    }
+                }
+                pumpIconLoads();
+
+                const activeMeshes = Math.min(instancedMeshes.length, COUNT);
+                const activePerMesh = Math.ceil(COUNT / activeMeshes);
+                instancedMeshes.forEach((im, idx) => { im.count = idx < activeMeshes ? activePerMesh : 0; });
+
+                for (let i = 0; i < COUNT; i++) {
+                    nodes.push({
+                        tunnelX: (Math.random() - 0.5) * TUNNEL_SPREAD,
+                        tunnelY: (Math.random() - 0.5) * TUNNEL_SPREAD,
+                        tunnelZ: Z_RESET + Math.random() * (Z_WRAP - Z_RESET),
+                        circleAngle: (i / COUNT) * Math.PI * 2 * 3,
+                        speed: 0.5 + Math.random() * 1.1,
+                        scale: 0.75 + Math.random() * 0.45,
+                        meshIndex: i % activeMeshes,
+                        instanceIndex: Math.floor(i / activeMeshes)
+                    });
+                }
+                camera.position.z = CAMERA_Z;
+
+                // Handle window resize (critical for deployment)
                 function onResize() {
-                    const ratio = Math.min(window.devicePixelRatio, 1.25);
                     camera.aspect = window.innerWidth / window.innerHeight;
                     camera.updateProjectionMatrix();
-                    renderer.setPixelRatio(ratio);
                     renderer.setSize(window.innerWidth, window.innerHeight);
-                    composer.setPixelRatio(ratio);
-                    composer.setSize(window.innerWidth, window.innerHeight);
-                    if (window.__bloomPass) {
-                        window.__bloomPass.resolution.set(window.innerWidth, window.innerHeight);
+                    if (composer && window.__bloomPass) {
+                        window.__bloomPass.resolution.set(window.innerWidth * 0.5, window.innerHeight * 0.5);
                     }
                 }
                 window.addEventListener('resize', onResize, false);
@@ -294,91 +270,37 @@
                 return true;
             } catch (err) {
                 console.error('Three.js init failed:', err);
-                canvasContainer.innerHTML = '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#f55;font-family:monospace;font-size:12px;opacity:0.6;">WEBGL_UNAVAILABLE — HUD DEGRADED</div>';
+                canvasContainer.innerHTML = '<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#f55;font-family:monospace;font-size:12px;opacity:0.6;">WEBGL_UNAVAILABLE ΓÇö HUD DEGRADED</div>';
                 return false;
             }
         }
 
-        const threeReady = initThree();
+        let threeReady = false;
+        initThree().then((ok) => { threeReady = ok; });
 
         function animate() {
             requestAnimationFrame(animate);
-            if (!threeReady || !renderer || !composer || !particlePoints) return;
+            if (!threeReady || !renderer || !composer || !instancedMeshes.length) return;
 
-            const t = clock.getElapsedTime();
-            const dt = Math.min(clock.getDelta(), 0.033);
-            lerpFactor = THREE.MathUtils.lerp(lerpFactor, isListening ? 1 : 0, 0.06);
-            shapePulse = THREE.MathUtils.lerp(shapePulse, 0, 0.035);
+            lerpFactor = THREE.MathUtils.lerp(lerpFactor, isListening ? 1 : 0, 0.08);
 
-            const positions = particlePoints.geometry.attributes.position.array;
-            const listenRing = 130 + Math.sin(t * 1.2) * 8;
-            const flowSpeed = isThinking ? 2.2 : 1;
-            const repelRadius = 140;
-            const repelStrength = 1.8;
+            const r = CIRCLE_R + Math.sin(Date.now() * 0.0015) * 5;
+            nodes.forEach(n => {
+                n.tunnelZ += n.speed * (isThinking ? 4 : 1);
+                if (n.tunnelZ > Z_WRAP) n.tunnelZ = Z_RESET;
 
-            for (let i = 0; i < PARTICLE_COUNT; i++) {
-                const p = particleData[i];
-                const i3 = i * 3;
+                _animPos.set(n.tunnelX, n.tunnelY, n.tunnelZ);
+                _animTarget.set(Math.cos(n.circleAngle) * r, Math.sin(n.circleAngle) * r, CIRCLE_Z);
+                _animPos.lerp(_animTarget, lerpFactor);
 
-                // Gentle ambient drift
-                let tx = p.homeX + Math.sin(t * p.speed * flowSpeed + p.phase) * 28;
-                let ty = p.homeY + Math.cos(t * p.speed * 0.9 * flowSpeed + p.phase * 1.3) * 22;
-                let tz = p.homeZ + Math.sin(t * 0.35 + p.phase) * 18;
-
-                // Mouse repulsion
-                if (mouse.x > -2) {
-                    const dx = p.x - mouseWorld.x;
-                    const dy = p.y - mouseWorld.y;
-                    const dist = Math.sqrt(dx * dx + dy * dy);
-                    if (dist < repelRadius && dist > 0.001) {
-                        const force = (1 - dist / repelRadius) * repelStrength;
-                        tx += (dx / dist) * force * 55;
-                        ty += (dy / dist) * force * 55;
-                    }
-                }
-
-                // Click pulse — particles briefly form a ring
-                if (shapePulse > 0.02) {
-                    const ringX = shapeCenter.x + Math.cos(p.ringAngle) * shapeRing;
-                    const ringY = shapeCenter.y + Math.sin(p.ringAngle) * shapeRing;
-                    const blend = shapePulse * shapePulse;
-                    tx = THREE.MathUtils.lerp(tx, ringX, blend * 0.85);
-                    ty = THREE.MathUtils.lerp(ty, ringY, blend * 0.85);
-                }
-
-                // Listening mode — elegant orbital gather
-                if (lerpFactor > 0.01) {
-                    const orbitX = Math.cos(p.ringAngle) * listenRing;
-                    const orbitY = Math.sin(p.ringAngle) * listenRing;
-                    tx = THREE.MathUtils.lerp(tx, orbitX, lerpFactor * 0.7);
-                    ty = THREE.MathUtils.lerp(ty, orbitY, lerpFactor * 0.7);
-                    tz = THREE.MathUtils.lerp(tz, 40, lerpFactor * 0.5);
-                }
-
-                // Smooth physics
-                p.vx += (tx - p.x) * 2.8 * dt;
-                p.vy += (ty - p.y) * 2.8 * dt;
-                p.vz += (tz - p.z) * 2.8 * dt;
-                p.vx *= 0.88; p.vy *= 0.88; p.vz *= 0.88;
-                p.x += p.vx; p.y += p.vy; p.z += p.vz;
-
-                positions[i3] = p.x;
-                positions[i3 + 1] = p.y;
-                positions[i3 + 2] = p.z;
-            }
-            particlePoints.geometry.attributes.position.needsUpdate = true;
-
-            // Subtle floating icons
-            floatingIcons.forEach((mesh) => {
-                const { def } = mesh.userData;
-                mesh.position.x = def.x + Math.sin(t * def.drift + def.x) * 12;
-                mesh.position.y = def.y + Math.cos(t * def.drift * 0.8 + def.y) * 10;
-                mesh.position.z = def.z + Math.sin(t * 0.2 + def.z) * 15;
-                mesh.rotation.z = Math.sin(t * 0.15 + def.drift) * 0.08;
-                mesh.material.opacity = def.baseOpacity + Math.sin(t * 0.6 + def.drift) * 0.04;
-                mesh.lookAt(camera.position);
+                const im = instancedMeshes[n.meshIndex];
+                if (!im || n.instanceIndex >= im.count) return;
+                _animScale.set(n.scale, n.scale, n.scale);
+                _animMat.compose(_animPos, _animQuat, _animScale);
+                im.setMatrixAt(n.instanceIndex, _animMat);
             });
 
+            instancedMeshes.forEach(im => { im.instanceMatrix.needsUpdate = true; });
             composer.render();
         }
         animate();

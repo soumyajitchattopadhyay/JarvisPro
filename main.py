@@ -20,11 +20,8 @@ from dotenv import load_dotenv
 from groq import RateLimitError
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
-
-# FastAPI imports for deployment
-from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 import actions 
 
@@ -52,6 +49,10 @@ app.add_middleware(
 @app.get("/health")
 def health_check():
     return {"status": "online", "system": "TESrACT"}
+
+_icons_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+if os.path.isdir(_icons_dir):
+    app.mount("/icons", StaticFiles(directory=_icons_dir), name="icons")
 
 # Permission helpers (synced with user_settings.json for web)
 SETTINGS_FILE = "user_settings.json"
