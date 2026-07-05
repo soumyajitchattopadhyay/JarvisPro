@@ -85,90 +85,168 @@
         let renderer, composer, scene, camera;
         let instancedMeshes = [];
         const nodes = [];
-        const COUNT = 2500;
-        const brands = ['openai','google','github','python','tesla','nvidia','react','rust','apple','microsoft'];
+        const COUNT = 2000;
+        const brands = [
+            { slug: 'google',    color: '4285F4' },
+            { slug: 'netflix',   color: 'E50914' },
+            { slug: 'instagram', color: 'E4405F' },
+            { slug: 'x',         color: 'FFFFFF' },
+            { slug: 'linkedin',  color: '0A66C2' },
+            { slug: 'youtube',   color: 'FF0000' },
+            { slug: 'spotify',   color: '1DB954' },
+            { slug: 'amazon',    color: 'FF9900' },
+            { slug: 'facebook',  color: '0866FF' },
+            { slug: 'tiktok',    color: 'FFFFFF' },
+            { slug: 'discord',   color: '5865F2' },
+            { slug: 'apple',     color: 'FFFFFF' },
+            { slug: 'microsoft', color: '5E5E5E' },
+            { slug: 'github',    color: 'FFFFFF' },
+            { slug: 'reddit',    color: 'FF4500' },
+            { slug: 'whatsapp',  color: '25D366' },
+            { slug: 'openai',    color: 'FFFFFF' },
+            { slug: 'nvidia',    color: '76B900' },
+            { slug: 'slack',     color: '4A154B' },
+            { slug: 'paypal',    color: '00457C' },
+            { slug: 'yahoo',     color: '6001D2', custom: true }
+        ];
+
+        const _pos = new THREE.Vector3();
+        const _target = new THREE.Vector3();
+        const _mat4 = new THREE.Matrix4();
+        let _ringRadius = 120;
+
+        function createIconTexture(slug, color) {
+            const size = 128;
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, size, size);
+            ctx.fillStyle = `#${color}`;
+            ctx.font = 'bold 72px Michroma, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(slug[0].toUpperCase(), size / 2, size / 2);
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.generateMipmaps = false;
+            tex.colorSpace = THREE.SRGBColorSpace;
+            return tex;
+        }
+
+        function createYahooTexture() {
+            const size = 128;
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, size, size);
+            ctx.fillStyle = '#6001D2';
+            ctx.font = 'bold 80px Michroma, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('Y!', size / 2, size / 2);
+            const tex = new THREE.CanvasTexture(canvas);
+            applyTextureSettings(tex);
+            return tex;
+        }
+
+        function applyTextureSettings(tex) {
+            tex.minFilter = THREE.LinearFilter;
+            tex.magFilter = THREE.LinearFilter;
+            tex.generateMipmaps = false;
+            tex.colorSpace = THREE.SRGBColorSpace;
+        }
 
         function initThree() {
             try {
                 scene = new THREE.Scene();
                 camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 1, 4000);
-                renderer = new THREE.WebGLRenderer({ 
-                    antialias: false, 
-                    powerPreference: "high-performance",
-                    alpha: true 
+                renderer = new THREE.WebGLRenderer({
+                    antialias: false,
+                    powerPreference: 'high-performance',
+                    alpha: true
                 });
-                renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // cap for perf
+                const pixelRatio = Math.min(window.devicePixelRatio, 1.25);
+                renderer.setPixelRatio(pixelRatio);
                 renderer.setSize(window.innerWidth, window.innerHeight);
                 canvasContainer.appendChild(renderer.domElement);
 
                 composer = new EffectComposer(renderer);
+                composer.setPixelRatio(pixelRatio);
                 composer.addPass(new RenderPass(scene, camera));
                 window.__bloomPass = new UnrealBloomPass(
-                    new THREE.Vector2(window.innerWidth, window.innerHeight), 
-                    0.65, 0.55, 0.8
+                    new THREE.Vector2(window.innerWidth, window.innerHeight),
+                    0.4, 0.35, 0.9
                 );
                 composer.addPass(window.__bloomPass);
                 composer.addPass(new OutputPass());
 
-                // Texture loading with graceful fallback
                 const loader = new THREE.TextureLoader();
-                const fallbackMaterial = new THREE.MeshBasicMaterial({ 
-                    color: 0x00fbff, 
-                    transparent: true, 
-                    opacity: 0.65 
-                });
+                loader.setCrossOrigin('anonymous');
 
-                const geometry = new THREE.PlaneGeometry(5, 5);
+                const geometry = new THREE.PlaneGeometry(6, 6);
                 const perMeshCount = Math.ceil(COUNT / brands.length);
 
                 instancedMeshes = brands.map((brand) => {
-                    const mat = new THREE.MeshBasicMaterial({ 
-                        color: 0x00fbff, 
-                        transparent: true, 
-                        opacity: 0.65,
-                        side: THREE.DoubleSide 
+                    const fallbackTex = brand.custom
+                        ? createYahooTexture()
+                        : createIconTexture(brand.slug, brand.color);
+                    const mat = new THREE.MeshBasicMaterial({
+                        map: fallbackTex,
+                        color: 0xffffff,
+                        transparent: true,
+                        opacity: 0.82,
+                        alphaTest: 0.08,
+                        depthWrite: false,
+                        side: THREE.DoubleSide
                     });
 
                     const im = new THREE.InstancedMesh(geometry, mat, perMeshCount);
+                    im.frustumCulled = false;
                     scene.add(im);
 
-                    // Try loading icon texture (non-blocking)
-                    loader.load(
-                        `https://cdn.simpleicons.org/${brand}/00fbff`,
-                        (tex) => {
-                            tex.flipY = false;
-                            im.material.map = tex;
-                            im.material.needsUpdate = true;
-                        },
-                        undefined,
-                        () => {
-                            // fallback already applied
-                            im.material.color.setHex(0x00fbff);
-                        }
-                    );
+                    if (!brand.custom) {
+                        loader.load(
+                            `https://cdn.simpleicons.org/${brand.slug}/${brand.color}`,
+                            (tex) => {
+                                applyTextureSettings(tex);
+                                if (mat.map && mat.map !== fallbackTex) mat.map.dispose();
+                                else fallbackTex.dispose();
+                                mat.map = tex;
+                                mat.needsUpdate = true;
+                            },
+                            undefined,
+                            () => { /* canvas letter fallback already applied */ }
+                        );
+                    }
                     return im;
                 });
 
-                // Initialize node data
                 for (let i = 0; i < COUNT; i++) {
+                    const meshIndex = i % instancedMeshes.length;
                     nodes.push({
                         tunnelX: (Math.random() - 0.5) * 800,
                         tunnelY: (Math.random() - 0.5) * 800,
                         tunnelZ: -Math.random() * 3000,
                         circleAngle: (i / COUNT) * Math.PI * 2,
                         speed: 2 + Math.random() * 5,
-                        meshIndex: i % instancedMeshes.length,
+                        meshIndex,
                         instanceIndex: Math.floor(i / instancedMeshes.length)
                     });
                 }
                 camera.position.z = 300;
 
-                // Handle window resize (critical for deployment)
                 function onResize() {
+                    const ratio = Math.min(window.devicePixelRatio, 1.25);
                     camera.aspect = window.innerWidth / window.innerHeight;
                     camera.updateProjectionMatrix();
+                    renderer.setPixelRatio(ratio);
                     renderer.setSize(window.innerWidth, window.innerHeight);
-                    if (composer && window.__bloomPass) {
+                    composer.setPixelRatio(ratio);
+                    composer.setSize(window.innerWidth, window.innerHeight);
+                    if (window.__bloomPass) {
                         window.__bloomPass.resolution.set(window.innerWidth, window.innerHeight);
                     }
                 }
@@ -189,20 +267,28 @@
             if (!threeReady || !renderer || !composer) return;
 
             lerpFactor = THREE.MathUtils.lerp(lerpFactor, isListening ? 1 : 0, 0.08);
+            _ringRadius = 120 + Math.sin(Date.now() * 0.002) * 10;
+            const speedMul = isThinking ? 10 : 1;
 
-            nodes.forEach(n => {
-                n.tunnelZ += n.speed * (isThinking ? 10 : 1);
+            for (let i = 0; i < nodes.length; i++) {
+                const n = nodes[i];
+                n.tunnelZ += n.speed * speedMul;
                 if (n.tunnelZ > 300) n.tunnelZ = -2700;
 
-                const r = 120 + Math.sin(Date.now() * 0.002) * 10;
-                const pos = new THREE.Vector3(n.tunnelX, n.tunnelY, n.tunnelZ)
-                    .lerp(new THREE.Vector3(Math.cos(n.circleAngle) * r, Math.sin(n.circleAngle) * r, 50), lerpFactor);
+                _pos.set(n.tunnelX, n.tunnelY, n.tunnelZ);
+                _target.set(
+                    Math.cos(n.circleAngle) * _ringRadius,
+                    Math.sin(n.circleAngle) * _ringRadius,
+                    50
+                );
+                _pos.lerp(_target, lerpFactor);
+                _mat4.makeTranslation(_pos.x, _pos.y, _pos.z);
+                instancedMeshes[n.meshIndex].setMatrixAt(n.instanceIndex, _mat4);
+            }
 
-                const mat = new THREE.Matrix4().setPosition(pos);
-                instancedMeshes[n.meshIndex].setMatrixAt(n.instanceIndex, mat);
-            });
-
-            instancedMeshes.forEach(im => { im.instanceMatrix.needsUpdate = true; });
+            for (let i = 0; i < instancedMeshes.length; i++) {
+                instancedMeshes[i].instanceMatrix.needsUpdate = true;
+            }
             composer.render();
         }
         animate();
