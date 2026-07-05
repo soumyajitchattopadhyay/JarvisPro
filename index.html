@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; font-family: 'Michroma', sans-serif; }
-        #canvas-container { position: fixed; inset: 0; z-index: 1; }
+        #canvas-container { position: fixed; inset: 0; z-index: 1; cursor: crosshair; }
         #hud { position: relative; z-index: 10; width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; padding: 40px; box-sizing: border-box; }
         
         /* STARK ALERT HUD */
@@ -80,77 +80,34 @@
             isThinking = false; document.getElementById('agent-status').innerText = "STANDBY";
         }
 
-        // --- HIGH PERFORMANCE THREE.JS ENGINE (Render-safe) ---
+        // --- PREMIUM THREE.JS BACKGROUND ---
         const canvasContainer = document.getElementById('canvas-container');
         let renderer, composer, scene, camera;
-        let instancedMeshes = [];
-        const nodes = [];
-        const COUNT = 2000;
-        const brands = [
-            { slug: 'google',    color: '4285F4' },
-            { slug: 'netflix',   color: 'E50914' },
-            { slug: 'instagram', color: 'E4405F' },
-            { slug: 'x',         color: 'FFFFFF' },
-            { slug: 'linkedin',  color: '0A66C2' },
-            { slug: 'youtube',   color: 'FF0000' },
-            { slug: 'spotify',   color: '1DB954' },
-            { slug: 'amazon',    color: 'FF9900' },
-            { slug: 'facebook',  color: '0866FF' },
-            { slug: 'tiktok',    color: 'FFFFFF' },
-            { slug: 'discord',   color: '5865F2' },
-            { slug: 'apple',     color: 'FFFFFF' },
-            { slug: 'microsoft', color: '5E5E5E' },
-            { slug: 'github',    color: 'FFFFFF' },
-            { slug: 'reddit',    color: 'FF4500' },
-            { slug: 'whatsapp',  color: '25D366' },
-            { slug: 'openai',    color: 'FFFFFF' },
-            { slug: 'nvidia',    color: '76B900' },
-            { slug: 'slack',     color: '4A154B' },
-            { slug: 'paypal',    color: '00457C' },
-            { slug: 'yahoo',     color: '6001D2', custom: true }
+        let particlePoints, particleData = [];
+        let floatingIcons = [];
+
+        const PARTICLE_COUNT = 900;
+        const GLOW_CYAN = new THREE.Color(0x00fbff);
+        const GLOW_GREEN = new THREE.Color(0x00ffaa);
+        const mouse = new THREE.Vector2(-9, -9);
+        const mouseWorld = new THREE.Vector3();
+        const raycaster = new THREE.Raycaster();
+        const dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+        let shapePulse = 0;
+        let shapeCenter = new THREE.Vector3();
+        let shapeRing = 0;
+        const clock = new THREE.Clock();
+
+        const ICON_DEFS = [
+            { slug: 'google',     x: -280, y: 160, z: -420, scale: 22, drift: 0.3 },
+            { slug: 'javascript', x:  320, y:  90, z: -380, scale: 20, drift: 0.45 },
+            { slug: 'intel',      x: -180, y: -140, z: -460, scale: 24, drift: 0.35 },
+            { slug: 'apple',      x:  240, y: -200, z: -500, scale: 22, drift: 0.28 },
+            { slug: 'x',          x:  -60, y:  220, z: -350, scale: 18, drift: 0.5 },
+            { slug: 'python',     x:  420, y: -60, z: -440, scale: 20, drift: 0.38 },
+            { slug: 'react',      x: -380, y:  -30, z: -400, scale: 19, drift: 0.42 },
+            { slug: 'nvidia',     x:   80, y: -260, z: -480, scale: 21, drift: 0.33 }
         ];
-
-        const _pos = new THREE.Vector3();
-        const _target = new THREE.Vector3();
-        const _mat4 = new THREE.Matrix4();
-        let _ringRadius = 120;
-
-        function createIconTexture(slug, color) {
-            const size = 128;
-            const canvas = document.createElement('canvas');
-            canvas.width = size;
-            canvas.height = size;
-            const ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, size, size);
-            ctx.fillStyle = `#${color}`;
-            ctx.font = 'bold 72px Michroma, sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(slug[0].toUpperCase(), size / 2, size / 2);
-            const tex = new THREE.CanvasTexture(canvas);
-            tex.minFilter = THREE.LinearFilter;
-            tex.magFilter = THREE.LinearFilter;
-            tex.generateMipmaps = false;
-            tex.colorSpace = THREE.SRGBColorSpace;
-            return tex;
-        }
-
-        function createYahooTexture() {
-            const size = 128;
-            const canvas = document.createElement('canvas');
-            canvas.width = size;
-            canvas.height = size;
-            const ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, size, size);
-            ctx.fillStyle = '#6001D2';
-            ctx.font = 'bold 80px Michroma, sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('Y!', size / 2, size / 2);
-            const tex = new THREE.CanvasTexture(canvas);
-            applyTextureSettings(tex);
-            return tex;
-        }
 
         function applyTextureSettings(tex) {
             tex.minFilter = THREE.LinearFilter;
@@ -159,15 +116,140 @@
             tex.colorSpace = THREE.SRGBColorSpace;
         }
 
+        function createGlowTexture(label) {
+            const size = 128;
+            const canvas = document.createElement('canvas');
+            canvas.width = size;
+            canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, size, size);
+            ctx.fillStyle = '#00fbff';
+            ctx.font = 'bold 64px Michroma, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(label, size / 2, size / 2);
+            const tex = new THREE.CanvasTexture(canvas);
+            applyTextureSettings(tex);
+            return tex;
+        }
+
+        function spawnFieldSpread() {
+            const spreadX = Math.max(window.innerWidth * 0.55, 500);
+            const spreadY = Math.max(window.innerHeight * 0.55, 400);
+            return {
+                x: (Math.random() - 0.5) * spreadX * 2,
+                y: (Math.random() - 0.5) * spreadY * 2,
+                z: (Math.random() - 0.5) * 500
+            };
+        }
+
+        function initParticles() {
+            const positions = new Float32Array(PARTICLE_COUNT * 3);
+            const colors = new Float32Array(PARTICLE_COUNT * 3);
+            particleData = [];
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const spread = spawnFieldSpread();
+                const tint = Math.random() > 0.45 ? GLOW_CYAN : GLOW_GREEN;
+                const i3 = i * 3;
+
+                positions[i3] = spread.x;
+                positions[i3 + 1] = spread.y;
+                positions[i3 + 2] = spread.z;
+
+                colors[i3] = tint.r;
+                colors[i3 + 1] = tint.g;
+                colors[i3 + 2] = tint.b;
+
+                particleData.push({
+                    x: spread.x, y: spread.y, z: spread.z,
+                    vx: 0, vy: 0, vz: 0,
+                    homeX: spread.x, homeY: spread.y, homeZ: spread.z,
+                    phase: Math.random() * Math.PI * 2,
+                    ringAngle: (i / PARTICLE_COUNT) * Math.PI * 2,
+                    speed: 0.25 + Math.random() * 0.55
+                });
+            }
+
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const mat = new THREE.PointsMaterial({
+                size: 2.2,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.75,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                sizeAttenuation: true
+            });
+
+            particlePoints = new THREE.Points(geo, mat);
+            scene.add(particlePoints);
+        }
+
+        function initFloatingIcons(loader) {
+            const geo = new THREE.PlaneGeometry(1, 1);
+            ICON_DEFS.forEach((def) => {
+                const fallback = createGlowTexture(def.slug[0].toUpperCase());
+                const mat = new THREE.MeshBasicMaterial({
+                    map: fallback,
+                    color: 0x00fbff,
+                    transparent: true,
+                    opacity: 0.14,
+                    alphaTest: 0.05,
+                    depthWrite: false,
+                    blending: THREE.AdditiveBlending,
+                    side: THREE.DoubleSide
+                });
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.set(def.x, def.y, def.z);
+                mesh.scale.setScalar(def.scale);
+                mesh.userData = { def, baseOpacity: 0.14 };
+                scene.add(mesh);
+                floatingIcons.push(mesh);
+
+                loader.load(
+                    `https://cdn.simpleicons.org/${def.slug}/00fbff`,
+                    (tex) => {
+                        applyTextureSettings(tex);
+                        if (mat.map !== fallback) mat.map.dispose();
+                        else fallback.dispose();
+                        mat.map = tex;
+                        mat.needsUpdate = true;
+                    }
+                );
+            });
+        }
+
+        function updateMouseNDC(clientX, clientY) {
+            mouse.x = (clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            raycaster.ray.intersectPlane(dragPlane, mouseWorld);
+        }
+
+        function triggerShapePulse(x, y) {
+            updateMouseNDC(x, y);
+            shapeCenter.copy(mouseWorld);
+            shapeRing = 90 + Math.random() * 40;
+            shapePulse = 1;
+        }
+
         function initThree() {
             try {
                 scene = new THREE.Scene();
-                camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 1, 4000);
+                scene.fog = new THREE.FogExp2(0x000000, 0.00085);
+                camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 3000);
+                camera.position.z = 520;
+
                 renderer = new THREE.WebGLRenderer({
                     antialias: false,
                     powerPreference: 'high-performance',
-                    alpha: true
+                    alpha: false
                 });
+                renderer.setClearColor(0x000000, 1);
                 const pixelRatio = Math.min(window.devicePixelRatio, 1.25);
                 renderer.setPixelRatio(pixelRatio);
                 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -178,65 +260,22 @@
                 composer.addPass(new RenderPass(scene, camera));
                 window.__bloomPass = new UnrealBloomPass(
                     new THREE.Vector2(window.innerWidth, window.innerHeight),
-                    0.4, 0.35, 0.9
+                    0.55, 0.38, 0.15
                 );
                 composer.addPass(window.__bloomPass);
                 composer.addPass(new OutputPass());
 
+                initParticles();
+
                 const loader = new THREE.TextureLoader();
                 loader.setCrossOrigin('anonymous');
+                initFloatingIcons(loader);
 
-                const geometry = new THREE.PlaneGeometry(6, 6);
-                const perMeshCount = Math.ceil(COUNT / brands.length);
-
-                instancedMeshes = brands.map((brand) => {
-                    const fallbackTex = brand.custom
-                        ? createYahooTexture()
-                        : createIconTexture(brand.slug, brand.color);
-                    const mat = new THREE.MeshBasicMaterial({
-                        map: fallbackTex,
-                        color: 0xffffff,
-                        transparent: true,
-                        opacity: 0.82,
-                        alphaTest: 0.08,
-                        depthWrite: false,
-                        side: THREE.DoubleSide
-                    });
-
-                    const im = new THREE.InstancedMesh(geometry, mat, perMeshCount);
-                    im.frustumCulled = false;
-                    scene.add(im);
-
-                    if (!brand.custom) {
-                        loader.load(
-                            `https://cdn.simpleicons.org/${brand.slug}/${brand.color}`,
-                            (tex) => {
-                                applyTextureSettings(tex);
-                                if (mat.map && mat.map !== fallbackTex) mat.map.dispose();
-                                else fallbackTex.dispose();
-                                mat.map = tex;
-                                mat.needsUpdate = true;
-                            },
-                            undefined,
-                            () => { /* canvas letter fallback already applied */ }
-                        );
-                    }
-                    return im;
+                window.addEventListener('mousemove', (e) => updateMouseNDC(e.clientX, e.clientY), { passive: true });
+                window.addEventListener('mousedown', (e) => {
+                    if (e.target.closest('.input-wrapper, #mic-btn, #user-input')) return;
+                    triggerShapePulse(e.clientX, e.clientY);
                 });
-
-                for (let i = 0; i < COUNT; i++) {
-                    const meshIndex = i % instancedMeshes.length;
-                    nodes.push({
-                        tunnelX: (Math.random() - 0.5) * 800,
-                        tunnelY: (Math.random() - 0.5) * 800,
-                        tunnelZ: -Math.random() * 3000,
-                        circleAngle: (i / COUNT) * Math.PI * 2,
-                        speed: 2 + Math.random() * 5,
-                        meshIndex,
-                        instanceIndex: Math.floor(i / instancedMeshes.length)
-                    });
-                }
-                camera.position.z = 300;
 
                 function onResize() {
                     const ratio = Math.min(window.devicePixelRatio, 1.25);
@@ -264,31 +303,82 @@
 
         function animate() {
             requestAnimationFrame(animate);
-            if (!threeReady || !renderer || !composer) return;
+            if (!threeReady || !renderer || !composer || !particlePoints) return;
 
-            lerpFactor = THREE.MathUtils.lerp(lerpFactor, isListening ? 1 : 0, 0.08);
-            _ringRadius = 120 + Math.sin(Date.now() * 0.002) * 10;
-            const speedMul = isThinking ? 10 : 1;
+            const t = clock.getElapsedTime();
+            const dt = Math.min(clock.getDelta(), 0.033);
+            lerpFactor = THREE.MathUtils.lerp(lerpFactor, isListening ? 1 : 0, 0.06);
+            shapePulse = THREE.MathUtils.lerp(shapePulse, 0, 0.035);
 
-            for (let i = 0; i < nodes.length; i++) {
-                const n = nodes[i];
-                n.tunnelZ += n.speed * speedMul;
-                if (n.tunnelZ > 300) n.tunnelZ = -2700;
+            const positions = particlePoints.geometry.attributes.position.array;
+            const listenRing = 130 + Math.sin(t * 1.2) * 8;
+            const flowSpeed = isThinking ? 2.2 : 1;
+            const repelRadius = 140;
+            const repelStrength = 1.8;
 
-                _pos.set(n.tunnelX, n.tunnelY, n.tunnelZ);
-                _target.set(
-                    Math.cos(n.circleAngle) * _ringRadius,
-                    Math.sin(n.circleAngle) * _ringRadius,
-                    50
-                );
-                _pos.lerp(_target, lerpFactor);
-                _mat4.makeTranslation(_pos.x, _pos.y, _pos.z);
-                instancedMeshes[n.meshIndex].setMatrixAt(n.instanceIndex, _mat4);
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const p = particleData[i];
+                const i3 = i * 3;
+
+                // Gentle ambient drift
+                let tx = p.homeX + Math.sin(t * p.speed * flowSpeed + p.phase) * 28;
+                let ty = p.homeY + Math.cos(t * p.speed * 0.9 * flowSpeed + p.phase * 1.3) * 22;
+                let tz = p.homeZ + Math.sin(t * 0.35 + p.phase) * 18;
+
+                // Mouse repulsion
+                if (mouse.x > -2) {
+                    const dx = p.x - mouseWorld.x;
+                    const dy = p.y - mouseWorld.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < repelRadius && dist > 0.001) {
+                        const force = (1 - dist / repelRadius) * repelStrength;
+                        tx += (dx / dist) * force * 55;
+                        ty += (dy / dist) * force * 55;
+                    }
+                }
+
+                // Click pulse — particles briefly form a ring
+                if (shapePulse > 0.02) {
+                    const ringX = shapeCenter.x + Math.cos(p.ringAngle) * shapeRing;
+                    const ringY = shapeCenter.y + Math.sin(p.ringAngle) * shapeRing;
+                    const blend = shapePulse * shapePulse;
+                    tx = THREE.MathUtils.lerp(tx, ringX, blend * 0.85);
+                    ty = THREE.MathUtils.lerp(ty, ringY, blend * 0.85);
+                }
+
+                // Listening mode — elegant orbital gather
+                if (lerpFactor > 0.01) {
+                    const orbitX = Math.cos(p.ringAngle) * listenRing;
+                    const orbitY = Math.sin(p.ringAngle) * listenRing;
+                    tx = THREE.MathUtils.lerp(tx, orbitX, lerpFactor * 0.7);
+                    ty = THREE.MathUtils.lerp(ty, orbitY, lerpFactor * 0.7);
+                    tz = THREE.MathUtils.lerp(tz, 40, lerpFactor * 0.5);
+                }
+
+                // Smooth physics
+                p.vx += (tx - p.x) * 2.8 * dt;
+                p.vy += (ty - p.y) * 2.8 * dt;
+                p.vz += (tz - p.z) * 2.8 * dt;
+                p.vx *= 0.88; p.vy *= 0.88; p.vz *= 0.88;
+                p.x += p.vx; p.y += p.vy; p.z += p.vz;
+
+                positions[i3] = p.x;
+                positions[i3 + 1] = p.y;
+                positions[i3 + 2] = p.z;
             }
+            particlePoints.geometry.attributes.position.needsUpdate = true;
 
-            for (let i = 0; i < instancedMeshes.length; i++) {
-                instancedMeshes[i].instanceMatrix.needsUpdate = true;
-            }
+            // Subtle floating icons
+            floatingIcons.forEach((mesh) => {
+                const { def } = mesh.userData;
+                mesh.position.x = def.x + Math.sin(t * def.drift + def.x) * 12;
+                mesh.position.y = def.y + Math.cos(t * def.drift * 0.8 + def.y) * 10;
+                mesh.position.z = def.z + Math.sin(t * 0.2 + def.z) * 15;
+                mesh.rotation.z = Math.sin(t * 0.15 + def.drift) * 0.08;
+                mesh.material.opacity = def.baseOpacity + Math.sin(t * 0.6 + def.drift) * 0.04;
+                mesh.lookAt(camera.position);
+            });
+
             composer.render();
         }
         animate();
