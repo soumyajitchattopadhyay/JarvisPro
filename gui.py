@@ -1,10 +1,11 @@
 import customtkinter as ctk
 import threading
 import time
-from speak import speak 
+from speak import speak
 from listen import listen_for_command
-from main import compiled_app as graph 
-from langchain_core.messages import HumanMessage
+from main import compiled_app as graph
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 
 class TESrACTUI(ctk.CTk):
     def __init__(self):
@@ -20,7 +21,8 @@ class TESrACTUI(ctk.CTk):
         self.log_box = ctk.CTkTextbox(self, width=550, height=550, corner_radius=15, font=("Consolas", 13))
         self.log_box.pack(pady=10)
 
-        self.history = []
+        self.history: list[BaseMessage] = []
+        self._config: RunnableConfig = {"configurable": {"thread_id": "gui_session"}}
         threading.Thread(target=self.run_assistant, daemon=True).start()
 
     def set_status(self, status, color="#00FFCC"):
@@ -44,13 +46,17 @@ class TESrACTUI(ctk.CTk):
                 self.set_status("ANALYZING...", "#FFFF00")
                 try:
                     # Simple control sync for the desktop GUI (full privileges handled in main web flow)
-                    current_state = graph.get_state({"configurable": {"thread_id": "gui_session"}})
-                    ctrl = current_state.values.get("control_allowed", False) if current_state else False
-                    result = graph.invoke({
-                        "messages": self.history + [HumanMessage(content=command)],
-                        "control_allowed": ctrl
-                    }, config={"configurable": {"thread_id": "gui_session"}})
-                    self.history = result["messages"]
+                    current_state = graph.get_state(self._config)
+                    state_values = current_state.values if current_state else None
+                    ctrl = bool((state_values or {}).get("control_allowed", False))
+                    result = graph.invoke(
+                        {
+                            "messages": self.history + [HumanMessage(content=command)],
+                            "control_allowed": ctrl,
+                        },
+                        config=self._config,
+                    )
+                    self.history = list(result.get("messages", []))
                     final_res = next((msg.content for msg in reversed(self.history) if isinstance(msg.content, str)), "")
                     if final_res:
                         self.set_status("EXECUTING...", "#00FF66")

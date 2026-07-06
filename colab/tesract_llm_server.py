@@ -205,7 +205,7 @@ for _ in range(40):
 print(f"Local server ready: http://127.0.0.1:{PORT}/health")
 
 # %% CELL 5 — ngrok public URL (copy this into your .env as COLAB_LLM_URL)
-from pyngrok import ngrok
+from pyngrok import ngrok  # type: ignore[import-untyped]
 
 ngrok.set_auth_token(NGROK_AUTHTOKEN)
 tunnel = ngrok.connect(PORT, "http")

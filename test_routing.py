@@ -13,12 +13,14 @@ from __future__ import annotations
 import os
 import sys
 import traceback
+from typing import TypeAlias
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 
 import llm_router
 from llm_router import (
@@ -32,6 +34,7 @@ from llm_router import (
 )
 import actions
 
+ClassificationCase: TypeAlias = tuple[str, str, str] | tuple[str, str, str, int]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,7 +63,7 @@ def _result(label: str, preferred: str, actual: str, ok: bool, detail: str = "")
 def test_classification() -> bool:
     _header("1. Task classification (offline)")
 
-    cases: list[tuple[str, str, str]] = [
+    cases: list[ClassificationCase] = [
         ("What time is it?", "groq", "light greeting / time query"),
         ("Hello, how are you?", "groq", "short casual message"),
         ("What is the capital of France?", "groq", "short factual query"),
@@ -108,7 +111,7 @@ def _run_direct_route(label: str, user_text: str, expect_preferred: str) -> bool
         return True
 
     sys_msg = SystemMessage(content="You are TESrACT. Reply in one short sentence, Sir.")
-    history = [HumanMessage(content=user_text)]
+    history: list[BaseMessage] = [HumanMessage(content=user_text)]
     preferred = choose_route(user_text, history_len=len(history))
 
     llm = build_groq_llm()
@@ -171,7 +174,7 @@ def test_agent_tool_calling() -> bool:
     from main import TESRACT_SYSTEM_PROMPT, compiled_app
 
     thread_id = "routing_test_tools"
-    config = {"configurable": {"thread_id": thread_id}}
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
     prompt = "What is the current time? You must use the get_current_time tool to answer."
 
     try:
@@ -183,7 +186,8 @@ def test_agent_tool_calling() -> bool:
             config=config,
         )
         state = compiled_app.get_state(config)
-        messages = state.values.get("messages", []) if state else []
+        state_values = state.values if state else None
+        messages = (state_values or {}).get("messages", [])
 
         tool_called = any(isinstance(m, ToolMessage) for m in messages)
         tool_names = [
