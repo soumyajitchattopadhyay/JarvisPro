@@ -63,17 +63,36 @@ def test_classification() -> bool:
     cases: list[tuple[str, str, str]] = [
         ("What time is it?", "groq", "light greeting / time query"),
         ("Hello, how are you?", "groq", "short casual message"),
+        ("What is the capital of France?", "groq", "short factual query"),
+        ("Who was the first president of the United States?", "groq", "simple who-question"),
         (
             "Analyze in detail the pros and cons of microservices architecture step by step",
             "colab",
             "heavy keyword + long analysis request",
         ),
+        (
+            "Write a detailed 500-word essay on the causes of World War I",
+            "colab",
+            "long-form writing with word-count hint",
+        ),
+        (
+            "Provide a comprehensive analysis of climate change impacts on agriculture",
+            "colab",
+            "deep analysis request",
+        ),
         ("use colab for a deep analysis of this API design", "colab", "explicit Colab request"),
+        ("Search the web for the latest news on AI", "groq", "tool-friendly web search"),
+        ("What is the capital of France?", "groq", "factual query even with long thread", 15),
     ]
 
     all_ok = True
-    for text, expected, reason in cases:
-        got = classify_task(text, history_len=0)
+    for case in cases:
+        if len(case) == 4:
+            text, expected, reason, history_len = case
+        else:
+            text, expected, reason = case
+            history_len = 0
+        got = classify_task(text, history_len=history_len)
         ok = got == expected
         all_ok = _result(f"Classify: {reason}", expected, got, ok) and all_ok
     return all_ok

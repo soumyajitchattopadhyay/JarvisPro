@@ -17,16 +17,15 @@ import sys
 import json
 import threading
 import traceback
-import time
 import datetime
 import webbrowser
 import re
-from typing import Annotated, TypedDict, List, Literal, Union, Dict, cast
+from typing import Annotated, TypedDict, List, Callable, cast
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 from typing_extensions import NotRequired
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 from groq import RateLimitError
@@ -36,16 +35,40 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import actions
+import llm_router
 from llm_router import route_and_invoke, colab_configured, colab_is_healthy, build_groq_llm
 
 # --- SAFE HARDWARE IMPORTS ---
 # This prevents the "Status 1" crash on Render/Railway
+SpeakFn = Callable[..., None]
+ListenFn = Callable[[], str | None]
+
 try:
-    from speak import speak 
-    from listen import listen_for_command
+    from speak import speak as _speak_impl
+    from listen import listen_for_command as _listen_impl
+    speak: SpeakFn | None = _speak_impl
+    listen_for_command: ListenFn | None = _listen_impl
 except Exception:
     speak = None
     listen_for_command = None
+
+
+def _run_speak(text: str, *, wait_for_speech: bool = False) -> None:
+    """Speak in a background thread when available; safe if speak is None."""
+    speak_fn = speak
+    if speak_fn is None:
+        return
+
+    def _do_speak() -> None:
+        try:
+            speak_fn(text, wait_for_speech=wait_for_speech)
+        except Exception as se:
+            print(f"[Web] Speak skipped: {se}")
+
+    if wait_for_speech:
+        _do_speak()
+    else:
+        threading.Thread(target=_do_speak, daemon=True).start()
 
 # --- ROUTING STARTUP STATUS ---
 _routing_mode = os.getenv("LLM_ROUTING_MODE", "auto")
@@ -177,6 +200,7 @@ def call_brain(state: JProState):
             break
 
     # Delegate to llm_router — picks Groq or Colab, cross-fallback if one backend fails.
+    # Use context window size (not full checkpoint length) so long threads don't force Colab.
     try:
         response, route = route_and_invoke(
             llm_with_tools=llm_with_tools,
@@ -184,9 +208,10 @@ def call_brain(state: JProState):
             history=history,
             control_allowed=is_allowed,
             user_text=user_text,
-            history_len=len(raw_history),
+            history_len=len(history),
         )
-        print(f"[TESrACT] Agent turn served by: {route.upper()}")
+        reason_suffix = f" — {llm_router.last_route_reason}" if llm_router.last_route_reason else ""
+        print(f"[TESrACT] Agent turn served by: {route.upper()}{reason_suffix}")
         return {"messages": [response]}
     except RateLimitError as e:
         # Both Groq (rate-limited) and Colab (if configured) failed — agent stays usable via simple commands.
@@ -202,11 +227,11 @@ def call_brain(state: JProState):
         print(f"[TESrACT] All LLM backends failed (Groq error, Colab {'up' if _colab_up else 'down'}): {e}")
         return {"messages": [AIMessage(content=err_msg)]}
 
-def reviewer_node(state: JProState):
+def reviewer_node(state: JProState) -> dict[str, object]:
     """Post-tool reviewer. Detects permission changes and recovers from errors.
     Looks across recent messages to catch control keywords reliably."""
     if not state.get("messages"):
-        return state
+        return {}
 
     # Check last few messages for control phrases (more reliable than just last)
     recent_content = " ".join(
@@ -226,7 +251,7 @@ def reviewer_node(state: JProState):
             content="The previous action encountered an issue. I will reassess and attempt another approach if possible, Sir."
         )]
 
-    return updates or state
+    return updates
 
 # --- 4. GRAPH CONSTRUCTION ---
 workflow = StateGraph(JProState)
@@ -276,7 +301,7 @@ async def chat_endpoint(request: Request):
         payload = await request.json()
         user_text = (payload.get("text") or "").strip()
         thread_id = "web_user_001"
-        config = {"configurable": {"thread_id": thread_id}}
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         lowered = user_text.lower()
         if "allow control" in lowered or "grant access" in lowered or "elevate" in lowered:
@@ -289,13 +314,7 @@ async def chat_endpoint(request: Request):
         # Handle simple commands directly (bypass LLM entirely to save tokens and remain usable under rate limits)
         simple_reply = try_simple_command(user_text, current_allowed)
         if simple_reply:
-            if speak:
-                def _safe_speak(text: str):
-                    try:
-                        speak(text, wait_for_speech=False)
-                    except Exception as se:
-                        print(f"[Web] Speak skipped: {se}")
-                threading.Thread(target=_safe_speak, args=(simple_reply,), daemon=True).start()
+            _run_speak(simple_reply)
             return {"reply": simple_reply, "control_status": current_allowed}
 
         # Standard way: pass only the new user message.
@@ -317,7 +336,8 @@ async def chat_endpoint(request: Request):
 
         # Always fetch the latest state after the full graph run (agent/tools/reviewer loop)
         final_state = compiled_app.get_state(config)
-        messages = final_state.values.get("messages", []) if final_state else []
+        state_values = final_state.values if final_state else None
+        messages = (state_values or {}).get("messages", [])
 
         final_reply = "At your service, Sir."
         for msg in reversed(messages):
@@ -325,17 +345,11 @@ async def chat_endpoint(request: Request):
                 final_reply = str(msg.content).replace("`", "").strip()
                 break
 
-        updated_allowed = final_state.values.get("control_allowed", current_allowed) if final_state else current_allowed
+        updated_allowed = (state_values or {}).get("control_allowed", current_allowed)
         if isinstance(updated_allowed, bool) and updated_allowed != current_allowed:
             set_permission(updated_allowed, thread_id)
 
-        if speak:
-            def _safe_speak(text: str):
-                try:
-                    speak(text, wait_for_speech=False)
-                except Exception as se:
-                    print(f"[Web] Speak skipped: {se}")
-            threading.Thread(target=_safe_speak, args=(final_reply,), daemon=True).start()
+        _run_speak(final_reply)
 
         return {
             "reply": final_reply,
@@ -350,14 +364,14 @@ async def chat_endpoint(request: Request):
 
 # --- EXECUTION LOOP ---
 def main_loop():
-    if speak: speak("TESrACT online. At your service, Sir.", wait_for_speech=True)
+    _run_speak("TESrACT online. At your service, Sir.", wait_for_speech=True)
     config: RunnableConfig = {"configurable": {"thread_id": "jarvis_session_001"}}
     
     while True:
         command = listen_for_command() if listen_for_command else input("User: ")
         if not command: continue
         if any(word in command.lower() for word in ["shutdown", "exit"]):
-            if speak: speak("Powering down.")
+            _run_speak("Powering down.", wait_for_speech=True)
             break
 
         state = compiled_app.get_state(config)
@@ -367,7 +381,7 @@ def main_loop():
         simple_reply = try_simple_command(command, is_allowed)
         if simple_reply:
             print(f"TESrACT: {simple_reply}")
-            if speak: speak(simple_reply, wait_for_speech=True)
+            _run_speak(simple_reply, wait_for_speech=True)
             continue
 
         inputs = cast(JProState, {"messages": [HumanMessage(content=command)], "control_allowed": is_allowed})
@@ -379,7 +393,8 @@ def main_loop():
             
             # Fetch the latest state after the complete run for reliable final response
             final_state = compiled_app.get_state(config)
-            messages = final_state.values.get("messages", []) if final_state else []
+            state_values = final_state.values if final_state else None
+            messages = (state_values or {}).get("messages", [])
 
             output_text = None
             for msg in reversed(messages):
@@ -389,13 +404,15 @@ def main_loop():
 
             if output_text:
                 print(f"TESrACT: {output_text}")
-                if speak: speak(output_text, wait_for_speech=True)
+                _run_speak(output_text, wait_for_speech=True)
             else:
                 print("TESrACT: Very well, Sir.")
         except RateLimitError as e:
             print(f"[TESrACT] Rate limit in voice loop: {e}")
-            if speak:
-                speak("TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work.", wait_for_speech=True)
+            _run_speak(
+                "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work.",
+                wait_for_speech=True,
+            )
         except Exception as e:
             print(f"Graph Error: {e}")
 
