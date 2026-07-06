@@ -3,11 +3,14 @@ TESrACT LLM router — Groq (fast + tools) vs Colab T4 (heavy inference).
 
 Environment variables:
   GROQ_API_KEY          — required for Groq path
-  COLAB_LLM_URL         — ngrok URL from Colab (e.g. https://abc123.ngrok-free.app)
+  RENDEZVOUS_SERVER_URL — Render URL of rendezvous_server.py (preferred when set)
+  RENDEZVOUS_API_KEY    — shared secret for rendezvous register/fetch (same as TESRACT_API_KEY)
+  COLAB_LLM_URL         — static ngrok URL fallback when RENDEZVOUS_SERVER_URL is unset
   COLAB_LLM_API_KEY     — must match TESRACT_API_KEY in Colab
   LLM_ROUTING_MODE      — auto | groq | colab | colab_fallback (default: auto)
   COLAB_LLM_TIMEOUT     — seconds (default: 120)
   COLAB_HEALTH_TTL      — cache health check seconds (default: 60)
+  RENDEZVOUS_CACHE_TTL  — seconds between rendezvous URL refreshes (default: 75)
 """
 from __future__ import annotations
 
@@ -99,12 +102,16 @@ _SIMPLE_QUERY_RE = re.compile(
 )
 
 ROUTING_MODE = os.getenv("LLM_ROUTING_MODE", "auto").strip().lower()
-COLAB_LLM_URL = (os.getenv("COLAB_LLM_URL") or "").rstrip("/")
+COLAB_LLM_URL_STATIC = (os.getenv("COLAB_LLM_URL") or "").rstrip("/")
+RENDEZVOUS_SERVER_URL = (os.getenv("RENDEZVOUS_SERVER_URL") or "").rstrip("/")
+RENDEZVOUS_API_KEY = os.getenv("RENDEZVOUS_API_KEY", "")
+RENDEZVOUS_CACHE_TTL = int(os.getenv("RENDEZVOUS_CACHE_TTL", "75"))
 COLAB_LLM_API_KEY = os.getenv("COLAB_LLM_API_KEY", "")
 COLAB_TIMEOUT = float(os.getenv("COLAB_LLM_TIMEOUT", "120"))
 COLAB_HEALTH_TTL = int(os.getenv("COLAB_HEALTH_TTL", "60"))
 
 _health_cache: dict[str, float | bool] = {"ok": False, "checked_at": 0.0}
+_rendezvous_cache: dict[str, float | str] = {"url": "", "fetched_at": 0.0}
 
 # Set after every route_and_invoke call — useful for tests and debugging.
 last_route_used: Route | None = None
@@ -306,13 +313,87 @@ def choose_route_detailed(
     return classify_task_detailed(user_text, history_len)
 
 
+def colab_url_source() -> str:
+    """How the Colab URL is discovered: rendezvous, static, or none."""
+    if RENDEZVOUS_SERVER_URL:
+        return "rendezvous"
+    if COLAB_LLM_URL_STATIC:
+        return "static"
+    return "none"
+
+
+def colab_discovery_enabled() -> bool:
+    """True when Colab discovery is configured (rendezvous or static URL in .env)."""
+    return colab_url_source() != "none"
+
+
+def _fetch_colab_url_from_rendezvous() -> str:
+    """Fetch the latest Colab ngrok URL from the rendezvous server."""
+    headers: dict[str, str] = {}
+    if RENDEZVOUS_API_KEY:
+        headers["Authorization"] = f"Bearer {RENDEZVOUS_API_KEY}"
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            res = client.get(f"{RENDEZVOUS_SERVER_URL}/active-url", headers=headers)
+            if res.status_code == 404:
+                _log("Rendezvous: no Colab URL registered yet — start your Colab notebook")
+                return ""
+            if res.status_code >= 400:
+                _log(f"Rendezvous fetch failed: HTTP {res.status_code} — {res.text[:200]}")
+                return ""
+            data = res.json()
+            url = str(data.get("url") or "").rstrip("/")
+            if url:
+                stale = bool(data.get("stale"))
+                age = data.get("age_seconds")
+                suffix = f" (age={age}s, stale={stale})" if age is not None else ""
+                _log(f"Rendezvous: resolved Colab URL → {url}{suffix}")
+            return url
+    except Exception as exc:
+        _log(f"Rendezvous fetch error: {exc}")
+        return ""
+
+
+def get_colab_llm_url(*, force_refresh: bool = False) -> str:
+    """
+    Resolve the Colab LLM base URL.
+
+    Priority:
+      1. RENDEZVOUS_SERVER_URL → GET /active-url (cached for RENDEZVOUS_CACHE_TTL seconds)
+      2. COLAB_LLM_URL from .env (static fallback when rendezvous is not configured)
+    """
+    if RENDEZVOUS_SERVER_URL:
+        now = time.time()
+        cached_url = str(_rendezvous_cache["url"] or "")
+        if (
+            not force_refresh
+            and cached_url
+            and now - float(_rendezvous_cache["fetched_at"]) < RENDEZVOUS_CACHE_TTL
+        ):
+            return cached_url
+
+        url = _fetch_colab_url_from_rendezvous()
+        _rendezvous_cache["url"] = url
+        _rendezvous_cache["fetched_at"] = now
+        return url
+
+    return COLAB_LLM_URL_STATIC
+
+
 def colab_configured() -> bool:
-    return bool(COLAB_LLM_URL)
+    """True when a Colab base URL is available (resolved or static)."""
+    return bool(get_colab_llm_url())
 
 
 def colab_is_healthy(force: bool = False, *, log_failure: bool = True) -> bool:
-    if not colab_configured():
+    source = colab_url_source()
+    colab_url = get_colab_llm_url(force_refresh=force)
+    if not colab_url:
+        if log_failure and colab_discovery_enabled():
+            _log(f"Colab health skipped ({source}): no URL resolved yet")
         return False
+
     now = time.time()
     if not force and now - float(_health_cache["checked_at"]) < COLAB_HEALTH_TTL:
         return bool(_health_cache["ok"])
@@ -324,7 +405,7 @@ def colab_is_healthy(force: bool = False, *, log_failure: bool = True) -> bool:
         if COLAB_LLM_API_KEY:
             headers["Authorization"] = f"Bearer {COLAB_LLM_API_KEY}"
         with httpx.Client(timeout=8.0) as client:
-            res = client.get(f"{COLAB_LLM_URL}/health", headers=headers)
+            res = client.get(f"{colab_url}/health", headers=headers)
             ok = res.status_code == 200
             if not ok:
                 err_detail = f"HTTP {res.status_code}"
@@ -334,8 +415,10 @@ def colab_is_healthy(force: bool = False, *, log_failure: bool = True) -> bool:
 
     _health_cache["ok"] = ok
     _health_cache["checked_at"] = now
-    if log_failure and not ok:
-        _log(f"Colab health check failed ({err_detail or 'unreachable'}) — {COLAB_LLM_URL}")
+    if ok and force:
+        _log(f"Colab health OK ({source}) — {colab_url}")
+    elif log_failure and not ok:
+        _log(f"Colab health check failed ({source}, {err_detail or 'unreachable'}) — {colab_url}")
     return ok
 
 
@@ -357,8 +440,11 @@ def _to_openai_messages(messages: list[BaseMessage]) -> list[dict[str, str]]:
 
 
 def colab_chat(messages: list[BaseMessage], temperature: float = 0.2, max_tokens: int = 768) -> str:
-    if not colab_configured():
-        raise RuntimeError("COLAB_LLM_URL is not set")
+    colab_url = get_colab_llm_url()
+    if not colab_url:
+        raise RuntimeError(
+            "Colab URL not configured — set RENDEZVOUS_SERVER_URL or COLAB_LLM_URL"
+        )
 
     headers = {
         "Content-Type": "application/json",
@@ -376,7 +462,7 @@ def colab_chat(messages: list[BaseMessage], temperature: float = 0.2, max_tokens
 
     with httpx.Client(timeout=COLAB_TIMEOUT) as client:
         res = client.post(
-            f"{COLAB_LLM_URL}/v1/chat/completions",
+            f"{colab_url}/v1/chat/completions",
             json=payload,
             headers=headers,
         )
@@ -433,7 +519,10 @@ def _try_colab(
 ) -> AIMessage | None:
     """Attempt Colab inference; return None (with log) when uplink is unavailable."""
     if not colab_configured():
-        _log(f"Colab unavailable ({reason}): COLAB_LLM_URL not set")
+        _log(
+            f"Colab unavailable ({reason}): no Colab URL "
+            f"(set RENDEZVOUS_SERVER_URL or COLAB_LLM_URL)"
+        )
         return None
     if not colab_is_healthy():
         _log(f"Colab unavailable ({reason}): GPU uplink unhealthy")

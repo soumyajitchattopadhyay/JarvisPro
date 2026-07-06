@@ -20,6 +20,8 @@ def _secret(name: str, default: str = "") -> str:
 HF_TOKEN = _secret("HF_TOKEN")          # huggingface.co/settings/tokens (for Llama)
 NGROK_AUTHTOKEN = _secret("NGROK_AUTHTOKEN")  # dashboard.ngrok.com/get-started/your-authtoken
 TESRACT_API_KEY = _secret("TESRACT_API_KEY", "change-me-in-production")
+# Optional: Render URL of rendezvous_server.py — auto-publishes ngrok URL (no manual .env copy)
+RENDEZVOUS_SERVER_URL = _secret("RENDEZVOUS_SERVER_URL", "").rstrip("/")
 
 MODEL_ID = os.environ.get("TESRACT_MODEL_ID", "meta-llama/Meta-Llama-3.1-8B-Instruct")
 # Fallback if Llama gated access is unavailable:
@@ -31,6 +33,7 @@ MAX_NEW_TOKENS = int(os.environ.get("TESRACT_MAX_NEW_TOKENS", "1024"))
 print("Model:", MODEL_ID)
 print("HF token set:", bool(HF_TOKEN))
 print("Ngrok token set:", bool(NGROK_AUTHTOKEN))
+print("Rendezvous server:", RENDEZVOUS_SERVER_URL or "(not set — manual COLAB_LLM_URL copy)")
 
 # %% CELL 3 — Load model on T4 (4-bit quantization)
 import torch
@@ -204,28 +207,77 @@ for _ in range(40):
 
 print(f"Local server ready: http://127.0.0.1:{PORT}/health")
 
-# %% CELL 5 — ngrok public URL (copy this into your .env as COLAB_LLM_URL)
+# %% CELL 5 — ngrok public URL + auto-register with Rendezvous Server
+# After ngrok exposes a public URL, we POST it to the rendezvous server so the
+# main TESrACT app can discover it automatically (no manual .env copy needed).
+import json
+import urllib.error
+import urllib.request
+
 from pyngrok import ngrok  # type: ignore[import-untyped]
+
+
+def register_with_rendezvous(public_url: str) -> bool:
+    """Publish the current ngrok URL to the rendezvous server (auth: TESRACT_API_KEY)."""
+    if not RENDEZVOUS_SERVER_URL:
+        print("[rendezvous] RENDEZVOUS_SERVER_URL not set — skip auto-registration")
+        print("[rendezvous] Copy COLAB_LLM_URL into your local .env manually")
+        return False
+
+    payload = json.dumps({"url": public_url, "api_key": TESRACT_API_KEY}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{RENDEZVOUS_SERVER_URL}/register",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as res:
+            body = json.loads(res.read().decode("utf-8"))
+        print("[rendezvous] ✓ Registration succeeded")
+        print(f"[rendezvous]   URL       : {body.get('url', public_url)}")
+        print(f"[rendezvous]   Last seen : {body.get('last_seen', 'n/a')}")
+        return True
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        print(f"[rendezvous] ✗ Registration failed — HTTP {exc.code}")
+        print(f"[rendezvous]   {detail}")
+        return False
+    except Exception as exc:
+        print(f"[rendezvous] ✗ Registration failed — {exc}")
+        return False
+
 
 ngrok.set_auth_token(NGROK_AUTHTOKEN)
 tunnel = ngrok.connect(PORT, "http")
-PUBLIC_URL = tunnel.public_url
+PUBLIC_URL = tunnel.public_url.rstrip("/")
+
 print("\n" + "=" * 60)
 print("TESrACT Colab LLM is LIVE")
 print("COLAB_LLM_URL =", PUBLIC_URL)
-print("Set in local .env:")
-print(f"  COLAB_LLM_URL={PUBLIC_URL}")
-print(f"  COLAB_LLM_API_KEY={TESRACT_API_KEY}")
+if RENDEZVOUS_SERVER_URL:
+    print("Auto-registering with rendezvous server…")
+    register_with_rendezvous(PUBLIC_URL)
+else:
+    print("Set in local .env:")
+    print(f"  COLAB_LLM_URL={PUBLIC_URL}")
+    print(f"  COLAB_LLM_API_KEY={TESRACT_API_KEY}")
 print("=" * 60)
 
-# %% CELL 6 — Keep-alive loop (run this last; keeps the session busy)
-import urllib.request
+# %% CELL 6 — Keep-alive loop (run this last; prevents Colab idle disconnect)
+# Pings the local FastAPI server every 4–5 minutes and re-registers with rendezvous
+# so the main app knows Colab is still alive.
+KEEPALIVE_INTERVAL = 270  # seconds (4.5 min — safely under Colab's ~5 min idle cutoff)
 
-print("Keep-alive running. Do not stop this cell.")
+print(f"Keep-alive running every {KEEPALIVE_INTERVAL}s. Do not stop this cell.")
 while True:
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=10)
-        print(f"[keepalive] {time.strftime('%H:%M:%S')} OK")
+        print(f"[keepalive] {time.strftime('%H:%M:%S')} local server OK")
     except Exception as exc:
-        print(f"[keepalive] health check failed: {exc}")
-    time.sleep(300)  # ping every 5 minutes
+        print(f"[keepalive] local health check failed: {exc}")
+
+    if RENDEZVOUS_SERVER_URL:
+        register_with_rendezvous(PUBLIC_URL)
+
+    time.sleep(KEEPALIVE_INTERVAL)

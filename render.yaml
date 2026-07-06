@@ -1,4 +1,19 @@
 services:
+  # Rendezvous server — Colab registers its ngrok URL here; main app fetches it automatically.
+  - type: web
+    name: tesract-rendezvous
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn rendezvous_server:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: RENDEZVOUS_API_KEY
+        description: "Shared secret — must match TESRACT_API_KEY in Colab and RENDEZVOUS_API_KEY in local .env"
+        sync: false
+    healthCheckPath: /health
+
   - type: web
     name: tesract-hud
     env: python

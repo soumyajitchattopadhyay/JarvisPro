@@ -29,6 +29,7 @@ from llm_router import (
     choose_route,
     classify_task,
     colab_configured,
+    colab_discovery_enabled,
     colab_is_healthy,
     route_and_invoke,
 )
@@ -228,7 +229,10 @@ def run_all_tests() -> int:
     print("TESrACT LLM Routing Test Suite")
     print(f"  LLM_ROUTING_MODE : {ROUTING_MODE}")
     print(f"  GROQ_API_KEY     : {'set' if os.getenv('GROQ_API_KEY') else 'NOT SET'}")
-    print(f"  COLAB_LLM_URL    : {'set' if colab_configured() else 'not set'}")
+    print(f"  Colab discovery  : {'enabled' if colab_discovery_enabled() else 'not set'}")
+    print(f"  Colab URL ready  : {'yes' if colab_configured() else 'no'}")
+    if os.getenv("RENDEZVOUS_SERVER_URL"):
+        print(f"  Rendezvous       : {os.getenv('RENDEZVOUS_SERVER_URL')}")
     if colab_configured():
         print(f"  Colab health     : {'online' if colab_is_healthy() else 'offline'}")
 

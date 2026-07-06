@@ -6,7 +6,7 @@ Routing (llm_router.py):
   - Colab T4 → heavy inference (analysis, long-form, deep reasoning)
   - Automatic fallback keeps the agent online when either backend is down.
 
-Configure via .env: GROQ_API_KEY, COLAB_LLM_URL, LLM_ROUTING_MODE (auto|groq|colab).
+Configure via .env: GROQ_API_KEY, COLAB_LLM_URL or RENDEZVOUS_SERVER_URL, LLM_ROUTING_MODE.
 """
 from dotenv import load_dotenv
 
@@ -36,7 +36,15 @@ from fastapi.staticfiles import StaticFiles
 
 import actions
 import llm_router
-from llm_router import route_and_invoke, colab_configured, colab_is_healthy, build_groq_llm
+from llm_router import (
+    route_and_invoke,
+    colab_configured,
+    colab_discovery_enabled,
+    colab_is_healthy,
+    colab_url_source,
+    build_groq_llm,
+    get_colab_llm_url,
+)
 
 # --- SAFE HARDWARE IMPORTS ---
 # This prevents the "Status 1" crash on Render/Railway
@@ -73,12 +81,13 @@ def _run_speak(text: str, *, wait_for_speech: bool = False) -> None:
 # --- ROUTING STARTUP STATUS ---
 _routing_mode = os.getenv("LLM_ROUTING_MODE", "auto")
 print(f"[TESrACT] LLM routing mode: {_routing_mode}")
-if colab_configured():
+if colab_discovery_enabled():
     _colab_ok = colab_is_healthy()
-    _colab_host = (os.getenv("COLAB_LLM_URL") or "")[:48]
-    print(f"[TESrACT] Colab uplink: {'online' if _colab_ok else 'offline'} ({_colab_host})")
+    _colab_host = (get_colab_llm_url() or "(awaiting registration)")[:48]
+    _discovery = colab_url_source()
+    print(f"[TESrACT] Colab uplink: {'online' if _colab_ok else 'offline'} ({_discovery}, {_colab_host})")
 else:
-    print("[TESrACT] Colab uplink: not configured — Groq-only unless COLAB_LLM_URL is set")
+    print("[TESrACT] Colab uplink: not configured — set RENDEZVOUS_SERVER_URL or COLAB_LLM_URL")
 
 # --- WEB SERVER INIT (For Render + Full Frontend) ---
 app = FastAPI(title="TESrACT")
