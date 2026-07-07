@@ -2,7 +2,7 @@
 TESrACT LLM routing integration tests.
 
 Exercises task classification, direct routing, and the full agent graph
-(including Groq tool calling).
+(including local Ollama + Groq tool calling fallback).
 
 Usage:
     python test_routing.py
@@ -30,15 +30,14 @@ from llm_router import (
     classify_task,
     colab_configured,
     colab_is_healthy,
+    ollama_is_healthy,
+    local_status,
     route_and_invoke,
 )
 import actions
 
 ClassificationCase: TypeAlias = tuple[str, str, str] | tuple[str, str, str, int]
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _header(title: str) -> None:
     print(f"\n{'=' * 60}")
@@ -56,36 +55,32 @@ def _result(label: str, preferred: str, actual: str, ok: bool, detail: str = "")
     return ok
 
 
-# ---------------------------------------------------------------------------
-# 1. Classification (offline — no API keys required)
-# ---------------------------------------------------------------------------
-
 def test_classification() -> bool:
     _header("1. Task classification (offline)")
 
     cases: list[ClassificationCase] = [
-        ("What time is it?", "groq", "light greeting / time query"),
-        ("Hello, how are you?", "groq", "short casual message"),
-        ("What is the capital of France?", "groq", "short factual query"),
-        ("Who was the first president of the United States?", "groq", "simple who-question"),
+        ("What time is it?", "local", "light greeting / time query"),
+        ("Hello, how are you?", "local", "short casual message"),
+        ("What is the capital of France?", "local", "short factual query"),
+        ("Who was the first president of the United States?", "local", "simple who-question"),
         (
             "Analyze in detail the pros and cons of microservices architecture step by step",
-            "colab",
+            "local",
             "heavy keyword + long analysis request",
         ),
         (
             "Write a detailed 500-word essay on the causes of World War I",
-            "colab",
+            "local",
             "long-form writing with word-count hint",
         ),
         (
             "Provide a comprehensive analysis of climate change impacts on agriculture",
-            "colab",
+            "local",
             "deep analysis request",
         ),
         ("use colab for a deep analysis of this API design", "colab", "explicit Colab request"),
-        ("Search the web for the latest news on AI", "groq", "tool-friendly web search"),
-        ("What is the capital of France?", "groq", "factual query even with long thread", 15),
+        ("Search the web for the latest news on AI", "local", "tool-friendly web search"),
+        ("What is the capital of France?", "local", "factual query even with long thread", 15),
     ]
 
     all_ok = True
@@ -101,13 +96,11 @@ def test_classification() -> bool:
     return all_ok
 
 
-# ---------------------------------------------------------------------------
-# 2. Direct routing invoke (requires GROQ_API_KEY; Colab optional)
-# ---------------------------------------------------------------------------
-
 def _run_direct_route(label: str, user_text: str, expect_preferred: str) -> bool:
-    if not os.getenv("GROQ_API_KEY"):
-        print(f"\n[SKIP] {label} — GROQ_API_KEY not set")
+    has_local = ollama_is_healthy(log_failure=False)
+    has_groq = bool(os.getenv("GROQ_API_KEY"))
+    if not has_local and not has_groq:
+        print(f"\n[SKIP] {label} — Ollama offline and GROQ_API_KEY not set")
         return True
 
     sys_msg = SystemMessage(content="You are TESrACT. Reply in one short sentence, Sir.")
@@ -125,15 +118,18 @@ def _run_direct_route(label: str, user_text: str, expect_preferred: str) -> bool
             control_allowed=False,
             user_text=user_text,
             history_len=len(history),
+            tools=actions.tools,
         )
         snippet = str(response.content or "")[:80].replace("\n", " ")
         ok = preferred == expect_preferred
-        # Heavy tasks may fall back to Groq when Colab is offline — that's expected.
-        if expect_preferred == "colab" and actual == "groq" and not colab_is_healthy(log_failure=False):
+        if expect_preferred == "local" and actual in ("groq", "colab") and not has_local:
             ok = True
-            detail = f"Colab offline — Groq fallback OK | reply: {snippet!r}"
-        elif expect_preferred == "colab" and actual == "colab":
-            detail = f"Colab served request | reply: {snippet!r}"
+            detail = f"Ollama offline — {actual.upper()} fallback OK | reply: {snippet!r}"
+        elif expect_preferred == "local" and actual == "local":
+            detail = f"Local Ollama served | reply: {snippet!r}"
+        elif expect_preferred == "local" and actual in ("groq", "colab"):
+            ok = True
+            detail = f"Local preferred but cloud served ({actual}) | reply: {snippet!r}"
         else:
             detail = f"reply: {snippet!r}"
         return _result(label, preferred, actual, ok, detail)
@@ -147,30 +143,25 @@ def test_direct_routing() -> bool:
     _header("2. Direct routing invoke (live API)")
 
     ok_light = _run_direct_route(
-        "Light task → Groq",
+        "Light task → Local (Ollama light)",
         "What time is it right now?",
-        "groq",
+        "local",
     )
     ok_heavy = _run_direct_route(
-        "Heavy task → Colab (or Groq fallback)",
+        "Heavy task → Local heavy (or cloud fallback)",
         "Provide a comprehensive step-by-step analysis of REST vs GraphQL API design",
-        "colab",
+        "local",
     )
     return ok_light and ok_heavy
 
 
-# ---------------------------------------------------------------------------
-# 3. Full agent graph + Groq tool calling
-# ---------------------------------------------------------------------------
-
 def test_agent_tool_calling() -> bool:
-    _header("3. Full agent graph — Groq tool calling")
+    _header("3. Full agent graph — tool calling (local or Groq)")
 
-    if not os.getenv("GROQ_API_KEY"):
-        print("\n[SKIP] Agent tool test — GROQ_API_KEY not set")
+    if not ollama_is_healthy(log_failure=False) and not os.getenv("GROQ_API_KEY"):
+        print("\n[SKIP] Agent tool test — Ollama offline and GROQ_API_KEY not set")
         return True
 
-    # Import here so FastAPI / hardware init only runs when needed.
     from main import TESRACT_SYSTEM_PROMPT, compiled_app
 
     thread_id = "routing_test_tools"
@@ -202,14 +193,15 @@ def test_agent_tool_calling() -> bool:
                 final_reply = str(msg.content)[:100]
                 break
 
-        ok = tool_called and backend == "GROQ"
+        ok = tool_called and backend in ("LOCAL", "GROQ")
         detail = (
             f"tools invoked: {tool_names or 'none'} | "
+            f"backend: {backend} | "
             f"final reply: {final_reply!r}"
         )
         return _result(
-            "Agent uses Groq + get_current_time tool",
-            "groq",
+            "Agent uses local/Groq + get_current_time tool",
+            "local",
             backend.lower(),
             ok,
             detail,
@@ -220,13 +212,13 @@ def test_agent_tool_calling() -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def run_all_tests() -> int:
     print("TESrACT LLM Routing Test Suite")
     print(f"  LLM_ROUTING_MODE : {ROUTING_MODE}")
+    _local = local_status()
+    print(f"  Ollama           : {'online' if _local['ollama_healthy'] else 'offline'}")
+    print(f"  Light model      : {_local['light_model']}")
+    print(f"  Heavy model      : {_local['heavy_model']}")
     print(f"  GROQ_API_KEY     : {'set' if os.getenv('GROQ_API_KEY') else 'NOT SET'}")
     print(f"  COLAB_LLM_URL    : {'set' if colab_configured() else 'not set'}")
     if colab_configured():

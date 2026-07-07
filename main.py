@@ -1,12 +1,14 @@
 """
 TESrACT — JARVIS-style agent with smart LLM routing.
 
-Routing (llm_router.py):
-  - Groq  → fast responses + tool calling (web search, code, browser)
-  - Colab T4 → heavy inference (analysis, long-form, deep reasoning)
-  - Automatic fallback keeps the agent online when either backend is down.
+Routing (llm_router.py) — local-first on Apple Silicon unified RAM:
+  - Ollama  → light models (Llama 3.2 3B) for Q&A/tools; heavy (Gemma2 9B) for analysis
+  - MLX     → optional Apple Silicon text path when OLLAMA is unavailable
+  - Groq    → cloud fallback + reliable tool calling
+  - Colab   → deepest inference when local RAM is insufficient
+  - Web search results stored in Chroma in-RAM for recall across turns
 
-Configure via .env: GROQ_API_KEY, COLAB_LLM_URL, LLM_ROUTING_MODE (auto|groq|colab).
+Configure via .env: OLLAMA_* , GROQ_API_KEY, COLAB_LLM_URL, LLM_ROUTING_MODE.
 """
 from dotenv import load_dotenv
 
@@ -36,7 +38,14 @@ from fastapi.staticfiles import StaticFiles
 
 import actions
 import llm_router
-from llm_router import route_and_invoke, colab_configured, colab_is_healthy, build_groq_llm
+from llm_router import (
+    route_and_invoke,
+    colab_configured,
+    colab_is_healthy,
+    build_groq_llm,
+    local_status,
+)
+from local_search_memory import memory_stats
 
 # --- SAFE HARDWARE IMPORTS ---
 # This prevents the "Status 1" crash on Render/Railway
@@ -72,13 +81,21 @@ def _run_speak(text: str, *, wait_for_speech: bool = False) -> None:
 
 # --- ROUTING STARTUP STATUS ---
 _routing_mode = os.getenv("LLM_ROUTING_MODE", "auto")
-print(f"[TESrACT] LLM routing mode: {_routing_mode}")
+print(f"[TESrACT] LLM routing mode: {_routing_mode} (local-first when auto)")
+_local = local_status()
+print(
+    f"[TESrACT] Ollama (local RAM): "
+    f"{'online' if _local['ollama_healthy'] else 'offline'} "
+    f"light={_local['light_model']} heavy={_local['heavy_model']}"
+)
+if _local.get("mlx_enabled"):
+    print(f"[TESrACT] MLX fallback: enabled ({_local.get('mlx_model')})")
 if colab_configured():
     _colab_ok = colab_is_healthy()
     _colab_host = (os.getenv("COLAB_LLM_URL") or "")[:48]
-    print(f"[TESrACT] Colab uplink: {'online' if _colab_ok else 'offline'} ({_colab_host})")
+    print(f"[TESrACT] Colab uplink (cloud): {'online' if _colab_ok else 'offline'} ({_colab_host})")
 else:
-    print("[TESrACT] Colab uplink: not configured — Groq-only unless COLAB_LLM_URL is set")
+    print("[TESrACT] Colab uplink: not configured — local + Groq fallback")
 
 # --- WEB SERVER INIT (For Render + Full Frontend) ---
 app = FastAPI(title="TESrACT")
@@ -92,13 +109,18 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
-    # [ROUTING] Surface Colab uplink + routing mode for deploy monitoring.
+    # [ROUTING] Surface local + cloud backends for deploy monitoring.
     return {
         "status": "online",
         "system": "TESrACT",
+        "local": local_status(),
+        "search_memory": memory_stats(),
         "colab_configured": colab_configured(),
         "colab_healthy": colab_is_healthy() if colab_configured() else False,
+        "groq_configured": bool(os.getenv("GROQ_API_KEY")),
         "llm_routing_mode": os.getenv("LLM_ROUTING_MODE", "auto"),
+        "last_route": llm_router.last_route_used,
+        "last_local_model": llm_router.last_local_model or None,
     }
 
 _icons_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
@@ -180,7 +202,7 @@ class JProState(TypedDict):
     control_allowed: bool 
 
 # --- NODES ---
-# [ROUTING] Groq LLM is built via llm_router; tools stay bound here for the agent graph.
+# [ROUTING] Groq LLM for cloud fallback; local Ollama is built inside llm_router.
 llm = build_groq_llm()
 llm_with_tools = llm.bind_tools(actions.tools)
 
@@ -199,8 +221,7 @@ def call_brain(state: JProState):
             user_text = str(msg.content or "")
             break
 
-    # Delegate to llm_router — picks Groq or Colab, cross-fallback if one backend fails.
-    # Use context window size (not full checkpoint length) so long threads don't force Colab.
+    # Delegate to llm_router — local Ollama first, then Groq/Colab fallback.
     try:
         response, route = route_and_invoke(
             llm_with_tools=llm_with_tools,
@@ -209,22 +230,26 @@ def call_brain(state: JProState):
             control_allowed=is_allowed,
             user_text=user_text,
             history_len=len(history),
+            tools=actions.tools,
         )
         reason_suffix = f" — {llm_router.last_route_reason}" if llm_router.last_route_reason else ""
-        print(f"[TESrACT] Agent turn served by: {route.upper()}{reason_suffix}")
+        model_suffix = ""
+        if route == "local" and llm_router.last_local_model:
+            model_suffix = f" [{llm_router.last_local_tier or 'light'}: {llm_router.last_local_model}]"
+        print(f"[TESrACT] Agent turn served by: {route.upper()}{model_suffix}{reason_suffix}")
         return {"messages": [response]}
     except RateLimitError as e:
         # Both Groq (rate-limited) and Colab (if configured) failed — agent stays usable via simple commands.
         rate_msg = "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work."
         if colab_configured() and not colab_is_healthy(log_failure=False):
             rate_msg += " Colab GPU uplink is also offline."
-        print(f"[TESrACT] All LLM backends exhausted (Groq rate limit): {e}")
+        print(f"[TESrACT] All LLM backends exhausted (local + Groq rate limit): {e}")
         return {"messages": [AIMessage(content=rate_msg)]}
     except Exception as e:
         # Last-resort graceful reply — graph continues; simple commands still work.
         err_msg = "I encountered a temporary issue. Please try again shortly, Sir."
         _colab_up = colab_configured() and colab_is_healthy(log_failure=False)
-        print(f"[TESrACT] All LLM backends failed (Groq error, Colab {'up' if _colab_up else 'down'}): {e}")
+        print(f"[TESrACT] All LLM backends failed (local/Ollama, Groq, Colab {'up' if _colab_up else 'down'}): {e}")
         return {"messages": [AIMessage(content=err_msg)]}
 
 def reviewer_node(state: JProState) -> dict[str, object]:

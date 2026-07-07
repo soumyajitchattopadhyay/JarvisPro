@@ -1,21 +1,81 @@
+import os
 import webbrowser
 import datetime
-import os
 from langchain_core.tools import tool
 from langchain_experimental.utilities import PythonREPL
 from duckduckgo_search import DDGS
 
+from local_search_memory import format_recall_for_context, store_search
+
 repl = PythonREPL()
+
+
+def _search_duckduckgo(query: str, max_results: int = 3) -> str:
+    with DDGS() as ddgs:
+        results = ddgs.text(query, max_results=max_results, backend="lite")
+        return "\n".join([f"Source: {r['title']} - {r['body']}" for r in results])
+
+
+def _search_tavily(query: str, max_results: int = 3) -> str:
+    """Optional Tavily API — set TAVILY_API_KEY in .env for richer results."""
+    import httpx
+
+    api_key = os.getenv("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("TAVILY_API_KEY not set")
+
+    with httpx.Client(timeout=20.0) as client:
+        res = client.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": query,
+                "max_results": max_results,
+                "include_answer": True,
+            },
+        )
+        res.raise_for_status()
+        data = res.json()
+        lines: list[str] = []
+        if data.get("answer"):
+            lines.append(f"Summary: {data['answer']}")
+        for hit in data.get("results") or []:
+            title = hit.get("title") or "Untitled"
+            body = hit.get("content") or hit.get("snippet") or ""
+            url = hit.get("url") or ""
+            lines.append(f"Source: {title} ({url}) - {body}")
+        return "\n".join(lines) if lines else "No Tavily results."
+
 
 @tool
 def web_search(query: str):
-    """Search the web for current information, facts, or news."""
+    """Search the web for current information, facts, or news. Recalls prior local searches when relevant."""
+    query = (query or "").strip()
+    if not query:
+        return "Search Error: empty query."
+
+    prior = format_recall_for_context(query)
+    provider = "duckduckgo"
     try:
-        with DDGS() as ddgs:
-            results = ddgs.text(query, max_results=3, backend="lite")
-            return "\n".join([f"Source: {r['title']} - {r['body']}" for r in results])
+        if os.getenv("TAVILY_API_KEY", "").strip():
+            provider = "tavily"
+            fresh = _search_tavily(query)
+        else:
+            fresh = _search_duckduckgo(query)
     except Exception as e:
-        return f"Search Error: {str(e)}"
+        if provider == "tavily":
+            try:
+                provider = "duckduckgo"
+                fresh = _search_duckduckgo(query)
+            except Exception as fallback_exc:
+                return f"Search Error: {fallback_exc}"
+        else:
+            return f"Search Error: {str(e)}"
+
+    store_search(query, fresh, source=provider)
+    header = f"[Web search via {provider} — stored in local RAM memory]\n"
+    return header + (prior + fresh if prior else fresh)
+
 
 @tool
 def execute_python_code(code: str, control_allowed: bool = False):
@@ -27,6 +87,7 @@ def execute_python_code(code: str, control_allowed: bool = False):
         return f"Execution complete:\n{result}"
     except Exception as e:
         return f"Execution failed: {str(e)}"
+
 
 @tool
 def open_url_in_browser(url: str, control_allowed: bool = False):
