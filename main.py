@@ -10,6 +10,7 @@ Routing (llm_router.py) — local-first on Apple Silicon unified RAM:
 
 Configure via .env: OLLAMA_* , GROQ_API_KEY, COLAB_LLM_URL, LLM_ROUTING_MODE.
 """
+from __future__ import annotations
 from dotenv import load_dotenv
 
 load_dotenv()  # Must run before any other import — llm_router reads env at import time.
@@ -27,31 +28,42 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 from typing_extensions import NotRequired
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 from groq import RateLimitError
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import actions
 import llm_router
+import mac_access
 from llm_router import (
     route_and_invoke,
+    route_and_invoke_synthesis,
     colab_configured,
     colab_is_healthy,
     build_groq_llm,
     local_status,
+    hybrid_status,
+    deserialize_messages,
+    serialize_aimessage,
 )
-from local_search_memory import memory_stats
+from local_search_memory import (
+    format_memory_for_system,
+    get_memory_stats,
+    run_memory_cleanup,
+    search_memory_status,
+    store_turn_summary,
+)
 
 # --- SAFE HARDWARE IMPORTS ---
 # This prevents the "Status 1" crash on Render/Railway
 SpeakFn = Callable[..., None]
-ListenFn = Callable[[], str | None]
-
+from typing import Optional
+ListenFn = Callable[[], Optional[str]]
 try:
     from speak import speak as _speak_impl
     from listen import listen_for_command as _listen_impl
@@ -81,13 +93,18 @@ def _run_speak(text: str, *, wait_for_speech: bool = False) -> None:
 
 # --- ROUTING STARTUP STATUS ---
 _routing_mode = os.getenv("LLM_ROUTING_MODE", "auto")
-print(f"[TESrACT] LLM routing mode: {_routing_mode} (local-first when auto)")
+print(f"[TESrACT] LLM routing mode: {_routing_mode} (Ollama primary when auto)")
 _local = local_status()
+_ollama_state = "online" if _local["ollama_healthy"] else "offline"
+_light_avail = "ready" if _local.get("light_model_available") else "missing"
+_heavy_avail = "ready" if _local.get("heavy_model_available") else "missing"
 print(
-    f"[TESrACT] Ollama (local RAM): "
-    f"{'online' if _local['ollama_healthy'] else 'offline'} "
-    f"light={_local['light_model']} heavy={_local['heavy_model']}"
+    f"[TESrACT] Ollama (primary): {_ollama_state} "
+    f"light={_local['light_model']} ({_light_avail}) "
+    f"heavy={_local['heavy_model']} ({_heavy_avail})"
 )
+if _local.get("installed_models"):
+    print(f"[TESrACT] Ollama models pulled: {', '.join(_local['installed_models'])}")
 if _local.get("mlx_enabled"):
     print(f"[TESrACT] MLX fallback: enabled ({_local.get('mlx_model')})")
 if colab_configured():
@@ -96,6 +113,19 @@ if colab_configured():
     print(f"[TESrACT] Colab uplink (cloud): {'online' if _colab_ok else 'offline'} ({_colab_host})")
 else:
     print("[TESrACT] Colab uplink: not configured — local + Groq fallback")
+
+_hybrid = hybrid_status()
+if _hybrid["enabled"]:
+    if _hybrid["local_instance_url"]:
+        _mac_state = "online" if _hybrid["remote_mac_healthy"] else "offline"
+        print(
+            f"[TESrACT] Hybrid routing: ENABLED — remote Mac {_mac_state} "
+            f"({_hybrid['local_instance_url'][:48]})"
+        )
+    else:
+        print("[TESrACT] Hybrid routing: ENABLED but LOCAL_INSTANCE_URL not set")
+else:
+    print("[TESrACT] Hybrid routing: disabled (set ENABLE_HYBRID_ROUTING=true on Render)")
 
 # --- WEB SERVER INIT (For Render + Full Frontend) ---
 app = FastAPI(title="TESrACT")
@@ -107,49 +137,328 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _system_info() -> dict:
+    """Fast host snapshot for hybrid-router liveness probes."""
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        return {
+            "platform": sys.platform,
+            "ram_total_gb": round(vm.total / (1024 ** 3), 2),
+            "ram_available_gb": round(vm.available / (1024 ** 3), 2),
+            "ram_used_percent": vm.percent,
+        }
+    except Exception as exc:
+        return {"platform": sys.platform, "error": str(exc)}
+
+
 @app.get("/health")
 def health_check():
-    # [ROUTING] Surface local + cloud backends for deploy monitoring.
+    """Lightweight liveness probe — local Mac instance + inference readiness."""
+    local = local_status()
+    search_memory = search_memory_status()
+    local_llm_available = bool(local.get("ollama_healthy"))
+
     return {
-        "status": "online",
-        "system": "TESrACT",
-        "local": local_status(),
-        "search_memory": memory_stats(),
+        "status": "ok",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "local_llm_available": local_llm_available,
+        "memory_available": bool(search_memory.get("available")),
+        "system": _system_info(),
+        "local": local,
+        "search_memory": search_memory,
         "colab_configured": colab_configured(),
-        "colab_healthy": colab_is_healthy() if colab_configured() else False,
+        "colab_healthy": colab_is_healthy(log_failure=False) if colab_configured() else False,
         "groq_configured": bool(os.getenv("GROQ_API_KEY")),
         "llm_routing_mode": os.getenv("LLM_ROUTING_MODE", "auto"),
+        "hybrid": hybrid_status(),
         "last_route": llm_router.last_route_used,
+        "last_route_is_fallback": llm_router.last_route_is_fallback,
         "last_local_model": llm_router.last_local_model or None,
     }
 
-_icons_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+
+@app.get("/memory/stats")
+def memory_stats_endpoint():
+    """Monitor in-RAM search/media memory usage and host RAM."""
+    return get_memory_stats(detailed=True)
+
+
+@app.post("/memory/cleanup")
+def memory_cleanup_endpoint():
+    """Trigger TTL and capacity cleanup across warm memory collections."""
+    return run_memory_cleanup(force=True)
+
+
+@app.post("/internal/llm/invoke")
+async def internal_llm_invoke(request: Request):
+    """
+    Internal endpoint for hybrid routing — executes LLM inference on this Mac instance.
+    Called by Render/cloud when ENABLE_HYBRID_ROUTING routes through LOCAL_INSTANCE_URL.
+    """
+    api_key = os.getenv("LOCAL_INSTANCE_API_KEY", "")
+    if api_key:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {api_key}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+        messages = deserialize_messages(body.get("messages") or [])
+        if not messages:
+            return JSONResponse({"error": "messages required"}, status_code=400)
+
+        sys_msg = messages[0] if isinstance(messages[0], SystemMessage) else SystemMessage(content="")
+        history = messages[1:] if isinstance(messages[0], SystemMessage) else messages
+        control_allowed = bool(body.get("control_allowed", False))
+        user_text = str(body.get("user_text") or "")
+        history_len = int(body.get("history_len") or len(history))
+
+        response, route = route_and_invoke(
+            llm_with_tools=llm_with_tools,
+            sys_msg=sys_msg,
+            history=history,
+            control_allowed=control_allowed,
+            user_text=user_text,
+            history_len=history_len,
+            tools=actions.tools,
+            allow_remote_mac=False,
+        )
+        return {
+            "message": serialize_aimessage(response),
+            "route": route,
+            "model": llm_router.last_local_model or None,
+            "reason": llm_router.last_route_reason,
+        }
+    except Exception as exc:
+        print(f"[TESrACT] /internal/llm/invoke error: {exc}")
+        traceback.print_exc()
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+_base_dir = os.path.dirname(os.path.abspath(__file__))
+_icons_dir = os.path.join(_base_dir, "icons")
 if os.path.isdir(_icons_dir):
     app.mount("/icons", StaticFiles(directory=_icons_dir), name="icons")
 
-# Permission helpers (synced with user_settings.json for web)
-SETTINGS_FILE = "user_settings.json"
+_generated_dir = os.path.join(_base_dir, "generated_images")
+os.makedirs(_generated_dir, exist_ok=True)
+app.mount("/generated", StaticFiles(directory=_generated_dir), name="generated")
+
+# Permission helpers — persisted per thread for the session (survives restarts)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(_BASE_DIR, "user_settings.json")
+
+_GRANT_CONTROL_RE = re.compile(
+    r"\b("
+    r"allow(?:\s+me)?\s+control|"
+    r"allow\s+(?:full\s+)?(?:access|control)|"
+    r"grant(?:\s+me)?\s+(?:access|control)|"
+    r"elevate(?:d)?(?:\s+access)?|"
+    r"enable\s+control|"
+    r"give\s+(?:me\s+)?(?:access|control)|"
+    r"unlock\s+(?:control|access)|"
+    r"turn\s+on\s+control"
+    r")\b",
+    re.IGNORECASE,
+)
+_REVOKE_CONTROL_RE = re.compile(
+    r"\b("
+    r"stop\s+control|"
+    r"restrict\s+control|"
+    r"revoke\s+(?:access|control)|"
+    r"disable\s+control|"
+    r"lock\s+(?:control|access)|"
+    r"turn\s+off\s+control"
+    r")\b",
+    re.IGNORECASE,
+)
+# Polite / conversational filler around a pure grant or revoke.
+_PERMISSION_FILLER_RE = re.compile(
+    r"\b("
+    r"yes|yep|yeah|yup|ok|okay|sure|please|now|thanks|thank\s*you|sir|"
+    r"go\s*ahead|alright|fine|do\s*it|i|i'?m|am|will|would|like|to|you|"
+    r"can|may|have|give|me|the|a|an|my|your|pc|computer|mac|system|"
+    r"device|machine|permission|elevated|mode|session|just|really|"
+    r"right|then|here|there|once|for|this|that"
+    r")\b",
+    re.IGNORECASE,
+)
+
+PERMISSION_GRANTED_REPLY = (
+    "Elevated Mac control granted for this session, Sir. "
+    "I can read, write, and run commands on your Mac until you say 'Stop Control'."
+)
+PERMISSION_REVOKED_REPLY = (
+    "Mac control revoked, Sir. I am back in restricted mode — "
+    "filesystem and terminal tools are locked until you say 'Allow Control' again."
+)
+PERMISSION_ALREADY_ACTIVE_REPLY = (
+    "Mac control is already active this session, Sir. "
+    "Tell me what to read, write, or run."
+)
+PERMISSION_ALREADY_RESTRICTED_REPLY = (
+    "I am already in restricted mode, Sir. "
+    "Say 'Allow Control' when you want Mac filesystem or terminal access."
+)
+
 
 def get_permission(thread_id: str = "web_user_001") -> bool:
     if not os.path.exists(SETTINGS_FILE):
         return False
     try:
-        with open(SETTINGS_FILE, "r") as f:
-            return json.load(f).get(thread_id, False)
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get(thread_id, False))
     except Exception:
         return False
 
-def set_permission(status: bool, thread_id: str = "web_user_001"):
-    data = {}
+
+def set_permission(status: bool, thread_id: str = "web_user_001") -> None:
+    data: dict = {}
     if os.path.exists(SETTINGS_FILE):
         try:
-            with open(SETTINGS_FILE, "r") as f:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
             pass
-    data[thread_id] = status
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(data, f)
+    data[thread_id] = bool(status)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def parse_permission_intent(text: str) -> bool | None:
+    """Return True (grant), False (revoke), or None (no permission change)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    lower = raw.lower()
+    if _REVOKE_CONTROL_RE.search(lower):
+        return False
+    if _GRANT_CONTROL_RE.search(lower):
+        return True
+    return None
+
+
+def is_permission_only_message(text: str) -> bool:
+    """True when the message only grants/revokes control (no other task attached).
+
+    Accepts conversational forms like 'yes allow control', 'please grant access',
+    'ok, stop control' so they never fall through to the LLM path.
+    """
+    if parse_permission_intent(text) is None:
+        return False
+    cleaned = (text or "").strip()
+    cleaned = _GRANT_CONTROL_RE.sub(" ", cleaned)
+    cleaned = _REVOKE_CONTROL_RE.sub(" ", cleaned)
+    cleaned = _PERMISSION_FILLER_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"[\s,.;:!?\"'`~_\-/\\|()[\]{}]+", "", cleaned)
+    return len(cleaned) == 0
+
+
+def is_grant_only_message(text: str) -> bool:
+    return parse_permission_intent(text) is True and is_permission_only_message(text)
+
+
+def is_revoke_only_message(text: str) -> bool:
+    return parse_permission_intent(text) is False and is_permission_only_message(text)
+
+
+def apply_permission_change(text: str, thread_id: str) -> tuple[bool, bool | None]:
+    """
+    Apply grant/revoke from user text.
+    Returns (new_control_allowed, changed):
+      - changed is True if permission keyword present and state flipped
+      - changed is False if keyword present but already in that state
+      - changed is None if no permission keyword
+    """
+    intent = parse_permission_intent(text)
+    if intent is None:
+        current = get_permission(thread_id)
+        return current, None
+    previous = get_permission(thread_id)
+    set_permission(intent, thread_id)
+    flipped = previous != intent
+    print(
+        f"[TESrACT:perm] thread={thread_id} control={'ACTIVE' if intent else 'RESTRICTED'}"
+        f"{'' if flipped else ' (no change)'}"
+    )
+    return intent, flipped
+
+
+def resolve_control_allowed(state: JProState | dict | None) -> bool:
+    """Session permission: persisted store OR in-graph state (whichever is granted)."""
+    state = state or {}
+    thread_id = str(state.get("thread_id") or "web_user_001")
+    in_graph = bool(state.get("control_allowed"))
+    persisted = get_permission(thread_id)
+    return in_graph or persisted
+
+
+def permission_reply_for(
+    text: str,
+    *,
+    was_allowed: bool,
+    now_allowed: bool | None = None,
+    currently_allowed: bool | None = None,
+    just_changed: bool | None = None,
+) -> str | None:
+    """Immediate UX reply for grant/revoke-only messages (no LLM needed)."""
+    # Back-compat: older callers used currently_allowed / just_changed
+    if now_allowed is None:
+        now_allowed = currently_allowed if currently_allowed is not None else was_allowed
+    if not is_permission_only_message(text):
+        return None
+    intent = parse_permission_intent(text)
+    if intent is True:
+        if just_changed is False or was_allowed:
+            return PERMISSION_ALREADY_ACTIVE_REPLY
+        return PERMISSION_GRANTED_REPLY
+    if intent is False:
+        if just_changed is False or not was_allowed:
+            return PERMISSION_ALREADY_RESTRICTED_REPLY
+        return PERMISSION_REVOKED_REPLY
+    return None
+
+
+def set_session_permission(
+    allowed: bool,
+    thread_id: str = "web_user_001",
+    *,
+    sync_graph: bool = True,
+) -> tuple[bool, bool]:
+    """
+    Authoritatively set session Mac control.
+    Returns (new_status, changed).
+    """
+    previous = get_permission(thread_id)
+    new_status = bool(allowed)
+    set_permission(new_status, thread_id)
+    if sync_graph:
+        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+        sync_graph_permission(
+            compiled_app, config, thread_id=thread_id, control_allowed=new_status,
+        )
+    changed = previous != new_status
+    print(
+        f"[TESrACT:perm] set_session thread={thread_id} "
+        f"control={'ACTIVE' if new_status else 'RESTRICTED'}"
+        f"{'' if changed else ' (no change)'}"
+    )
+    return new_status, changed
+
+
+def sync_graph_permission(
+    app: object,
+    config: RunnableConfig,
+    *,
+    thread_id: str,
+    control_allowed: bool,
+) -> None:
+    """Keep LangGraph checkpoint aligned with persisted session permission."""
+    try:
+        app.update_state(config, {"control_allowed": bool(control_allowed), "thread_id": thread_id})
+    except Exception as exc:
+        print(f"[TESrACT:perm] checkpoint sync skipped: {exc}")
 
 def try_simple_command(text: str, control_allowed: bool) -> str | None:
     """Handle very simple commands directly (bypass LLM to save tokens and work under rate limits)."""
@@ -185,59 +494,596 @@ def try_simple_command(text: str, control_allowed: bool) -> str | None:
 
     return None
 
-# --- TESrACT CORE DIRECTIVES (minimal Jarvis-style) ---
-TESRACT_SYSTEM_PROMPT = """You are TESrACT, like JARVIS. Call user "Sir". Be calm, concise, formal.
+# --- TESrACT CORE DIRECTIVES (agentic Jarvis-style) ---
+TESRACT_SYSTEM_PROMPT = """You are TESrACT — a genuinely agentic AI assistant (JARVIS-style). Address the user as "Sir".
 
-Rules: Use tools for actions/info. Never claim results without tool confirmation.
-Tools: web_search, execute_python_code (if allowed), open_url_in_browser (if allowed), get_current_time.
-If RESTRICTED, ask for "Allow Control".
+## Identity
+You solve problems by EXECUTING TOOLS, not by chatting. You operate on Sir's Mac with real capabilities:
+file management, terminal commands, coding tasks, web research, and automation.
 
-Reply briefly, stay in character."""
+## Anti-hallucination rules (CRITICAL — never violate)
+1. NEVER claim you executed an action unless you received a ToolMessage result in this conversation.
+2. NEVER say "I'm generating…", "I've created…", "I'm searching…" in plain text — emit a tool_call instead.
+3. NEVER say you are text-only or cannot use tools. You have tools. Use them.
+4. If no tool has run yet for Sir's request, your NEXT output MUST be tool_calls (not prose).
+5. Only report facts from tool output. Quote STATUS lines (SUCCESS, PERMISSION_DENIED, etc.) honestly.
+6. NEVER use placeholders like [Insert Current Time], {time}, TODO, or bracketed filler text.
+7. After tools run, your NEXT message must be plain text that copies the RESULT section from ToolMessage exactly.
+
+## Two-phase tool workflow
+Phase 1 — Call tools: emit tool_calls only (minimal or empty text).
+Phase 2 — Synthesize: after ToolMessage appears, write a final answer in plain text using the RESULT data. No more tool_calls.
+
+## Mac access & permission model
+Sir says "Allow Control" once to unlock Mac filesystem and terminal tools for the session.
+Permission persists until Sir says "Stop Control" or the session ends — no need to re-grant each turn.
+While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask Sir for "Allow Control".
+
+### No elevation needed (safe / read-only cloud tools):
+  web_search, search_and_summarize, recall_memory, save_memory_note, manage_task_plan,
+  generate_image, get_current_time
+
+### Require Allow Control (Mac filesystem & system actions):
+  read_file, write_file, list_directory, run_terminal_command,
+  execute_python_code, open_url_in_browser
+
+### Terminal safety (run_terminal_command):
+- Safe commands (ls, pwd, git status, cat) run immediately when control is ACTIVE.
+- Dangerous commands (rm, sudo, install, chmod) return CONFIRMATION_REQUIRED — show Sir the exact command and wait.
+- Sir confirms with "Confirm command" or "Yes, run it" — then retry the SAME command with user_confirmed=true.
+- BLOCKED commands (rm -rf /, system path edits) are never executed — explain why and suggest a safer alternative.
+
+### Filesystem safety:
+- Paths support ~ and absolute Mac paths (~/Desktop, ~/Documents, /Users/...).
+- Protected system paths (/System, /usr, /etc, SSH keys) cannot be written or deleted.
+- Prefer non-destructive operations; never delete without explicit Sir request and confirmation.
+
+## Tool guide
+- Image/draw/create picture → generate_image
+- Research/news/look up → search_and_summarize (deep) or web_search (quick)
+- Past context/remember/previous → recall_memory
+- Remember this preference/fact → save_memory_note
+- Complex multi-step work → manage_task_plan
+- Read/list/edit files on Mac → read_file / list_directory / write_file
+- Shell/terminal/build/git/npm → run_terminal_command
+- Calculate/code snippet → execute_python_code
+- Time/date → get_current_time
+- Open URL → open_url_in_browser
+
+## Error recovery
+If a tool fails: try an alternative tool or approach. Do not give up or hallucinate success.
+If PERMISSION_DENIED: ask Sir for "Allow Control" and retry the same tool.
+If CONFIRMATION_REQUIRED: quote the command to Sir and wait for confirmation — do not claim it ran.
+
+Use Mac access responsibly to help Sir with coding, file management, and real tasks.
+Reply concisely in character. Be proactive, precise, and evidence-based."""
 
 PROTOCOLS = {"CORE": TESRACT_SYSTEM_PROMPT}  # kept for backward compat in status messages
 
 class JProState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     next_step: NotRequired[str]
-    control_allowed: bool 
+    control_allowed: bool
+    thread_id: NotRequired[str]
+    command_confirmed: NotRequired[bool]
 
 # --- NODES ---
 # [ROUTING] Groq LLM for cloud fallback; local Ollama is built inside llm_router.
 llm = build_groq_llm()
 llm_with_tools = llm.bind_tools(actions.tools)
 
+_REFUSAL_PATTERNS = (
+    "text-based", "text based", "text only", "language model only",
+    "cannot generate image", "can't generate image", "unable to generate image",
+    "i cannot create", "i can't create", "i am unable to", "i'm unable to",
+    "don't have the ability", "do not have the ability", "as an ai language model",
+    "i'm just a", "i am just a", "not able to perform", "cannot perform actions",
+)
+_ACTION_REQUEST_RE = re.compile(
+    r"\b(generate|create|draw|make|build|search|look up|research|run|execute|"
+    r"calculate|open|read|write|save|list|find|fetch|download|summarize|image|"
+    r"picture|photo|code|python|file|url|website|browse|remember|recall)\b",
+    re.IGNORECASE,
+)
+_RETRY_NUDGE = (
+    "CRITICAL: You must use your available tools to fulfill Sir's request. "
+    "Do NOT refuse or claim you are text-only. Call the appropriate tool now "
+    "(generate_image, web_search, search_and_summarize, recall_memory, "
+    "read_file, list_directory, write_file, run_terminal_command, "
+    "execute_python_code, get_current_time, etc.) and report the actual result."
+)
+_HALLUCINATION_NUDGE = (
+    "HALLUCINATION BLOCKED: You described an action in text but did NOT call a tool. "
+    "Sir's request is still UNFULFILLED. Issue tool_calls NOW. "
+    "Never claim images were generated, code was run, or searches were done without ToolMessage evidence."
+)
+_FAKE_EXECUTION_RE = re.compile(
+    r"\b("
+    r"i(?:'ve| have) (?:generated|created|executed|searched|saved|written|run|opened)|"
+    r"(?:i'm|i am) (?:generating|creating|executing|searching|running|opening)|"
+    r"(?:generating|creating|executing|searching|running) (?:your |the |an? )|"
+    r"image has been (?:created|generated)|here is your image|"
+    r"let me (?:generate|create|search|run|execute|open)|"
+    r"the image (?:is|has been)|successfully generated"
+    r")\b",
+    re.IGNORECASE,
+)
+# Match LLM filler placeholders, but not legitimate tool-output tags like [dir]/[file].
+_PLACEHOLDER_RE = re.compile(
+    r"\["
+    r"(?!(?:dir|file|folder|link|image)\b)"  # structural list tags from tools
+    r"[^\]]{1,80}\]"
+    r"|TODO|TBD|PLACEHOLDER|\{[a-z_ ]+\}"
+    r"|\bX%\b|\[X%\]",
+    re.IGNORECASE,
+)
+_SYNTHESIS_NUDGE = (
+    "SYNTHESIS REQUIRED: Tool results are in the ToolMessage above. "
+    "Write a plain-text reply to Sir copying the exact RESULT values. "
+    "No tool_calls. No placeholders or brackets."
+)
+_TOOL_RESULT_RE = re.compile(r"RESULT:\s*\n?", re.IGNORECASE)
+
+
+def _recent_tool_use(messages: list[BaseMessage], window: int = 8) -> bool:
+    return any(isinstance(m, ToolMessage) for m in messages[-window:])
+
+
+def _looks_like_refusal(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(pat in lower for pat in _REFUSAL_PATTERNS)
+
+
+def _looks_like_fake_execution(text: str) -> bool:
+    return bool(_FAKE_EXECUTION_RE.search(text or ""))
+
+
+def _nudge_already_sent(messages: list[BaseMessage], marker: str) -> bool:
+    return any(
+        isinstance(m, SystemMessage) and marker in str(m.content or "")
+        for m in messages[-8:]
+    )
+
+
+def _has_placeholders(text: str) -> bool:
+    return bool(_PLACEHOLDER_RE.search(text or ""))
+
+
+_BACKEND_FAILURE_MARKERS = (
+    "temporary issue",
+    "try again shortly",
+    "rate-limited",
+    "rate limited",
+    "all backends exhausted",
+)
+
+
+def _looks_like_backend_failure(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(marker in lower for marker in _BACKEND_FAILURE_MARKERS)
+
+
+def _is_valid_synthesis(text: str) -> bool:
+    """True when assistant text is a real answer, not a placeholder or fake execution claim."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    if _has_placeholders(cleaned) or _looks_like_fake_execution(cleaned):
+        return False
+    if _looks_like_backend_failure(cleaned):
+        return False
+    # Local models often emit "tool_call: list_directory /Applications" as prose
+    if actions.looks_like_pseudo_tool_call(cleaned):
+        return False
+    return True
+
+
+def _reply_uses_tool_evidence(text: str, tool_messages: list[ToolMessage]) -> bool:
+    """True when a synthesized reply plausibly reflects actual tool output."""
+    if not text or not tool_messages:
+        return bool(text)
+    if _looks_like_backend_failure(text):
+        return False
+    lower = text.lower()
+    for tm in tool_messages:
+        name = str(getattr(tm, "name", "") or "")
+        raw = str(tm.content or "")
+        body = _parse_tool_result(raw)
+        if "STATUS: ERROR" in raw.upper() or "PERMISSION_DENIED" in raw.upper():
+            # Accept only if the reply actually mentions the permission/error situation
+            if "permission" in lower or "allow control" in lower or "error" in lower:
+                return True
+            continue
+        if not body:
+            continue
+        if name == "get_current_time":
+            if re.search(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\b", body, re.IGNORECASE):
+                if re.search(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\b", text, re.IGNORECASE):
+                    return True
+            for token in body.replace(",", " ").split():
+                if len(token) >= 4 and token.lower() in lower:
+                    return True
+            return False
+        if name in ("list_directory", "read_file", "write_file", "run_terminal_command"):
+            # Require at least one distinctive token from tool output in the reply
+            tokens = [
+                tok for tok in re.split(r"[\s,\[\]()/:]+", body)
+                if len(tok) >= 4 and tok.lower() not in {"file", "files", "contents", "bytes", "status", "success", "result"}
+            ]
+            hits = sum(1 for tok in tokens[:40] if tok.lower() in lower)
+            if hits >= 1:
+                return True
+            continue
+        if name in ("web_search", "search_and_summarize", "recall_memory"):
+            return _is_valid_synthesis(text)
+    return False
+
+
+def _tool_calls_pending(messages: list[BaseMessage]) -> bool:
+    """True if the latest AI message requested tools not yet answered."""
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            return False
+        if isinstance(msg, AIMessage):
+            return bool(getattr(msg, "tool_calls", None))
+        if isinstance(msg, HumanMessage):
+            return False
+    return False
+
+
+def _pending_tool_synthesis(messages: list[BaseMessage]) -> bool:
+    """True when tools ran this turn but no trustworthy final plain-text AI reply exists yet."""
+    saw_tool = False
+    turn_tools: list[ToolMessage] = []
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            if getattr(msg, "tool_calls", None):
+                continue
+            text = str(msg.content or "")
+            if _is_valid_synthesis(text) and _reply_uses_tool_evidence(text, turn_tools):
+                return False
+        if isinstance(msg, ToolMessage):
+            saw_tool = True
+            turn_tools.append(msg)
+        if isinstance(msg, HumanMessage):
+            break
+    turn_tools.reverse()
+    return saw_tool
+
+
+def _current_turn_tool_messages(messages: list[BaseMessage]) -> list[ToolMessage]:
+    found: list[ToolMessage] = []
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            break
+        if isinstance(msg, ToolMessage):
+            found.append(msg)
+    found.reverse()
+    return found
+
+
+def _parse_tool_result(content: str) -> str:
+    text = (content or "").strip()
+    if "RESULT:" in text.upper():
+        parts = _TOOL_RESULT_RE.split(text, maxsplit=1)
+        if len(parts) > 1:
+            return parts[1].strip()
+    return text
+
+
+def _try_execute_pending_command(
+    user_text: str,
+    *,
+    thread_id: str,
+    control_allowed: bool,
+) -> str | None:
+    """Run a previously queued shell command after Sir confirms."""
+    if not control_allowed or not mac_access.is_confirmation_message(user_text):
+        return None
+    pending = mac_access.get_pending_confirmation(thread_id)
+    if not pending or pending.get("tool") != "run_terminal_command":
+        return None
+
+    result = actions.run_tool(
+        "run_terminal_command",
+        {
+            "command": pending.get("command", ""),
+            "working_directory": pending.get("working_directory", ""),
+            "user_confirmed": True,
+        },
+        control_allowed=True,
+        thread_id=thread_id,
+        user_confirmed=True,
+    )
+    mac_access.clear_pending_confirmation(thread_id)
+    body = _parse_tool_result(result)
+    if "STATUS: ERROR" in result.upper():
+        return f"I could not run the command, Sir. {body}"
+    return f"Command executed, Sir.\n\n{body}"
+
+
+def _format_tool_fallback_reply(tool_messages: list[ToolMessage]) -> str:
+    """Build a user-facing reply directly from tool output when the LLM fails to synthesize."""
+    if not tool_messages:
+        return "At your service, Sir."
+
+    lines: list[str] = []
+    for tm in tool_messages:
+        name = str(getattr(tm, "name", "") or "tool")
+        body = _parse_tool_result(str(tm.content or ""))
+        if not body:
+            continue
+        if name == "get_current_time":
+            return f"{body}, Sir."
+        if name == "manage_task_plan":
+            clean = body.replace("STATUS: EMPTY", "No active task plan.").replace("STATUS: ACTIVE", "").strip()
+            return f"{clean}, Sir." if clean else "No active task plan, Sir."
+        if name in ("web_search", "search_and_summarize", "recall_memory", "run_terminal_command"):
+            lines.append(body[:1200])
+        elif name in ("read_file", "write_file", "list_directory"):
+            # Apps listing can be long — keep a useful chunk
+            limit = 3500 if "Applications" in body or "applications" in body.lower() else 1200
+            lines.append(body[:limit])
+        elif name == "generate_image" and "Local URL:" in body:
+            for part in body.splitlines():
+                if part.startswith("Local URL:"):
+                    lines.append(f"Image ready, Sir. {part.strip()}")
+                    break
+            else:
+                lines.append(body[:400])
+        else:
+            lines.append(body[:600])
+
+    if not lines:
+        return "Task completed, Sir."
+    if len(lines) == 1:
+        return f"{lines[0]}, Sir." if not lines[0].endswith(".") else f"{lines[0]} Sir."
+    return "Here are the results, Sir.\n\n" + "\n\n".join(lines)
+
+
+def extract_final_reply(messages: list[BaseMessage]) -> str:
+    """Pick the best final assistant reply, falling back to raw tool output."""
+    turn_tools = _current_turn_tool_messages(messages)
+    if turn_tools:
+        tool_reply = _format_tool_fallback_reply(turn_tools)
+        if tool_reply and tool_reply != "At your service, Sir.":
+            for msg in reversed(messages):
+                if not isinstance(msg, AIMessage):
+                    continue
+                if getattr(msg, "tool_calls", None):
+                    continue
+                text = str(msg.content or "").strip()
+                if _is_valid_synthesis(text) and _reply_uses_tool_evidence(text, turn_tools):
+                    return text
+            return tool_reply
+
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+            text = str(msg.content or "").strip()
+            if _is_valid_synthesis(text):
+                return text
+
+    return "At your service, Sir."
+
+
+def _sanitize_tool_call_response(response: AIMessage) -> AIMessage:
+    """Strip hallucinated placeholder text from tool-call turns."""
+    if not getattr(response, "tool_calls", None):
+        return response
+    content = str(getattr(response, "content", "") or "").strip()
+    if (
+        not content
+        or _has_placeholders(content)
+        or _looks_like_fake_execution(content)
+        or actions.looks_like_pseudo_tool_call(content)
+    ):
+        return AIMessage(content="", tool_calls=response.tool_calls)
+    return response
+
+
+def _should_force_tools(state: JProState) -> bool:
+    """Run tools deterministically when the LLM did not call them for an action request."""
+    messages = state.get("messages", [])
+    if _current_turn_tool_messages(messages):
+        return False
+
+    user_text = ""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            user_text = str(msg.content or "")
+            break
+    if not user_text:
+        return False
+
+    last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
+    if last_ai and getattr(last_ai, "tool_calls", None):
+        return False
+
+    ai_text = str(getattr(last_ai, "content", "") or "") if last_ai else ""
+
+    # Prefer deterministic tools whenever we can infer them (list Desktop/apps, time, etc.)
+    if actions.infer_forced_tools(user_text):
+        return True
+
+    # Local models often emit "tool_call: list_directory /Applications" as plain text
+    if ai_text and (
+        actions.parse_pseudo_tool_calls(ai_text)
+        or actions.looks_like_pseudo_tool_call(ai_text)
+    ):
+        return True
+
+    if not _ACTION_REQUEST_RE.search(user_text):
+        return False
+
+    if last_ai is None:
+        return True
+
+    return (
+        _has_placeholders(ai_text)
+        or _looks_like_fake_execution(ai_text)
+        or _looks_like_backend_failure(ai_text)
+        or not ai_text.strip()
+        or _looks_like_refusal(ai_text)
+    )
+
+
+def _tool_status_ok(content: str) -> bool:
+    upper = (content or "").upper()
+    if "STATUS: ERROR" in upper or "PERMISSION_DENIED" in upper:
+        return False
+    return (
+        "STATUS: SUCCESS" in upper
+        or "STATUS: SAVED" in upper
+        or "STATUS: FOUND" in upper
+        or "STATUS: CREATED" in upper
+        or "STATUS: ACTIVE" in upper
+        or "STATUS: EMPTY" in upper
+        or "EXECUTION COMPLETE" in upper
+        or "IMAGE GENERATED" in upper
+        or "BROWSER OPENED" in upper
+        or "WRITTEN " in upper
+        or "FILE:" in upper
+        or "CONTENTS OF" in upper
+    )
+
+
+def _build_system_prompt(
+    *,
+    control_status: str,
+    user_text: str,
+    raw_history: list[BaseMessage],
+    thread_id: str = "web_user_001",
+) -> str:
+    parts = [TESRACT_SYSTEM_PROMPT, f"\nCURRENT_CONTROL: {control_status}"]
+
+    pending = mac_access.get_pending_confirmation(thread_id)
+    if pending:
+        parts.append(
+            "\n## PENDING COMMAND CONFIRMATION\n"
+            f"Awaiting Sir's approval to run:\n  {pending.get('command', '')}\n"
+            "If Sir says 'Confirm command' or 'Yes, run it', retry run_terminal_command "
+            "with the SAME command and user_confirmed=true."
+        )
+
+    memory_ctx = format_memory_for_system(user_text, n=3)
+    if memory_ctx:
+        parts.append(f"\n## Memory context\n{memory_ctx}")
+
+    if _ACTION_REQUEST_RE.search(user_text) and not _recent_tool_use(raw_history):
+        parts.append(
+            "\n## ACTION REQUIRED THIS TURN\n"
+            "Sir's message requires real tool execution. "
+            "You MUST emit tool_calls now — do NOT describe actions in prose. "
+            "Do NOT claim success without a ToolMessage."
+        )
+
+    if _pending_tool_synthesis(raw_history):
+        parts.append(
+            "\n## SYNTHESIS MODE (active)\n"
+            "Tools have already executed. Respond in plain text ONLY — no tool_calls.\n"
+            "Copy exact values from the ToolMessage RESULT section into your answer.\n"
+            "Never use placeholders like [Insert Current Time]."
+        )
+
+    if len(user_text.split()) > 12 or user_text.count(",") >= 2 or " and " in user_text.lower():
+        parts.append(
+            "\n## Multi-step hint\n"
+            "This looks complex. Consider manage_task_plan(action='create') first, "
+            "then execute each step with tools."
+        )
+
+    return "\n".join(parts)
+
+
+def permission_gate(state: JProState) -> dict[str, object]:
+    """Sync session permission from graph state, persisted settings, and latest user text.
+
+    Critical: never clobber an already-granted in-graph flag with a stale file read.
+    Once granted, control_allowed stays True until an explicit Stop Control message.
+    """
+    thread_id = str(state.get("thread_id") or "web_user_001")
+    # OR of checkpoint + persisted store (either source can unlock the session)
+    allowed = bool(state.get("control_allowed")) or get_permission(thread_id)
+
+    for msg in reversed(state.get("messages", [])):
+        if isinstance(msg, HumanMessage):
+            new_allowed, changed = apply_permission_change(str(msg.content or ""), thread_id)
+            if changed is not None:
+                # Explicit grant/revoke always wins for this turn
+                allowed = bool(new_allowed)
+            break
+
+    # Keep file and graph aligned for the rest of the session
+    set_permission(allowed, thread_id)
+    print(f"[TESrACT:perm] gate thread={thread_id} control={'ACTIVE' if allowed else 'RESTRICTED'}")
+    return {"control_allowed": allowed, "thread_id": thread_id}
+
+
 def call_brain(state: JProState):
-    is_allowed = state.get("control_allowed", False)
+    is_allowed = resolve_control_allowed(state)
     status = "ACTIVE" if is_allowed else "RESTRICTED"
 
-    system_content = TESRACT_SYSTEM_PROMPT + f"\n\nCURRENT_CONTROL: {status}"
-    sys_msg = SystemMessage(content=system_content)
-
     raw_history = state.get("messages", [])
-    history = [m for m in raw_history if "rate-limited" not in str(getattr(m, "content", "") or "").lower()][-4:]
+    history = [
+        m for m in raw_history
+        if "rate-limited" not in str(getattr(m, "content", "") or "").lower()
+    ][-16:]
     user_text = ""
     for msg in reversed(raw_history):
         if isinstance(msg, HumanMessage):
             user_text = str(msg.content or "")
             break
 
-    # Delegate to llm_router — local Ollama first, then Groq/Colab fallback.
+    thread_id = str(state.get("thread_id") or "web_user_001")
+    system_content = _build_system_prompt(
+        control_status=status,
+        user_text=user_text,
+        raw_history=raw_history,
+        thread_id=thread_id,
+    )
+    sys_msg = SystemMessage(content=system_content)
+
     try:
-        response, route = route_and_invoke(
-            llm_with_tools=llm_with_tools,
-            sys_msg=sys_msg,
-            history=history,
-            control_allowed=is_allowed,
-            user_text=user_text,
-            history_len=len(history),
-            tools=actions.tools,
-        )
+        if _pending_tool_synthesis(raw_history):
+            response, route = route_and_invoke_synthesis(
+                llm=llm,
+                sys_msg=sys_msg,
+                history=history,
+                user_text=user_text,
+                history_len=len(history),
+            )
+        else:
+            response, route = route_and_invoke(
+                llm_with_tools=llm_with_tools,
+                sys_msg=sys_msg,
+                history=history,
+                control_allowed=is_allowed,
+                user_text=user_text,
+                history_len=len(history),
+                tools=actions.tools,
+            )
         reason_suffix = f" — {llm_router.last_route_reason}" if llm_router.last_route_reason else ""
         model_suffix = ""
-        if route == "local" and llm_router.last_local_model:
-            model_suffix = f" [{llm_router.last_local_tier or 'light'}: {llm_router.last_local_model}]"
-        print(f"[TESrACT] Agent turn served by: {route.upper()}{model_suffix}{reason_suffix}")
-        return {"messages": [response]}
+        if route == "remote_mac" and llm_router.last_local_model:
+            model_suffix = f" [model: {llm_router.last_local_model}]"
+        elif route == "local" and llm_router.last_local_model:
+            model_suffix = (
+                f" [{llm_router.last_local_tier or 'light'}: {llm_router.last_local_model}]"
+            )
+
+        if route == "local":
+            backend_label = "LOCAL OLLAMA"
+        elif route == "remote_mac":
+            backend_label = "LOCAL MAC (tunnel)"
+        elif route == "groq":
+            backend_label = "GROQ (fallback)" if llm_router.last_route_is_fallback else "GROQ"
+        elif route == "colab":
+            backend_label = "COLAB (fallback)" if llm_router.last_route_is_fallback else "COLAB"
+        else:
+            backend_label = route.upper()
+
+        print(f"[TESrACT] Agent turn served by: {backend_label}{model_suffix}{reason_suffix}")
+        return {"messages": [_sanitize_tool_call_response(response)]}
     except RateLimitError as e:
         # Both Groq (rate-limited) and Colab (if configured) failed — agent stays usable via simple commands.
         rate_msg = "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work."
@@ -252,48 +1098,350 @@ def call_brain(state: JProState):
         print(f"[TESrACT] All LLM backends failed (local/Ollama, Groq, Colab {'up' if _colab_up else 'down'}): {e}")
         return {"messages": [AIMessage(content=err_msg)]}
 
+
 def reviewer_node(state: JProState) -> dict[str, object]:
-    """Post-tool reviewer. Detects permission changes and recovers from errors.
-    Looks across recent messages to catch control keywords reliably."""
+    """Post-tool reviewer: permission sync, error recovery, refusal retry nudges."""
     if not state.get("messages"):
         return {}
 
-    # Check last few messages for control phrases (more reliable than just last)
+    messages = state["messages"]
     recent_content = " ".join(
-        str(m.content or "").lower() for m in state["messages"][-3:]
+        str(m.content or "").lower() for m in messages[-4:]
+    )
+    updates: dict[str, object] = {}
+
+    thread_id = str(state.get("thread_id") or "web_user_001")
+    last_user_msg = next((m for m in reversed(messages) if isinstance(m, HumanMessage)), None)
+    if last_user_msg:
+        new_allowed, changed = apply_permission_change(str(last_user_msg.content or ""), thread_id)
+        if changed is not None:
+            updates["control_allowed"] = new_allowed
+            if not new_allowed:
+                mac_access.clear_pending_confirmation(thread_id)
+    elif resolve_control_allowed(state):
+        updates["control_allowed"] = True
+
+    if last_user_msg and mac_access.is_confirmation_message(str(last_user_msg.content or "")):
+        updates["command_confirmed"] = True
+
+    last_ai = next(
+        (m for m in reversed(messages) if isinstance(m, AIMessage)),
+        None,
+    )
+    last_user = next(
+        (m for m in reversed(messages) if isinstance(m, HumanMessage)),
+        None,
     )
 
-    updates = {}
+    if last_ai and not getattr(last_ai, "tool_calls", None):
+        ai_text = str(last_ai.content or "")
+        turn_tools = _current_turn_tool_messages(messages)
+        needs_synthesis = (
+            _recent_tool_use(messages)
+            and turn_tools
+            and not _reply_uses_tool_evidence(ai_text, turn_tools)
+        )
+        if needs_synthesis:
+            if not _nudge_already_sent(messages, "SYNTHESIS REQUIRED"):
+                updates["messages"] = [SystemMessage(content=_SYNTHESIS_NUDGE)]
+        elif (
+            last_user
+            and _ACTION_REQUEST_RE.search(str(last_user.content or ""))
+            and not _recent_tool_use(messages)
+        ):
+            if _looks_like_fake_execution(ai_text) and not _nudge_already_sent(messages, "HALLUCINATION BLOCKED"):
+                updates["messages"] = [SystemMessage(content=_HALLUCINATION_NUDGE)]
+            elif (_looks_like_refusal(ai_text) or len(ai_text) < 30) and not _nudge_already_sent(messages, _RETRY_NUDGE[:40]):
+                updates["messages"] = [SystemMessage(content=_RETRY_NUDGE)]
 
-    if "allow control" in recent_content or "elevated access" in recent_content:
-        updates["control_allowed"] = True
-    if "stop control" in recent_content or "restrict control" in recent_content:
-        updates["control_allowed"] = False
+    if "messages" not in updates:
+        last_tool = next((m for m in reversed(messages) if isinstance(m, ToolMessage)), None)
+        if last_tool:
+            tool_body = str(last_tool.content or "").lower()
+            if "confirmation_required" in tool_body:
+                pass
+            elif any(kw in tool_body for kw in ("error", "failed", "permission_denied", "denied")):
+                updates["messages"] = [SystemMessage(
+                    content=(
+                        "Tool returned an error or permission denial. "
+                        "Try a different approach, ask Sir for Allow Control if needed, "
+                        "or retry with corrected parameters. Do not fabricate success."
+                    )
+                )]
 
-    # In-character error recovery
-    if "error" in recent_content and not updates:
+    if "error" in recent_content and "messages" not in updates:
         updates["messages"] = [SystemMessage(
-            content="The previous action encountered an issue. I will reassess and attempt another approach if possible, Sir."
+            content=(
+                "The previous action encountered an issue. Reassess Sir's request, "
+                "try an alternative tool or approach, and execute it — do not give up."
+            )
         )]
 
     return updates
 
+
+_CONTROL_GATED_TOOLS = frozenset(actions._CONTROL_GATED)
+_CONFIRMATION_GATED_TOOLS = frozenset(actions._CONFIRMATION_GATED)
+_tool_executor = ToolNode(actions.tools, handle_tool_errors=True)
+
+
+def _tool_call_as_dict(tc: object) -> dict:
+    """Normalize a tool call (dict or object) to a mutable dict with an args dict."""
+    if isinstance(tc, dict):
+        out = tc
+    else:
+        out = {
+            "name": getattr(tc, "name", "") or "",
+            "args": getattr(tc, "args", None) or {},
+            "id": getattr(tc, "id", None) or "",
+            "type": getattr(tc, "type", "tool_call") or "tool_call",
+        }
+    args = out.get("args")
+    if not isinstance(args, dict):
+        out["args"] = {}
+    return out
+
+
+def _inject_mac_tool_args(
+    tc: object,
+    *,
+    control_allowed: bool,
+    thread_id: str,
+    command_confirmed: bool,
+) -> dict:
+    """Force session permission + confirmation flags onto gated tool calls."""
+    call = _tool_call_as_dict(tc)
+    name = str(call.get("name") or "")
+    args = call.setdefault("args", {})
+    if not isinstance(args, dict):
+        args = {}
+        call["args"] = args
+    if name in _CONTROL_GATED_TOOLS:
+        # Always override LLM-supplied values — session gate is authoritative
+        args["control_allowed"] = bool(control_allowed)
+    if name in _CONFIRMATION_GATED_TOOLS:
+        args["thread_id"] = thread_id
+        cmd = str(args.get("command") or "")
+        pending = mac_access.get_pending_confirmation(thread_id)
+        if (
+            command_confirmed
+            and pending
+            and mac_access.command_fingerprint(cmd) == pending.get("fingerprint")
+        ):
+            args["user_confirmed"] = True
+        else:
+            args["user_confirmed"] = False
+    return call
+
+
+def execute_tools(state: JProState):
+    """Run tools and enforce control_allowed on gated tools."""
+    messages = list(state.get("messages", []) or [])
+    thread_id = str(state.get("thread_id") or "web_user_001")
+    command_confirmed = bool(state.get("command_confirmed", False))
+    allowed = resolve_control_allowed(state)
+    # Ensure ToolNode InjectedState("control_allowed") sees the resolved session flag
+    exec_state: dict = {
+        **dict(state),
+        "control_allowed": allowed,
+        "thread_id": thread_id,
+        "command_confirmed": command_confirmed,
+        "messages": messages,
+    }
+    if messages:
+        last = messages[-1]
+        if isinstance(last, AIMessage) and last.tool_calls:
+            patched_calls = []
+            for tc in last.tool_calls:
+                patched = _inject_mac_tool_args(
+                    tc,
+                    control_allowed=allowed,
+                    thread_id=thread_id,
+                    command_confirmed=command_confirmed,
+                )
+                patched_calls.append(patched)
+                print(
+                    f"[TESrACT:tools] Executing {patched.get('name')}"
+                    f"(control_allowed={allowed}, args={patched.get('args')})"
+                )
+            # Rebuild AIMessage so ToolNode always sees patched args (immutable-safe)
+            messages = list(messages[:-1]) + [
+                AIMessage(
+                    content=getattr(last, "content", "") or "",
+                    tool_calls=patched_calls,
+                    id=getattr(last, "id", None),
+                )
+            ]
+            exec_state["messages"] = messages
+    try:
+        result = _tool_executor.invoke(exec_state)
+        # Preserve session permission across the tools → synthesize edge
+        if isinstance(result, dict):
+            result = {**result, "control_allowed": allowed, "thread_id": thread_id}
+        return result
+    except Exception as exc:
+        print(f"[TESrACT:tools] ToolNode error: {exc}")
+        traceback.print_exc()
+        last = messages[-1] if messages else None
+        if isinstance(last, AIMessage) and last.tool_calls:
+            errors = []
+            for i, tc in enumerate(last.tool_calls):
+                call = _tool_call_as_dict(tc)
+                name = str(call.get("name") or "unknown")
+                err_text = actions._tool_err(name, f"Tool execution failed: {exc}")
+                errors.append(ToolMessage(
+                    content=err_text,
+                    name=name,
+                    tool_call_id=str(call.get("id") or f"err_{i}_{name}"),
+                ))
+            return {
+                "messages": errors,
+                "control_allowed": allowed,
+                "thread_id": thread_id,
+            }
+        raise
+
+
+def force_tools_node(state: JProState) -> dict[str, object]:
+    """Deterministic tool execution when the LLM hallucinates instead of calling tools."""
+    messages = state.get("messages", [])
+    user_text = ""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            user_text = str(msg.content or "")
+            break
+
+    planned = actions.infer_forced_tools(user_text)
+
+    # Recover when the model wrote a tool call as plain text instead of structured tool_calls
+    if not planned:
+        last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
+        if last_ai and not getattr(last_ai, "tool_calls", None):
+            planned = actions.parse_pseudo_tool_calls(str(last_ai.content or ""))
+
+    if not planned:
+        return {}
+
+    allowed = resolve_control_allowed(state)
+    thread_id = str(state.get("thread_id") or "web_user_001")
+    tool_messages: list[ToolMessage] = []
+    for i, (name, args) in enumerate(planned):
+        print(f"[TESrACT:tools] Force-executing {name}({args}) control_allowed={allowed}")
+        result = actions.run_tool(
+            name,
+            args,
+            control_allowed=allowed,
+            thread_id=thread_id,
+            user_confirmed=bool(state.get("command_confirmed", False)),
+        )
+        tool_messages.append(ToolMessage(
+            content=result,
+            name=name,
+            tool_call_id=f"forced_{i}_{name}",
+        ))
+    return {
+        "messages": tool_messages,
+        "control_allowed": allowed,
+        "thread_id": thread_id,
+    }
+
+
+def synthesize_node(state: JProState) -> dict[str, object]:
+    """
+    Build the final user-facing reply from real tool output.
+    Skips LLM synthesis only when a trustworthy answer already exists.
+    """
+    messages = state.get("messages", [])
+    turn_tools = _current_turn_tool_messages(messages)
+    if not turn_tools:
+        return {}
+
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            continue
+        if isinstance(msg, AIMessage):
+            if getattr(msg, "tool_calls", None):
+                break
+            text = str(msg.content or "").strip()
+            if _is_valid_synthesis(text) and _reply_uses_tool_evidence(text, turn_tools):
+                return {}
+            break
+        if isinstance(msg, HumanMessage):
+            break
+
+    error_msgs = [
+        _parse_tool_result(str(tm.content or ""))
+        for tm in turn_tools
+        if "STATUS: ERROR" in str(tm.content or "").upper()
+        or "PERMISSION_DENIED" in str(tm.content or "").upper()
+    ]
+    if error_msgs:
+        err_body = error_msgs[0]
+        if "PERMISSION_DENIED" in err_body.upper() or "PERMISSION_DENIED" in str(turn_tools[0].content or "").upper():
+            reply = (
+                "Mac control is restricted, Sir. Please say 'Allow Control' "
+                "so I can use filesystem and terminal tools."
+            )
+        else:
+            reply = f"I encountered a tool error, Sir. {err_body}"
+        return {"messages": [AIMessage(content=reply)]}
+
+    reply = _format_tool_fallback_reply(turn_tools)
+    # Avoid re-appending an identical synthesis (recursion safety)
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+            if str(msg.content or "").strip() == reply.strip():
+                return {}
+            break
+    print(f"[TESrACT:synthesize] Direct reply from {len(turn_tools)} tool result(s)")
+    return {"messages": [AIMessage(content=reply)]}
+
+
 # --- 4. GRAPH CONSTRUCTION ---
 workflow = StateGraph(JProState)
+workflow.add_node("permission_gate", permission_gate)
 workflow.add_node("agent", call_brain)
-workflow.add_node("tools", ToolNode(actions.tools))
+workflow.add_node("tools", execute_tools)
+workflow.add_node("force_tools", force_tools_node)
+workflow.add_node("synthesize", synthesize_node)
 workflow.add_node("reviewer", reviewer_node)
-workflow.add_edge(START, "agent")
+workflow.add_edge(START, "permission_gate")
+workflow.add_edge("permission_gate", "agent")
 
 def route_after_agent(state: JProState):
     last_msg = state["messages"][-1]
     if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
         return "tools"
+    if _should_force_tools(state):
+        return "force_tools"
+    return "reviewer"
+
+
+def route_after_reviewer(state: JProState):
+    messages = state.get("messages", [])
+    if messages and isinstance(messages[-1], SystemMessage):
+        content = str(messages[-1].content or "")
+        retry_markers = (
+            _RETRY_NUDGE[:40],
+            "HALLUCINATION BLOCKED",
+            "SYNTHESIS REQUIRED",
+            "Reassess Sir's request",
+            "Tool returned an error",
+        )
+        if any(marker in content for marker in retry_markers):
+            return "agent"
+    if _should_force_tools(state):
+        return "force_tools"
+    if _pending_tool_synthesis(messages):
+        return "synthesize"
     return END
 
+
 workflow.add_conditional_edges("agent", route_after_agent)
-workflow.add_edge("tools", "reviewer")
-workflow.add_edge("reviewer", "agent")
+workflow.add_edge("tools", "synthesize")
+workflow.add_edge("force_tools", "synthesize")
+workflow.add_edge("synthesize", "reviewer")
+workflow.add_conditional_edges("reviewer", route_after_reviewer)
 
 memory = MemorySaver()
 compiled_app = workflow.compile(checkpointer=memory)
@@ -319,6 +1467,59 @@ async def serve_interface():
         return HTMLResponse(content=f"<h1>Interface Error: {e}</h1>", status_code=500)
 
 
+@app.get("/permission")
+def permission_status():
+    """Current Mac control flag for the web session (used by the HUD toggle)."""
+    thread_id = "web_user_001"
+    allowed = get_permission(thread_id)
+    return {
+        "control_status": allowed,
+        "thread_id": thread_id,
+        "label": "ELEVATED" if allowed else "RESTRICTED",
+    }
+
+
+@app.post("/permission")
+async def permission_set(request: Request):
+    """Toggle Mac control from the UI switch — bypasses the LLM entirely."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    thread_id = "web_user_001"
+    if "control_allowed" in payload:
+        desired = bool(payload.get("control_allowed"))
+    elif "enabled" in payload:
+        desired = bool(payload.get("enabled"))
+    else:
+        return JSONResponse(
+            {"error": "control_allowed (bool) is required", "control_status": get_permission(thread_id)},
+            status_code=400,
+        )
+
+    was_allowed = get_permission(thread_id)
+    current_allowed, changed = set_session_permission(desired, thread_id, sync_graph=True)
+    if current_allowed and not was_allowed:
+        reply = PERMISSION_GRANTED_REPLY
+    elif current_allowed and was_allowed:
+        reply = PERMISSION_ALREADY_ACTIVE_REPLY
+    elif not current_allowed and was_allowed:
+        reply = PERMISSION_REVOKED_REPLY
+    else:
+        reply = PERMISSION_ALREADY_RESTRICTED_REPLY
+
+    # Optional: speak the change (non-blocking)
+    if changed:
+        _run_speak(reply)
+
+    return {
+        "reply": reply,
+        "control_status": current_allowed,
+        "changed": changed,
+        "pending_command": mac_access.get_pending_confirmation(thread_id),
+    }
+
+
 @app.post("/chat")
 async def chat_endpoint(request: Request):
     """Main chat endpoint used by the Three.js frontend. Full agentic flow."""
@@ -328,29 +1529,68 @@ async def chat_endpoint(request: Request):
         thread_id = "web_user_001"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-        lowered = user_text.lower()
-        if "allow control" in lowered or "grant access" in lowered or "elevate" in lowered:
-            set_permission(True)
-        elif "stop control" in lowered or "restrict" in lowered:
-            set_permission(False)
+        # Snapshot pre-change state so first-time "Allow Control" gets the granted reply
+        was_allowed = get_permission(thread_id)
+        current_allowed, perm_changed = apply_permission_change(user_text, thread_id)
+        if perm_changed is None:
+            current_allowed = get_permission(thread_id)
 
-        current_allowed = get_permission(thread_id)
+        # Pure grant/revoke (including "yes allow control") — never hit the LLM
+        perm_reply = permission_reply_for(
+            user_text,
+            was_allowed=was_allowed,
+            now_allowed=current_allowed,
+            just_changed=perm_changed,
+        )
+        if perm_reply:
+            sync_graph_permission(
+                compiled_app, config, thread_id=thread_id, control_allowed=current_allowed,
+            )
+            _run_speak(perm_reply)
+            return {
+                "reply": perm_reply,
+                "control_status": current_allowed,
+                "pending_command": mac_access.get_pending_confirmation(thread_id),
+            }
 
         # Handle simple commands directly (bypass LLM entirely to save tokens and remain usable under rate limits)
         simple_reply = try_simple_command(user_text, current_allowed)
         if simple_reply:
             _run_speak(simple_reply)
-            return {"reply": simple_reply, "control_status": current_allowed}
+            return {
+                "reply": simple_reply,
+                "control_status": current_allowed,
+                "pending_command": mac_access.get_pending_confirmation(thread_id),
+            }
+
+        confirmed_reply = _try_execute_pending_command(
+            user_text, thread_id=thread_id, control_allowed=current_allowed,
+        )
+        if confirmed_reply:
+            _run_speak(confirmed_reply)
+            return {
+                "reply": confirmed_reply,
+                "control_status": current_allowed,
+                "pending_command": None,
+            }
 
         # Standard way: pass only the new user message.
         # The checkpointer + add_messages reducer will append it to the thread history automatically.
+        sync_graph_permission(compiled_app, config, thread_id=thread_id, control_allowed=current_allowed)
+
         inputs = cast(JProState, {
             "messages": [HumanMessage(content=user_text)],
-            "control_allowed": current_allowed
+            "control_allowed": current_allowed,
+            "thread_id": thread_id,
+            "command_confirmed": mac_access.is_confirmation_message(user_text),
         })
 
+        agent_config: RunnableConfig = {
+            **config,
+            "recursion_limit": 40,
+        }
         try:
-            compiled_app.invoke(inputs, config=config)
+            compiled_app.invoke(inputs, config=agent_config)
         except RateLimitError as e:
             # On rate limit, still return friendly msg but note that basic commands work
             print(f"[TESrACT] RateLimitError caught in chat_endpoint: {e}")
@@ -364,27 +1604,41 @@ async def chat_endpoint(request: Request):
         state_values = final_state.values if final_state else None
         messages = (state_values or {}).get("messages", [])
 
-        final_reply = "At your service, Sir."
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage) and getattr(msg, "content", None) and not getattr(msg, "tool_calls", None):
-                final_reply = str(msg.content).replace("`", "").strip()
-                break
+        final_reply = extract_final_reply(messages)
 
-        updated_allowed = (state_values or {}).get("control_allowed", current_allowed)
-        if isinstance(updated_allowed, bool) and updated_allowed != current_allowed:
-            set_permission(updated_allowed, thread_id)
+        tools_used: list[str] = []
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                break
+            if isinstance(msg, ToolMessage):
+                name = str(getattr(msg, "name", "") or "").strip()
+                if name:
+                    tools_used.append(name)
+        tools_used.reverse()
+        try:
+            store_turn_summary(user_text, final_reply, tools_used=tools_used)
+        except Exception as mem_exc:
+            print(f"[TESrACT] Turn memory store skipped: {mem_exc}")
+
+        updated_allowed = resolve_control_allowed(cast(JProState, state_values or {}))
+        set_permission(updated_allowed, thread_id)
+        sync_graph_permission(compiled_app, config, thread_id=thread_id, control_allowed=updated_allowed)
 
         _run_speak(final_reply)
 
         return {
             "reply": final_reply,
-            "control_status": get_permission(thread_id)
+            "control_status": updated_allowed,
+            "pending_command": mac_access.get_pending_confirmation(thread_id),
         }
 
     except Exception as e:
         print("--- /chat ERROR ---")
         traceback.print_exc()
-        return {"reply": "TESrACT is having a temporary issue. Please try again shortly, Sir.", "control_status": False}
+        return {
+            "reply": "TESrACT is having a temporary issue. Please try again shortly, Sir.",
+            "control_status": get_permission("web_user_001"),
+        }
 
 
 # --- EXECUTION LOOP ---
@@ -400,7 +1654,30 @@ def main_loop():
             break
 
         state = compiled_app.get_state(config)
-        is_allowed = state.values.get("control_allowed", False) if state and state.values else False
+        thread_id = "jarvis_session_001"
+        is_allowed = (
+            resolve_control_allowed(cast(JProState, state.values or {}))
+            if state and state.values
+            else get_permission(thread_id)
+        )
+        was_allowed = is_allowed
+        new_allowed, changed = apply_permission_change(command, thread_id)
+        if changed is not None:
+            is_allowed = new_allowed
+
+        perm_reply = permission_reply_for(
+            command,
+            was_allowed=was_allowed,
+            now_allowed=is_allowed,
+            just_changed=changed,
+        )
+        if perm_reply:
+            sync_graph_permission(
+                compiled_app, config, thread_id=thread_id, control_allowed=is_allowed,
+            )
+            print(f"TESrACT: {perm_reply}")
+            _run_speak(perm_reply, wait_for_speech=True)
+            continue
 
         # Handle simple commands directly (works even under rate limits)
         simple_reply = try_simple_command(command, is_allowed)
@@ -409,7 +1686,13 @@ def main_loop():
             _run_speak(simple_reply, wait_for_speech=True)
             continue
 
-        inputs = cast(JProState, {"messages": [HumanMessage(content=command)], "control_allowed": is_allowed})
+        sync_graph_permission(compiled_app, config, thread_id=thread_id, control_allowed=is_allowed)
+        inputs = cast(JProState, {
+            "messages": [HumanMessage(content=command)],
+            "control_allowed": is_allowed,
+            "thread_id": thread_id,
+            "command_confirmed": mac_access.is_confirmation_message(command),
+        })
         
         try:
             # Run the full agentic loop
@@ -421,13 +1704,9 @@ def main_loop():
             state_values = final_state.values if final_state else None
             messages = (state_values or {}).get("messages", [])
 
-            output_text = None
-            for msg in reversed(messages):
-                if isinstance(msg, AIMessage) and msg.content and not getattr(msg, "tool_calls", None):
-                    output_text = str(msg.content).replace("`", "").strip()
-                    break
+            output_text = extract_final_reply(messages)
 
-            if output_text:
+            if output_text and output_text != "At your service, Sir.":
                 print(f"TESrACT: {output_text}")
                 _run_speak(output_text, wait_for_speech=True)
             else:

@@ -5,3 +5,9 @@ terminals/
 index_jan_beautiful_backup.html
 index_july2_good.html
 index_original_feb9.html
+
+# Local env / runtime
+venv/
+agent_data/
+user_settings.json
+generated_images/

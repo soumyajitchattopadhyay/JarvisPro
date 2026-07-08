@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <title>TESrACT // HUD_OVERRIDE</title>
-    <link href="https://fonts.googleapis.com/css2?family=Syncopate:wght@400;700&family=Michroma&family=Orbitron:wght@400;900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Syncopate:wght@400;700&family=Michroma&family=Orbitron:wght@400;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; font-family: 'Michroma', sans-serif; }
         #canvas-container { position: fixed; inset: 0; z-index: 1; }
@@ -38,8 +39,8 @@
         /* ── CHAT PANEL ── */
         .chat-panel {
             pointer-events: auto;
-            width: min(680px, 90vw);
-            max-height: min(42vh, 380px);
+            width: min(720px, 92vw);
+            max-height: min(52vh, 460px);
             display: flex;
             flex-direction: column;
             border-radius: 16px;
@@ -141,20 +142,25 @@
         .chat-msg {
             position: relative;
             display: flex;
-            gap: 10px;
-            max-width: 92%;
+            gap: 12px;
+            max-width: 94%;
             animation: chat-in 0.35s cubic-bezier(0.22, 1, 0.36, 1);
         }
         .chat-msg--user {
             align-self: flex-end;
             flex-direction: row-reverse;
+            max-width: 78%;
         }
-        .chat-msg--assistant { align-self: flex-start; }
-        .chat-msg--loading { opacity: 0.8; }
+        .chat-msg--assistant { align-self: flex-start; max-width: 96%; }
+        .chat-msg--loading .chat-msg__bubble {
+            border-color: rgba(0, 251, 255, 0.22);
+            box-shadow: 0 0 24px rgba(0, 251, 255, 0.06);
+            animation: bubble-pulse 2s ease-in-out infinite;
+        }
         .chat-msg__avatar {
             flex-shrink: 0;
-            width: 30px;
-            height: 30px;
+            width: 32px;
+            height: 32px;
             border-radius: 10px;
             display: flex;
             align-items: center;
@@ -173,47 +179,233 @@
             position: relative;
             flex: 1;
             min-width: 0;
-            padding: 11px 36px 11px 14px;
-            border-radius: 14px;
+            padding: 14px 40px 14px 16px;
+            border-radius: 16px;
             border: 1px solid rgba(0, 251, 255, 0.1);
-            background: rgba(0, 10, 16, 0.75);
+            background: rgba(0, 10, 16, 0.82);
         }
         .chat-msg--user .chat-msg__bubble {
             border-color: rgba(0, 251, 255, 0.22);
             background: linear-gradient(135deg, rgba(0, 251, 255, 0.1) 0%, rgba(0, 251, 255, 0.04) 100%);
-            border-radius: 14px 14px 4px 14px;
+            border-radius: 16px 16px 4px 16px;
+            padding: 12px 16px;
         }
         .chat-msg--assistant .chat-msg__bubble {
-            border-radius: 14px 14px 14px 4px;
+            border-radius: 16px 16px 16px 4px;
+            background: linear-gradient(160deg, rgba(2, 14, 22, 0.9) 0%, rgba(0, 8, 14, 0.85) 100%);
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25);
         }
         .chat-msg__label {
             font-family: 'Orbitron';
             font-size: 7px;
             letter-spacing: 2.5px;
             color: rgba(0, 251, 255, 0.45);
-            margin-bottom: 5px;
+            margin-bottom: 8px;
             text-transform: uppercase;
         }
-        .chat-msg--user .chat-msg__label { color: rgba(0, 251, 255, 0.7); }
+        .chat-msg--user .chat-msg__label { color: rgba(0, 251, 255, 0.7); margin-bottom: 4px; }
         .chat-msg__body {
-            color: rgba(0, 251, 255, 0.92);
-            font-size: 12.5px;
-            line-height: 1.6;
-            white-space: pre-wrap;
+            color: rgba(210, 248, 255, 0.94);
+            font-size: 13px;
+            line-height: 1.7;
             word-break: break-word;
             user-select: text;
         }
-        .chat-msg--user .chat-msg__body { color: #e8feff; }
+        .chat-msg--user .chat-msg__body {
+            color: #e8feff;
+            white-space: pre-wrap;
+            font-size: 12.5px;
+            line-height: 1.55;
+        }
+
+        /* ── MARKDOWN CONTENT ── */
+        .md-content > *:first-child { margin-top: 0; }
+        .md-content > *:last-child { margin-bottom: 0; }
+        .md-content p { margin: 0 0 0.85em; }
+        .md-content p:last-child { margin-bottom: 0; }
+        .md-content h1, .md-content h2, .md-content h3,
+        .md-content h4, .md-content h5, .md-content h6 {
+            font-family: 'Orbitron', sans-serif;
+            color: #e8feff;
+            letter-spacing: 1.5px;
+            margin: 1.25em 0 0.55em;
+            line-height: 1.35;
+            font-weight: 400;
+        }
+        .md-content h1 { font-size: 1.15em; color: #00fbff; }
+        .md-content h2 { font-size: 1.05em; }
+        .md-content h3 { font-size: 0.95em; color: rgba(0, 251, 255, 0.85); }
+        .md-content h4, .md-content h5, .md-content h6 { font-size: 0.88em; }
+        .md-content strong, .md-content b {
+            color: #fff;
+            font-weight: 600;
+        }
+        .md-content em, .md-content i { color: rgba(0, 251, 255, 0.8); }
+        .md-content ul, .md-content ol {
+            margin: 0.5em 0 0.9em;
+            padding-left: 1.4em;
+        }
+        .md-content li {
+            margin: 0.35em 0;
+            padding-left: 0.25em;
+        }
+        .md-content li::marker { color: rgba(0, 251, 255, 0.55); }
+        .md-content ul ul, .md-content ol ol, .md-content ul ol, .md-content ol ul {
+            margin: 0.25em 0;
+        }
+        .md-content blockquote {
+            margin: 0.85em 0;
+            padding: 10px 14px;
+            border-left: 3px solid rgba(0, 251, 255, 0.45);
+            background: rgba(0, 251, 255, 0.04);
+            border-radius: 0 8px 8px 0;
+            color: rgba(180, 235, 245, 0.88);
+        }
+        .md-content blockquote p { margin-bottom: 0.4em; }
+        .md-content hr {
+            border: none;
+            height: 1px;
+            margin: 1.1em 0;
+            background: linear-gradient(90deg, transparent, rgba(0, 251, 255, 0.25), transparent);
+        }
+        .md-content a {
+            color: #00fbff;
+            text-decoration: none;
+            border-bottom: 1px solid rgba(0, 251, 255, 0.3);
+            transition: border-color 0.2s, color 0.2s;
+        }
+        .md-content a:hover {
+            color: #7fffff;
+            border-bottom-color: rgba(0, 251, 255, 0.6);
+        }
+        .md-content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 0.85em 0;
+            font-size: 0.92em;
+        }
+        .md-content th, .md-content td {
+            padding: 8px 12px;
+            border: 1px solid rgba(0, 251, 255, 0.12);
+            text-align: left;
+        }
+        .md-content th {
+            background: rgba(0, 251, 255, 0.08);
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.78em;
+            letter-spacing: 1px;
+            color: rgba(0, 251, 255, 0.75);
+        }
+        .md-content tr:nth-child(even) td { background: rgba(0, 251, 255, 0.02); }
+        .md-content :not(pre) > code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.88em;
+            padding: 2px 7px;
+            border-radius: 5px;
+            background: rgba(0, 251, 255, 0.08);
+            border: 1px solid rgba(0, 251, 255, 0.15);
+            color: #7ee8ff;
+        }
+
+        /* ── CODE BLOCKS ── */
+        .code-block {
+            margin: 0.9em 0;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 1px solid rgba(0, 251, 255, 0.14);
+            background: #0a0e14;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+        }
+        .code-block__header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 7px 12px;
+            background: linear-gradient(180deg, rgba(0, 251, 255, 0.07) 0%, rgba(0, 20, 30, 0.5) 100%);
+            border-bottom: 1px solid rgba(0, 251, 255, 0.1);
+        }
+        .code-block__lang {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 8px;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            color: rgba(0, 251, 255, 0.55);
+        }
+        .code-block__copy {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: 1px solid rgba(0, 251, 255, 0.18);
+            background: rgba(0, 0, 0, 0.35);
+            color: rgba(0, 251, 255, 0.5);
+            font-family: 'Orbitron', sans-serif;
+            font-size: 7px;
+            letter-spacing: 1.5px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .code-block__copy:hover {
+            color: #00fbff;
+            border-color: rgba(0, 251, 255, 0.45);
+            background: rgba(0, 251, 255, 0.08);
+        }
+        .code-block__copy.copied {
+            color: #00ff88;
+            border-color: rgba(0, 255, 136, 0.5);
+        }
+        .code-block pre {
+            margin: 0 !important;
+            padding: 14px 16px !important;
+            background: transparent !important;
+            border-radius: 0 !important;
+            overflow-x: auto;
+            font-size: 12px !important;
+            line-height: 1.55 !important;
+        }
+        .code-block pre code {
+            font-family: 'JetBrains Mono', monospace !important;
+            background: transparent !important;
+            border: none !important;
+            padding: 0 !important;
+            color: #c8e6f0 !important;
+            text-shadow: none !important;
+        }
+        .code-block pre::-webkit-scrollbar { height: 5px; }
+        .code-block pre::-webkit-scrollbar-thumb {
+            background: rgba(0, 251, 255, 0.2);
+            border-radius: 4px;
+        }
+        .md-content > pre:not(.code-block pre) {
+            margin: 0.9em 0;
+            padding: 14px 16px;
+            border-radius: 10px;
+            background: #0a0e14;
+            border: 1px solid rgba(0, 251, 255, 0.14);
+            overflow-x: auto;
+        }
+
+        /* Prism cyberpunk overrides */
+        .code-block .token.comment, .code-block .token.prolog, .code-block .token.doctype, .code-block .token.cdata { color: #5a7a88; }
+        .code-block .token.punctuation { color: #6a9aaa; }
+        .code-block .token.property, .code-block .token.tag, .code-block .token.boolean, .code-block .token.number, .code-block .token.constant, .code-block .token.symbol { color: #ff79c6; }
+        .code-block .token.selector, .code-block .token.attr-name, .code-block .token.string, .code-block .token.char, .code-block .token.builtin { color: #7ee8a0; }
+        .code-block .token.operator, .code-block .token.entity, .code-block .token.url { color: #00fbff; }
+        .code-block .token.atrule, .code-block .token.attr-value, .code-block .token.keyword { color: #00d4ff; }
+        .code-block .token.function, .code-block .token.class-name { color: #ffd866; }
+        .code-block .token.regex, .code-block .token.important, .code-block .token.variable { color: #ff9f43; }
+
         .chat-copy {
             position: absolute;
-            top: 8px;
-            right: 8px;
-            background: rgba(0, 0, 0, 0.35);
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.4);
             border: 1px solid rgba(0, 251, 255, 0.15);
-            border-radius: 6px;
+            border-radius: 7px;
             color: rgba(0, 251, 255, 0.4);
-            width: 24px;
-            height: 24px;
+            width: 26px;
+            height: 26px;
             cursor: pointer;
             font-size: 9px;
             transition: all 0.2s ease;
@@ -227,27 +419,52 @@
             box-shadow: 0 0 12px rgba(0, 251, 255, 0.15);
         }
         .chat-copy.copied { color: #00ff88; border-color: #00ff88; opacity: 1; }
+
+        /* ── LOADING STATE ── */
         .chat-typing {
             display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .chat-typing__row {
+            display: flex;
             align-items: center;
-            gap: 8px;
-            color: rgba(0, 251, 255, 0.55);
-            font-size: 10px;
-            letter-spacing: 2px;
+            gap: 10px;
+            color: rgba(0, 251, 255, 0.65);
+            font-family: 'Orbitron', sans-serif;
+            font-size: 9px;
+            letter-spacing: 2.5px;
         }
         .chat-typing-dots {
             display: flex;
-            gap: 4px;
+            gap: 5px;
         }
         .chat-typing-dots span {
-            width: 5px;
-            height: 5px;
+            width: 6px;
+            height: 6px;
             border-radius: 50%;
-            background: rgba(0, 251, 255, 0.6);
+            background: #00fbff;
+            box-shadow: 0 0 6px rgba(0, 251, 255, 0.5);
             animation: typing-bounce 1.2s ease-in-out infinite;
         }
         .chat-typing-dots span:nth-child(2) { animation-delay: 0.15s; }
         .chat-typing-dots span:nth-child(3) { animation-delay: 0.3s; }
+        .chat-typing__bar {
+            height: 2px;
+            border-radius: 2px;
+            background: rgba(0, 251, 255, 0.1);
+            overflow: hidden;
+            position: relative;
+        }
+        .chat-typing__bar::after {
+            content: '';
+            position: absolute;
+            top: 0; left: -40%;
+            width: 40%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, #00fbff, transparent);
+            animation: scan-line 1.8s ease-in-out infinite;
+        }
 
         @keyframes chat-in {
             from { opacity: 0; transform: translateY(10px) scale(0.98); }
@@ -261,6 +478,14 @@
             0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
             30% { transform: translateY(-5px); opacity: 1; }
         }
+        @keyframes bubble-pulse {
+            0%, 100% { box-shadow: 0 0 16px rgba(0, 251, 255, 0.05); }
+            50% { box-shadow: 0 0 28px rgba(0, 251, 255, 0.12); }
+        }
+        @keyframes scan-line {
+            0% { left: -40%; }
+            100% { left: 100%; }
+        }
 
         /* ── INPUT BAR ── */
         .input-wrapper {
@@ -271,7 +496,7 @@
             gap: 12px;
             margin-bottom: 16px;
             flex-shrink: 0;
-            width: min(680px, 90vw);
+            width: min(720px, 92vw);
             margin-left: auto;
             margin-right: auto;
         }
@@ -279,47 +504,63 @@
             flex: 1;
             display: flex;
             align-items: center;
-            gap: 4px;
-            padding: 6px 6px 6px 20px;
+            gap: 6px;
+            padding: 5px 5px 5px 22px;
             border-radius: 50px;
-            background: linear-gradient(145deg, rgba(4, 12, 18, 0.8) 0%, rgba(0, 0, 0, 0.7) 100%);
-            border: 1px solid rgba(0, 251, 255, 0.16);
+            background: linear-gradient(145deg, rgba(4, 12, 18, 0.85) 0%, rgba(0, 0, 0, 0.75) 100%);
+            border: 1px solid rgba(0, 251, 255, 0.18);
             box-shadow:
-                0 4px 24px rgba(0, 0, 0, 0.35),
-                0 0 0 1px rgba(0, 251, 255, 0.03) inset;
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
-            transition: border-color 0.25s ease, box-shadow 0.25s ease;
+                0 4px 24px rgba(0, 0, 0, 0.4),
+                0 0 0 1px rgba(0, 251, 255, 0.04) inset,
+                inset 0 1px 0 rgba(0, 251, 255, 0.06);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            transition: border-color 0.25s ease, box-shadow 0.25s ease, opacity 0.25s ease;
         }
         .input-bar:focus-within {
-            border-color: rgba(0, 251, 255, 0.35);
+            border-color: rgba(0, 251, 255, 0.4);
             box-shadow:
-                0 4px 24px rgba(0, 0, 0, 0.35),
-                0 0 20px rgba(0, 251, 255, 0.08);
+                0 4px 28px rgba(0, 0, 0, 0.4),
+                0 0 24px rgba(0, 251, 255, 0.1),
+                inset 0 1px 0 rgba(0, 251, 255, 0.1);
+        }
+        .input-bar.is-busy {
+            opacity: 0.65;
+            pointer-events: none;
         }
         #user-input {
             flex: 1;
             background: transparent;
             border: none;
             color: #e8feff;
-            padding: 12px 0;
+            padding: 13px 0;
             font-family: 'Michroma', sans-serif;
-            font-size: 12px;
+            font-size: 12.5px;
             outline: none;
             letter-spacing: 0.5px;
         }
         #user-input::placeholder {
-            color: rgba(0, 251, 255, 0.3);
-            letter-spacing: 2px;
+            color: rgba(0, 251, 255, 0.32);
+            letter-spacing: 1.5px;
             font-size: 11px;
         }
+        #user-input:disabled { cursor: not-allowed; }
+        .input-hint {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 7px;
+            letter-spacing: 1.5px;
+            color: rgba(0, 251, 255, 0.25);
+            padding-right: 4px;
+            white-space: nowrap;
+            user-select: none;
+        }
         .send-btn {
-            width: 42px;
-            height: 42px;
+            width: 44px;
+            height: 44px;
             border-radius: 50%;
-            border: 1px solid rgba(0, 251, 255, 0.25);
-            background: rgba(0, 251, 255, 0.08);
-            color: rgba(0, 251, 255, 0.7);
+            border: 1px solid rgba(0, 251, 255, 0.28);
+            background: linear-gradient(145deg, rgba(0, 251, 255, 0.12) 0%, rgba(0, 251, 255, 0.05) 100%);
+            color: rgba(0, 251, 255, 0.75);
             cursor: pointer;
             font-size: 13px;
             display: flex;
@@ -328,11 +569,16 @@
             transition: all 0.2s ease;
             flex-shrink: 0;
         }
-        .send-btn:hover {
-            background: rgba(0, 251, 255, 0.18);
+        .send-btn:hover:not(:disabled) {
+            background: rgba(0, 251, 255, 0.22);
             color: #00fbff;
-            border-color: rgba(0, 251, 255, 0.5);
-            box-shadow: 0 0 16px rgba(0, 251, 255, 0.2);
+            border-color: rgba(0, 251, 255, 0.55);
+            box-shadow: 0 0 18px rgba(0, 251, 255, 0.25);
+            transform: translateY(-1px);
+        }
+        .send-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
         }
         .mic-btn {
             background: linear-gradient(145deg, rgba(4, 12, 18, 0.8) 0%, rgba(0, 0, 0, 0.7) 100%);
@@ -367,14 +613,150 @@
             50% { box-shadow: 0 0 40px rgba(255, 0, 85, 0.55); }
         }
         @keyframes alert-pulse { from { opacity: 0.4; } to { opacity: 1; } }
+
+        #confirm-banner {
+            display: none;
+            pointer-events: auto;
+            width: min(720px, 92vw);
+            margin: 0 auto 10px;
+            padding: 12px 16px;
+            border-radius: 12px;
+            background: rgba(255, 120, 0, 0.12);
+            border: 1px solid rgba(255, 160, 0, 0.45);
+            color: #ffb347;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            line-height: 1.5;
+            box-shadow: 0 0 24px rgba(255, 120, 0, 0.12);
+        }
+        #confirm-banner strong {
+            display: block;
+            font-family: 'Orbitron';
+            font-size: 9px;
+            letter-spacing: 2px;
+            margin-bottom: 6px;
+            color: #ff9f1c;
+        }
+        #confirm-banner code {
+            display: block;
+            margin-top: 6px;
+            padding: 8px 10px;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.35);
+            color: #ffe0b2;
+            word-break: break-all;
+        }
+
+        /* ── MAC CONTROL TOGGLE ── */
+        .ctrl-toggle-wrap {
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: rgba(0, 10, 16, 0.55);
+            border: 1px solid rgba(0, 251, 255, 0.18);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            user-select: none;
+        }
+        .ctrl-toggle-wrap.is-elevated {
+            border-color: rgba(255, 60, 60, 0.45);
+            box-shadow: 0 0 16px rgba(255, 0, 0, 0.12);
+        }
+        .ctrl-toggle-meta {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            min-width: 0;
+        }
+        .ctrl-toggle-label {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 8px;
+            letter-spacing: 2px;
+            color: rgba(0, 251, 255, 0.7);
+        }
+        .ctrl-toggle-wrap.is-elevated .ctrl-toggle-label {
+            color: rgba(255, 120, 120, 0.9);
+        }
+        .ctrl-toggle-hint {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            color: rgba(232, 254, 255, 0.45);
+            letter-spacing: 0.3px;
+        }
+        .ctrl-switch {
+            position: relative;
+            width: 44px;
+            height: 24px;
+            flex-shrink: 0;
+            border-radius: 999px;
+            border: 1px solid rgba(0, 251, 255, 0.35);
+            background: rgba(0, 251, 255, 0.08);
+            cursor: pointer;
+            padding: 0;
+            transition: background 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+        .ctrl-switch:disabled {
+            opacity: 0.5;
+            cursor: wait;
+        }
+        .ctrl-switch__knob {
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #00fbff;
+            box-shadow: 0 0 10px rgba(0, 251, 255, 0.55);
+            transition: transform 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+        }
+        .ctrl-switch.is-on {
+            background: rgba(255, 40, 40, 0.22);
+            border-color: rgba(255, 80, 80, 0.65);
+            box-shadow: 0 0 14px rgba(255, 0, 0, 0.18);
+        }
+        .ctrl-switch.is-on .ctrl-switch__knob {
+            transform: translateX(20px);
+            background: #ff4d4d;
+            box-shadow: 0 0 12px rgba(255, 60, 60, 0.7);
+        }
+        .chat-panel__header-actions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .chat-ctrl-mini {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 8px;
+            letter-spacing: 1.5px;
+            color: rgba(0, 251, 255, 0.55);
+        }
+        .chat-ctrl-mini.is-elevated {
+            color: rgba(255, 120, 120, 0.9);
+        }
     </style>
 </head>
 <body>
     <div id="system-alert"><div class="alert-text">TESrACT OVERRIDE</div></div>
     <div id="canvas-container"></div>
     <div id="hud">
-        <div style="display:flex; justify-content: space-between;">
+        <div style="display:flex; justify-content: space-between; align-items: flex-start; gap: 16px;">
             <div class="ui-text" style="color:#00fbff; font-family:'Orbitron'; font-size:9px; letter-spacing:3px;">TESrACT: <span id="agent-status">STANDBY</span><br>CTRL: <span id="ctrl-mode">RESTRICTED</span></div>
+            <div class="ctrl-toggle-wrap" id="ctrl-toggle-wrap" title="Allow TESrACT to control this Mac">
+                <div class="ctrl-toggle-meta">
+                    <span class="ctrl-toggle-label">MAC CONTROL</span>
+                    <span class="ctrl-toggle-hint" id="ctrl-toggle-hint">Restricted — filesystem locked</span>
+                </div>
+                <button type="button" class="ctrl-switch" id="ctrl-switch" role="switch" aria-checked="false" aria-label="Allow Mac control">
+                    <span class="ctrl-switch__knob"></span>
+                </button>
+            </div>
             <div class="ui-text" id="clock" style="color:#00fbff; font-family:'Orbitron';">00:00:00</div>
         </div>
         <div id="title-container">
@@ -385,22 +767,42 @@
                         <span class="chat-status-dot"></span>
                         COMMS // UPLINK
                     </span>
-                    <span id="chat-count" class="chat-count-badge">1 MSG</span>
+                    <div class="chat-panel__header-actions">
+                        <span class="chat-ctrl-mini" id="chat-ctrl-mini">CTRL OFF</span>
+                        <span id="chat-count" class="chat-count-badge">1 MSG</span>
+                    </div>
                 </div>
                 <div class="chat-messages-wrap">
                     <div id="chat-messages" class="chat-messages"></div>
                 </div>
             </div>
         </div>
+        <div id="confirm-banner">
+            <strong>COMMAND CONFIRMATION REQUIRED</strong>
+            <span id="confirm-banner-text">A shell command is awaiting approval.</span>
+            <code id="confirm-banner-cmd"></code>
+        </div>
         <div class="input-wrapper">
-            <div class="input-bar">
+            <div class="input-bar" id="input-bar">
                 <input type="text" id="user-input" placeholder="Enter command..." autocomplete="off">
+                <span class="input-hint">↵ SEND</span>
                 <button id="send-btn" class="send-btn" type="button" title="Send"><i class="fa-solid fa-arrow-up"></i></button>
             </div>
             <button id="mic-btn" class="mic-btn" type="button" title="Voice input"><i class="fa-solid fa-microphone"></i></button>
         </div>
     </div>
 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-shell-session.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
     <script type="importmap">{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }</script>
     <script type="module">
         import * as THREE from 'three';
@@ -409,11 +811,160 @@
         import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
         import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
-        let isThinking = false, isListening = false, lerpFactor = 0, currentCtrl = false;
+        let isThinking = false, isListening = false, lerpFactor = 0, currentCtrl = false, ctrlToggleBusy = false;
         const chatMessages = document.getElementById('chat-messages');
         const chatCountEl = document.getElementById('chat-count');
         const sysAlert = document.getElementById('system-alert');
+        const confirmBanner = document.getElementById('confirm-banner');
+        const confirmBannerText = document.getElementById('confirm-banner-text');
+        const confirmBannerCmd = document.getElementById('confirm-banner-cmd');
+        const ctrlSwitch = document.getElementById('ctrl-switch');
+        const ctrlToggleWrap = document.getElementById('ctrl-toggle-wrap');
+        const ctrlToggleHint = document.getElementById('ctrl-toggle-hint');
+        const chatCtrlMini = document.getElementById('chat-ctrl-mini');
+
+        function setControlUi(allowed, { announce = false, reply = '' } = {}) {
+            currentCtrl = !!allowed;
+            const modeEl = document.getElementById('ctrl-mode');
+            if (modeEl) {
+                modeEl.innerText = currentCtrl ? 'ELEVATED' : 'RESTRICTED';
+                modeEl.style.color = currentCtrl ? '#ff0000' : '#00fbff';
+            }
+            if (ctrlSwitch) {
+                ctrlSwitch.classList.toggle('is-on', currentCtrl);
+                ctrlSwitch.setAttribute('aria-checked', currentCtrl ? 'true' : 'false');
+            }
+            if (ctrlToggleWrap) {
+                ctrlToggleWrap.classList.toggle('is-elevated', currentCtrl);
+            }
+            if (ctrlToggleHint) {
+                ctrlToggleHint.textContent = currentCtrl
+                    ? 'Elevated — filesystem & terminal unlocked'
+                    : 'Restricted — filesystem locked';
+            }
+            if (chatCtrlMini) {
+                chatCtrlMini.textContent = currentCtrl ? 'CTRL ON' : 'CTRL OFF';
+                chatCtrlMini.classList.toggle('is-elevated', currentCtrl);
+            }
+            if (announce && reply) {
+                appendChatMessage('assistant', reply);
+            }
+        }
+
+        async function fetchControlStatus() {
+            try {
+                const res = await fetch('/permission');
+                if (res.ok) {
+                    const data = await res.json();
+                    setControlUi(!!data.control_status);
+                    return;
+                }
+                // Older servers without /permission: leave UI as-is
+            } catch (e) {
+                console.warn('Permission status fetch failed', e);
+            }
+        }
+
+        async function postPermissionToggle(enabled) {
+            // Primary: dedicated permission API (no LLM)
+            let res = await fetch('/permission', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ control_allowed: !!enabled }),
+            });
+
+            // Fallback: chat short-circuit ("Allow Control" / "Stop Control")
+            // Used when the server process is stale and does not expose /permission yet.
+            if (res.status === 404 || res.status === 405) {
+                res = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        text: enabled ? 'Allow Control' : 'Stop Control',
+                    }),
+                });
+            }
+
+            let data = {};
+            try {
+                data = await res.json();
+            } catch (_) {
+                data = {};
+            }
+            if (!res.ok) {
+                const detail = data.error || data.detail || `HTTP ${res.status}`;
+                throw new Error(detail);
+            }
+            return data;
+        }
+
+        async function setControlFromToggle(enabled) {
+            if (ctrlToggleBusy) return;
+            ctrlToggleBusy = true;
+            if (ctrlSwitch) ctrlSwitch.disabled = true;
+            // Optimistic UI so the switch feels responsive
+            setControlUi(!!enabled);
+            try {
+                const data = await postPermissionToggle(enabled);
+                const allowed = typeof data.control_status === 'boolean'
+                    ? data.control_status
+                    : !!enabled;
+                setControlUi(allowed, {
+                    announce: true,
+                    reply: data.reply || (allowed
+                        ? 'Elevated Mac control granted for this session, Sir.'
+                        : 'Mac control revoked, Sir.'),
+                });
+                updateConfirmBanner(data.pending_command || null);
+            } catch (e) {
+                console.warn('Permission toggle failed', e);
+                // Revert UI to last known server state
+                await fetchControlStatus();
+                const msg = (e && e.message) ? String(e.message) : 'unknown error';
+                appendChatMessage(
+                    'assistant',
+                    `Could not update Mac control, Sir (${msg}). `
+                    + 'If the server was started before the toggle was added, restart it with: python main.py web'
+                );
+            } finally {
+                ctrlToggleBusy = false;
+                if (ctrlSwitch) ctrlSwitch.disabled = false;
+            }
+        }
+
+        if (ctrlSwitch) {
+            ctrlSwitch.addEventListener('click', () => {
+                setControlFromToggle(!currentCtrl);
+            });
+        }
+        // Load persisted session permission on boot
+        fetchControlStatus();
+
+        function updateConfirmBanner(pending) {
+            if (!pending || !pending.command) {
+                confirmBanner.style.display = 'none';
+                return;
+            }
+            confirmBannerText.textContent = 'Reply "Confirm command" or "Yes, run it" to execute:';
+            confirmBannerCmd.textContent = pending.command;
+            confirmBanner.style.display = 'block';
+        }
+        const inputBar = document.getElementById('input-bar');
+        const userInputEl = document.getElementById('user-input');
+        const sendBtnEl = document.getElementById('send-btn');
         let loadingMsgEl = null;
+
+        const LANG_LABELS = {
+            bash: 'BASH', sh: 'SHELL', shell: 'SHELL', zsh: 'ZSH',
+            python: 'PYTHON', py: 'PYTHON', javascript: 'JAVASCRIPT', js: 'JAVASCRIPT',
+            typescript: 'TYPESCRIPT', ts: 'TYPESCRIPT', json: 'JSON', yaml: 'YAML', yml: 'YAML',
+            html: 'HTML', css: 'CSS', sql: 'SQL', java: 'JAVA', rust: 'RUST', go: 'GO',
+            cpp: 'C++', c: 'C', plaintext: 'TEXT', text: 'TEXT', console: 'CONSOLE'
+        };
+
+        if (window.marked) {
+            marked.use({ gfm: true, breaks: true });
+        }
 
         function updateChatCount() {
             const n = chatMessages.querySelectorAll('.chat-msg:not(.chat-msg--loading)').length;
@@ -424,15 +975,15 @@
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
 
-        async function copyMessageText(text, btn) {
+        function setInputBusy(busy) {
+            userInputEl.disabled = busy;
+            sendBtnEl.disabled = busy;
+            inputBar.classList.toggle('is-busy', busy);
+        }
+
+        async function copyToClipboard(text, btn, iconOnly = true) {
             try {
                 await navigator.clipboard.writeText(text);
-                btn.classList.add('copied');
-                btn.innerHTML = '<i class="fa-solid fa-check"></i>';
-                setTimeout(() => {
-                    btn.classList.remove('copied');
-                    btn.innerHTML = '<i class="fa-solid fa-copy"></i>';
-                }, 1600);
             } catch (_) {
                 const ta = document.createElement('textarea');
                 ta.value = text;
@@ -442,6 +993,75 @@
                 ta.select();
                 document.execCommand('copy');
                 document.body.removeChild(ta);
+            }
+            const prev = btn.innerHTML;
+            btn.classList.add('copied');
+            btn.innerHTML = iconOnly
+                ? '<i class="fa-solid fa-check"></i>'
+                : '<i class="fa-solid fa-check"></i> COPIED';
+            setTimeout(() => {
+                btn.classList.remove('copied');
+                btn.innerHTML = prev;
+            }, 1600);
+        }
+
+        function detectLanguage(codeEl) {
+            const cls = [...codeEl.classList].find((c) => c.startsWith('language-'));
+            if (cls) return cls.slice(9).toLowerCase();
+            const sample = (codeEl.textContent || '').trim().slice(0, 200);
+            if (/^(\$ |#!\/bin\/(ba)?sh|sudo |npm |pip |curl |git )/m.test(sample)) return 'bash';
+            if (/^(def |import |from |print\(|class )/m.test(sample)) return 'python';
+            if (/^(\{|\[|")/.test(sample) && /":/.test(sample)) return 'json';
+            return 'plaintext';
+        }
+
+        function enhanceCodeBlocks(root) {
+            root.querySelectorAll('pre').forEach((pre) => {
+                if (pre.closest('.code-block')) return;
+                let codeEl = pre.querySelector('code');
+                if (!codeEl) {
+                    codeEl = document.createElement('code');
+                    codeEl.textContent = pre.textContent;
+                    pre.textContent = '';
+                    pre.appendChild(codeEl);
+                }
+                const lang = detectLanguage(codeEl);
+                if (![...codeEl.classList].some((c) => c.startsWith('language-'))) {
+                    codeEl.classList.add(`language-${lang}`);
+                }
+
+                const wrapper = document.createElement('div');
+                wrapper.className = 'code-block';
+                const header = document.createElement('div');
+                header.className = 'code-block__header';
+                const langLabel = document.createElement('span');
+                langLabel.className = 'code-block__lang';
+                langLabel.textContent = LANG_LABELS[lang] || lang.toUpperCase();
+                const copyBtn = document.createElement('button');
+                copyBtn.type = 'button';
+                copyBtn.className = 'code-block__copy';
+                copyBtn.title = 'Copy code';
+                copyBtn.innerHTML = '<i class="fa-solid fa-copy"></i> COPY';
+                copyBtn.onclick = () => copyToClipboard(codeEl.textContent, copyBtn, false);
+                header.append(langLabel, copyBtn);
+                pre.parentNode.insertBefore(wrapper, pre);
+                wrapper.append(header, pre);
+                if (window.Prism) Prism.highlightElement(codeEl);
+            });
+        }
+
+        function renderMarkdown(text) {
+            if (!window.marked) return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+            return marked.parse(text);
+        }
+
+        function populateMessageBody(body, role, text) {
+            if (role === 'assistant') {
+                body.classList.add('md-content');
+                body.innerHTML = renderMarkdown(text);
+                enhanceCodeBlocks(body);
+            } else {
+                body.textContent = text;
             }
         }
 
@@ -464,16 +1084,18 @@
 
             const body = document.createElement('div');
             body.className = 'chat-msg__body';
-            body.textContent = text;
+            populateMessageBody(body, role, text);
 
-            const copyBtn = document.createElement('button');
-            copyBtn.className = 'chat-copy';
-            copyBtn.type = 'button';
-            copyBtn.title = 'Copy message';
-            copyBtn.innerHTML = '<i class="fa-solid fa-copy"></i>';
-            copyBtn.onclick = () => copyMessageText(text, copyBtn);
-
-            bubble.append(label, body, copyBtn);
+            bubble.append(label, body);
+            if (role === 'assistant') {
+                const copyBtn = document.createElement('button');
+                copyBtn.className = 'chat-copy';
+                copyBtn.type = 'button';
+                copyBtn.title = 'Copy message';
+                copyBtn.innerHTML = '<i class="fa-solid fa-copy"></i>';
+                copyBtn.onclick = () => copyToClipboard(text, copyBtn);
+                bubble.appendChild(copyBtn);
+            }
             msg.append(avatar, bubble);
             chatMessages.appendChild(msg);
             updateChatCount();
@@ -490,8 +1112,11 @@
                 <div class="chat-msg__bubble">
                     <div class="chat-msg__label">TESrACT</div>
                     <div class="chat-typing">
-                        <span>PROCESSING</span>
-                        <span class="chat-typing-dots"><span></span><span></span><span></span></span>
+                        <div class="chat-typing__row">
+                            <span>SYNTHESIZING</span>
+                            <span class="chat-typing-dots"><span></span><span></span><span></span></span>
+                        </div>
+                        <div class="chat-typing__bar"></div>
                     </div>
                 </div>`;
             chatMessages.appendChild(loadingMsgEl);
@@ -513,6 +1138,7 @@
 
             appendChatMessage('user', prompt);
             isThinking = true;
+            setInputBusy(true);
             document.getElementById('agent-status').innerText = "PROCESSING";
             showLoadingMessage();
 
@@ -537,10 +1163,12 @@
                 if (data.control_status && (replyLower.includes("execution") || replyLower.includes("opened") || replyLower.includes("complete"))) {
                     sysAlert.style.display = 'flex'; setTimeout(() => sysAlert.style.display = 'none', 2800);
                 }
-                if (data.control_status !== currentCtrl) {
-                    currentCtrl = data.control_status;
-                    document.getElementById('ctrl-mode').innerText = currentCtrl ? "ELEVATED" : "RESTRICTED";
-                    document.getElementById('ctrl-mode').style.color = currentCtrl ? "#ff0000" : "#00fbff";
+                if (typeof data.control_status === 'boolean') {
+                    setControlUi(data.control_status);
+                }
+                updateConfirmBanner(data.pending_command || null);
+                if ((reply || '').includes('CONFIRMATION_REQUIRED')) {
+                    confirmBanner.style.display = 'block';
                 }
             } catch(e) {
                 removeLoadingMessage();
@@ -548,6 +1176,7 @@
                 console.warn('Chat fetch failed', e);
             }
             isThinking = false;
+            setInputBusy(false);
             document.getElementById('agent-status').innerText = "STANDBY";
         }
 
@@ -791,16 +1420,15 @@
         updateClock();
         setInterval(updateClock, 1000);
 
-        const userInput = document.getElementById('user-input');
-        const sendBtn = document.getElementById('send-btn');
         function submitInput() {
-            const val = userInput.value;
+            if (isThinking) return;
+            const val = userInputEl.value;
             if (!val.trim()) return;
             processCommand(val);
-            userInput.value = '';
+            userInputEl.value = '';
         }
-        userInput.onkeypress = (e) => { if (e.key === 'Enter') submitInput(); };
-        sendBtn.onclick = submitInput;
+        userInputEl.onkeypress = (e) => { if (e.key === 'Enter') submitInput(); };
+        sendBtnEl.onclick = submitInput;
         const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (Speech) {
             const rec = new Speech(), micBtn = document.getElementById('mic-btn');
