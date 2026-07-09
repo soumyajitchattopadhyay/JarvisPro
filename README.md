@@ -8,7 +8,8 @@ A proactive, agentic AI assistant with a JARVIS-inspired personality.
 - Tool use, access control, and memory
 - **Self-healing Cloudflare tunnel** → stable global link on Render
 - **Secure Brain mode** — host never mutates the OS for public requests; physical actions return client-side intents
-- **HMAC handshake** on `/chat` and `/api/update-brain` (`BRAIN_REGISTRY_SECRET`)
+- **HMAC handshake** on `/api/update-brain` and `/internal/llm/invoke` (`BRAIN_REGISTRY_SECRET`)
+- **Public `/chat` HUD** by default (no browser secrets); optional `BRAIN_AUTH_REQUIRE_CHAT=true`
 
 Run locally:
 ```
@@ -72,8 +73,9 @@ The Mac process is a **cognitive engine** only:
 | File creation | Returns `action: DOWNLOAD_FILE` for the client |
 | List/read/mkdir/open/shell | Returns `action: DISPLAY_DATA` client intents |
 | Pure Q&A / math / search | `action: LOGIC_ONLY` (Brain-local) |
-| Public `/chat`, `/api/update-brain` | Require HMAC or Bearer `BRAIN_REGISTRY_SECRET` |
-| Localhost HUD | Allowed without headers when `BRAIN_AUTH_LOCALHOST_BYPASS=true` (default) |
+| Public `/chat` (HUD) | Open by default — browsers cannot embed secrets. Set `BRAIN_AUTH_REQUIRE_CHAT=true` to lock |
+| `/api/update-brain`, `/internal/llm/invoke` | Require HMAC or Bearer `BRAIN_REGISTRY_SECRET` |
+| Localhost HUD | Always works; optional strict chat auth still allows loopback when `BRAIN_AUTH_LOCALHOST_BYPASS=true` |
 
 Example authenticated `/chat` response when packaging a file:
 

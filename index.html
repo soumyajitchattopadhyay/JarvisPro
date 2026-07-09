@@ -1144,8 +1144,19 @@
 
             try {
                 const res = await fetch('/chat', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: prompt}) });
-                const data = await res.json();
-                const reply = data.reply || 'No response received.';
+                let data = {};
+                try {
+                    data = await res.json();
+                } catch (_) {
+                    data = {};
+                }
+                // Prefer server `reply`; fall back to auth/error detail so 401s are not silent.
+                let reply = (data && (data.reply || data.detail || data.error)) || '';
+                if (!reply) {
+                    reply = res.ok
+                        ? 'No response received.'
+                        : `Request failed (HTTP ${res.status}). Is the Mac brain online?`;
+                }
                 removeLoadingMessage();
                 appendChatMessage('assistant', reply);
 

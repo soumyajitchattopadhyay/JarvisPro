@@ -215,11 +215,21 @@ async def read_body_bytes(request: Request) -> bytes:
 
 
 def unauthorized_response(detail: str = "Unauthorized") -> JSONResponse:
+    # Always include `reply` so the HUD never falls through to a blank
+    # "No response received." when auth fails (browser has no secret headers).
+    human = (
+        f"Access denied ({detail}). "
+        "This endpoint requires a valid BRAIN_REGISTRY_SECRET handshake, "
+        "or open the HUD via localhost / the live tunnel (/go)."
+    )
     return JSONResponse(
         {
             "status": "error",
             "error": "unauthorized",
             "detail": detail,
+            "reply": human,
+            "control_status": False,
+            "pending_command": None,
             "execution_target": "none",
             "action": "LOGIC_ONLY",
             "payload": {},
@@ -227,6 +237,18 @@ def unauthorized_response(detail: str = "Unauthorized") -> JSONResponse:
         status_code=401,
         headers={"WWW-Authenticate": "Bearer, HMAC-SHA256"},
     )
+
+
+def chat_auth_required() -> bool:
+    """
+    Whether /chat must present brain credentials.
+
+    Default FALSE — the public HUD on Render posts to /chat without secrets.
+    Hybrid Mac invoke stays protected via /internal/llm/invoke (always gated).
+    Set BRAIN_AUTH_REQUIRE_CHAT=true only for locked-down private deployments.
+    """
+    raw = (os.getenv("BRAIN_AUTH_REQUIRE_CHAT") or "false").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def verify_request(
@@ -292,21 +314,46 @@ def verify_request(
     return False, "missing or invalid brain credentials"
 
 
+def _parse_json_payload(body: bytes) -> dict[str, Any] | None:
+    import json
+
+    if not body:
+        return None
+    try:
+        data = json.loads(body.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 async def gate_brain_auth(
     request: Request,
 ) -> tuple[bytes, dict[str, Any] | None, JSONResponse | None]:
     """Return (body, payload, error_response). error_response is None when authorized."""
-    import json
-
     body = await read_body_bytes(request)
-    payload: dict[str, Any] | None = None
-    if body:
-        try:
-            data = json.loads(body.decode("utf-8"))
-            if isinstance(data, dict):
-                payload = data
-        except Exception:
-            payload = None
+    payload = _parse_json_payload(body)
+    ok, reason = verify_request(request, body, payload=payload)
+    if not ok:
+        print(f"[TESrACT:auth] REJECT {request.method} {request.url.path}: {reason}")
+        return body, payload, unauthorized_response(reason)
+    return body, payload, None
+
+
+async def gate_chat_auth(
+    request: Request,
+) -> tuple[bytes, dict[str, Any] | None, JSONResponse | None]:
+    """
+    Auth gate for the public /chat HUD endpoint.
+
+    By default this only parses JSON and does NOT require credentials, so the
+    Render-hosted frontend can talk to the agent without embedding secrets.
+    Set BRAIN_AUTH_REQUIRE_CHAT=true to enforce the same HMAC/Bearer gate as
+    /internal/llm/invoke.
+    """
+    body = await read_body_bytes(request)
+    payload = _parse_json_payload(body)
+    if not chat_auth_required():
+        return body, payload, None
     ok, reason = verify_request(request, body, payload=payload)
     if not ok:
         print(f"[TESrACT:auth] REJECT {request.method} {request.url.path}: {reason}")

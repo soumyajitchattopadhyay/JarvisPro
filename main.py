@@ -5,7 +5,8 @@ Secure Brain architecture:
   - Host Mac is a cognitive engine (logic, LLM, API orchestration)
   - No public request may mutate the host OS; physical actions return
     client-side execution intents (DOWNLOAD_FILE / DISPLAY_DATA / LOGIC_ONLY)
-  - /chat and /api/update-brain require HMAC or shared-secret handshake
+  - /api/update-brain and /internal/llm/invoke require HMAC or shared-secret handshake
+  - /chat is public by default (HUD); set BRAIN_AUTH_REQUIRE_CHAT=true to lock it
 
 Routing (llm_router.py) — local-first on Apple Silicon unified RAM:
   - Ollama  → light models for Q&A/tools; heavy for analysis
@@ -1728,11 +1729,16 @@ async def permission_set(request: Request):
 @app.post("/chat")
 async def chat_endpoint(request: Request):
     """
-    Main chat endpoint. Requires cryptographic handshake for non-localhost callers.
+    Main chat endpoint for the public HUD (Render + tunnel + localhost).
+
+    Auth is optional by default — browsers cannot embed BRAIN_REGISTRY_SECRET.
+    Strict handshake still protects /api/update-brain and /internal/llm/invoke
+    (Render → Mac hybrid). Set BRAIN_AUTH_REQUIRE_CHAT=true to lock /chat down.
+
     Physical host actions are never executed — returned as client execution intents.
     """
     try:
-        _raw, payload, auth_err = await brain_auth.gate_brain_auth(request)
+        _raw, payload, auth_err = await brain_auth.gate_chat_auth(request)
         if auth_err is not None:
             return auth_err
         if not isinstance(payload, dict):
