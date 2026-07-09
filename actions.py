@@ -15,9 +15,6 @@ import httpx
 from langchain_core.tools import tool
 from langchain_experimental.utilities import PythonREPL
 from duckduckgo_search import DDGS
-from langgraph.prebuilt import InjectedState
-from typing_extensions import Annotated
-
 from local_search_memory import (
     format_recall_for_context,
     recall_memory,
@@ -27,23 +24,33 @@ from local_search_memory import (
 )
 from mac_access import (
     classify_command,
+    ensure_directory,
+    find_named_path,
     format_confirmation_request,
+    last_remembered_path,
     list_path,
     read_text_file,
+    real_home,
+    remember_path,
     resolve_mac_path,
+    rewrite_paths_in_command,
     run_shell_command,
+    sanitize_path_string,
     set_pending_confirmation,
     write_text_file,
-)
-
-# Injected from graph state by ToolNode — hidden from the LLM tool schema.
-ControlAllowed = Annotated[bool, InjectedState("control_allowed")]
+)  # resolve_mac_path used by mkdir/file inference
+import permissions
 
 repl = PythonREPL()
 WORKSPACE_ROOT = Path(__file__).resolve().parent
 GENERATED_DIR = WORKSPACE_ROOT / "generated_images"
 AGENT_DATA_DIR = WORKSPACE_ROOT / "agent_data"
 TASKS_FILE = AGENT_DATA_DIR / "active_task.json"
+
+
+def _control_ok(control_allowed: bool = False) -> bool:
+    """True when Mac control is ON (file flag) or an explicit override is passed."""
+    return bool(control_allowed) or permissions.is_control_allowed()
 
 def _ensure_dirs() -> None:
     GENERATED_DIR.mkdir(exist_ok=True)
@@ -60,17 +67,98 @@ def _tool_err(name: str, message: str) -> str:
 
 def _permission_denied(tool_name: str, detail: str = "") -> str:
     msg = (
-        "PERMISSION_DENIED: Mac access requires elevated control. "
-        "Ask Sir to say 'Allow Control' once — permission stays active for the session."
+        "PERMISSION_DENIED: Mac control is OFF. "
+        "Turn on the MAC CONTROL toggle or say 'Allow Control'."
     )
     if detail:
         msg = f"{msg} ({detail})"
     return _tool_err(tool_name, msg)
 
 
+def _clean_path_arg(path: str) -> str:
+    """Strip model junk like 'filename: requirements.txt' or path=... wrappers."""
+    raw = (path or "").strip().strip("'\"")
+    raw = re.sub(
+        r"^(?:filename|file\s*name|path|file)\s*[:=]\s*",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    # Kill hallucinated placeholder homes early
+    raw = sanitize_path_string(raw)
+    raw = raw.strip().strip("'\"")
+    return raw
+
+
+def _safe_resolve(path: Path) -> Path:
+    """resolve() that allows missing parents (needed for create/write)."""
+    try:
+        return path.expanduser().resolve(strict=False)
+    except TypeError:
+        return path.expanduser().resolve()
+
+
 def _resolve_path(path: str) -> Path:
-    """Resolve a Mac filesystem path (~, absolute, or relative to cwd)."""
-    return resolve_mac_path(path)
+    """
+    Resolve a Mac path to the real absolute path on this machine.
+
+    Order:
+      1. sanitize placeholders (/Users/yourusername → real home)
+      2. expand ~ / Desktop / Documents
+      3. if relative name exists under Desktop/home, use that
+      4. project workspace for project files
+    Never requires the path to already exist (create/write targets).
+    """
+    raw = _clean_path_arg(path)
+    if not raw:
+        raise ValueError("Path cannot be empty.")
+
+    try:
+        primary = resolve_mac_path(raw)
+        if primary.exists():
+            return primary
+    except Exception:
+        primary = None
+
+    norm = raw.replace("\\", "/").strip()
+    # Strip leading ~/ for segment logic
+    rel = norm[2:] if norm.startswith("~/") else norm.lstrip("/")
+
+    # Multi-segment relative: TESrACT-1/Soumyajit or Desktop/TESrACT-1/x
+    if not norm.startswith("/") and "/" in rel:
+        parts = [p for p in rel.split("/") if p and p != "~"]
+        if parts:
+            root_name = parts[0]
+            # Desktop/foo → under home/Desktop
+            if root_name.lower() in ("desktop", "documents", "downloads"):
+                base = real_home() / root_name.capitalize()
+                return _safe_resolve(base.joinpath(*parts[1:]))
+            found_root = find_named_path(root_name)
+            if found_root:
+                return _safe_resolve(found_root.joinpath(*parts[1:]))
+            # Default: under Desktop
+            return _safe_resolve((real_home() / "Desktop").joinpath(*parts))
+
+    # Single name: TESrACT-1, notes.txt
+    if not norm.startswith("/") and "/" not in rel:
+        found = find_named_path(rel)
+        if found:
+            return found
+        # Prefer Desktop for new folders/files
+        desktop_cand = _safe_resolve(real_home() / "Desktop" / rel)
+        ws_cand = _safe_resolve(WORKSPACE_ROOT / rel)
+        if ws_cand.exists():
+            return ws_cand
+        return desktop_cand
+
+    if primary is not None:
+        return primary
+    try:
+        return resolve_mac_path(raw)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not resolve path original={path!r} cleaned={raw!r}: {exc}"
+        ) from exc
 
 
 def _search_duckduckgo(query: str, max_results: int = 5) -> list[dict[str, str]]:
@@ -302,14 +390,10 @@ def generate_image(prompt: str, style: str = ""):
 
 
 @tool
-def execute_python_code(code: str, control_allowed: ControlAllowed = False):
+def execute_python_code(code: str, control_allowed: bool = False):
     """Run Python code for calculations, data analysis, logic, or automation. Requires elevated control."""
-    if not control_allowed:
-        return _tool_err(
-            "execute_python_code",
-            "PERMISSION_DENIED: Code execution requires elevated access. "
-            "Ask Sir to say 'Allow Control', then retry this tool.",
-        )
+    if not _control_ok(control_allowed):
+        return _permission_denied("execute_python_code")
     code = (code or "").strip()
     if not code:
         return _tool_err("execute_python_code", "code cannot be empty.")
@@ -322,61 +406,96 @@ def execute_python_code(code: str, control_allowed: ControlAllowed = False):
 
 
 @tool
-def read_file(path: str, max_chars: int = 12000, control_allowed: ControlAllowed = False):
-    """Read a text file anywhere on Sir's Mac (e.g. ~/Desktop/notes.txt, /Users/...). Requires Allow Control."""
-    if not control_allowed:
+def read_file(path: str, max_chars: int = 12000, control_allowed: bool = False):
+    """Read a text file on Sir's Mac. Use ~ or real paths (e.g. ~/Desktop/notes.txt). Requires Allow Control."""
+    if not _control_ok(control_allowed):
         return _permission_denied("read_file")
     if not (path or "").strip():
         return _tool_err("read_file", "path cannot be empty.")
     try:
-        target = _resolve_path(path)
+        target = _resolve_path(sanitize_path_string(path))
         body = read_text_file(target, max_chars=max_chars)
         return _tool_ok("read_file", body)
     except Exception as exc:
-        return _tool_err("read_file", str(exc))
+        return _tool_err(
+            "read_file",
+            f"{exc} | home={real_home()} original_path={path!r}",
+        )
 
 
 @tool
 def write_file(
     path: str,
     content: str,
-    control_allowed: ControlAllowed = False,
+    control_allowed: bool = False,
     append: bool = False,
 ):
-    """Create or edit a text file on Sir's Mac. Requires Allow Control for Mac-wide paths."""
-    if not control_allowed:
+    """Create or edit a text file on Sir's Mac. Prefer ~/Desktop/... paths. Requires Allow Control."""
+    if not _control_ok(control_allowed):
         return _permission_denied("write_file")
     path = (path or "").strip()
     if not path:
         return _tool_err("write_file", "path cannot be empty.")
+    # Always sanitize LLM placeholder homes (/Users/yourusername, wrong usernames, etc.)
+    path = sanitize_path_string(path)
     try:
         target = _resolve_path(path)
         result = write_text_file(target, content or "", append=bool(append))
         return _tool_ok("write_file", result)
     except Exception as exc:
-        return _tool_err("write_file", str(exc))
+        return _tool_err(
+            "write_file",
+            f"{exc} | home={real_home()} original_path={path!r}",
+        )
+
+
+@tool
+def create_directory(path: str, control_allowed: bool = False):
+    """
+    Create a folder (and parents) on Sir's Mac.
+    Prefer ~/Desktop/... paths. Requires Allow Control.
+    Use this instead of shell mkdir for reliable folder creation.
+    """
+    if not _control_ok(control_allowed):
+        return _permission_denied("create_directory")
+    path = (path or "").strip()
+    if not path:
+        return _tool_err("create_directory", "path cannot be empty.")
+    path = sanitize_path_string(path)
+    try:
+        target = _resolve_path(path)
+        result = ensure_directory(target)
+        return _tool_ok("create_directory", result)
+    except Exception as exc:
+        return _tool_err(
+            "create_directory",
+            f"{exc} | home={real_home()} original_path={path!r}",
+        )
 
 
 @tool
 def list_directory(
     path: str = "~",
     max_entries: int = 200,
-    control_allowed: ControlAllowed = False,
+    control_allowed: bool = False,
 ):
-    """List files and folders anywhere on Sir's Mac (~, ~/Documents, /Applications, /Users/...). Requires Allow Control."""
-    if not control_allowed:
+    """List files/folders on Sir's Mac. Prefer ~ paths (e.g. ~/Desktop). Requires Allow Control."""
+    if not _control_ok(control_allowed):
         return _permission_denied("list_directory")
     try:
         raw = (path or "~").strip() or "~"
+        raw = sanitize_path_string(raw)
         target = _resolve_path(raw)
-        # Applications folders are large — raise the cap automatically
         limit = int(max_entries or 200)
         if "applications" in str(target).lower():
             limit = max(limit, 400)
         body = list_path(target, max_entries=limit)
         return _tool_ok("list_directory", body)
     except Exception as exc:
-        return _tool_err("list_directory", str(exc))
+        return _tool_err(
+            "list_directory",
+            f"{exc} | home={real_home()} original_path={path!r}",
+        )
 
 
 @tool
@@ -384,18 +503,19 @@ def run_terminal_command(
     command: str,
     working_directory: str = "",
     user_confirmed: bool = False,
-    control_allowed: ControlAllowed = False,
+    control_allowed: bool = False,
     thread_id: str = "web_user_001",
 ):
     """
-    Run a shell command on Sir's Mac. Safe commands (ls, pwd, git status) run immediately.
+    Run a shell command on Sir's Mac. Safe commands (ls, pwd, git status, mkdir) run immediately.
     Dangerous commands (rm, sudo, install) require Sir to confirm first.
     Blocked commands (rm -rf /, system edits) are never executed.
+    Always use real paths (~/Desktop/...) — never /Users/yourusername.
     """
-    if not control_allowed:
+    if not _control_ok(control_allowed):
         return _permission_denied("run_terminal_command")
 
-    cmd = (command or "").strip()
+    cmd = rewrite_paths_in_command((command or "").strip())
     if not cmd:
         return _tool_err("run_terminal_command", "command cannot be empty.")
 
@@ -403,7 +523,7 @@ def run_terminal_command(
     if level == "blocked":
         return _tool_err(
             "run_terminal_command",
-            "BLOCKED: This command targets protected system resources and cannot be executed.",
+            f"BLOCKED: protected system command refused. command={cmd!r}",
         )
     if level == "confirm" and not user_confirmed:
         set_pending_confirmation(
@@ -419,23 +539,23 @@ def run_terminal_command(
         )
 
     try:
-        output = run_shell_command(cmd, working_directory=working_directory)
+        wd = sanitize_path_string(working_directory) if working_directory else ""
+        output = run_shell_command(cmd, working_directory=wd)
         return _tool_ok("run_terminal_command", output)
     except subprocess.TimeoutExpired:
         return _tool_err("run_terminal_command", f"Command timed out after 120s: {cmd}")
     except Exception as exc:
-        return _tool_err("run_terminal_command", str(exc))
+        return _tool_err(
+            "run_terminal_command",
+            f"{exc} | command={cmd!r} home={real_home()}",
+        )
 
 
 @tool
-def open_url_in_browser(url: str, control_allowed: ControlAllowed = False):
+def open_url_in_browser(url: str, control_allowed: bool = False):
     """Open a URL in the system browser. Requires elevated control."""
-    if not control_allowed:
-        return _tool_err(
-            "open_url_in_browser",
-            "PERMISSION_DENIED: Browser access requires elevated access. "
-            "Ask Sir to say 'Allow Control', then retry.",
-        )
+    if not _control_ok(control_allowed):
+        return _permission_denied("open_url_in_browser")
     url = (url or "").strip()
     if not url:
         return _tool_err("open_url_in_browser", "URL cannot be empty.")
@@ -600,6 +720,7 @@ tools = [
     execute_python_code,
     read_file,
     write_file,
+    create_directory,
     list_directory,
     run_terminal_command,
     open_url_in_browser,
@@ -612,6 +733,7 @@ _CONTROL_GATED = frozenset({
     "execute_python_code",
     "read_file",
     "write_file",
+    "create_directory",
     "list_directory",
     "run_terminal_command",
     "open_url_in_browser",
@@ -659,6 +781,94 @@ _LIST_APPS_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_READ_FILE_RE = re.compile(
+    r"\b(?:"
+    r"(?:read|open|show|cat|display|view|print)\s+(?:the\s+)?(?:contents?\s+of\s+)?(?:the\s+)?file\s+"
+    r"|read\s+(?:the\s+)?"
+    r"|what(?:'s| is)\s+in\s+(?:the\s+)?(?:file\s+)?"
+    r"|show\s+(?:me\s+)?(?:the\s+)?(?:contents?\s+of\s+)?"
+    r")"
+    r"['\"]?([~/]?[\w./\\-]+\.[\w]+)['\"]?",
+    re.IGNORECASE,
+)
+# Explicit write WITH content only — never force empty writes (would wipe files).
+_WRITE_FILE_CONTENT_RE = re.compile(
+    r"\b(?:write|create|save|put)\s+(?:to\s+)?(?:a\s+|the\s+)?file\s+"
+    r"['\"]?([~/]?[\w./\\-]+\.[\w]+)['\"]?\s+"
+    r"(?:with\s+(?:the\s+)?(?:content|text|data)\s*[:\-]?\s*|\s*[:\-]\s*)(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_WRITE_FILE_CONTENT_RE2 = re.compile(
+    r"\b(?:write|save)\s+(?:this\s+)?(?:to\s+)?['\"]?([~/]?[\w./\\-]+\.[\w]+)['\"]?\s*"
+    r"(?:"
+    r"\s*[:\-]\s*"
+    r"|\s+with\s+(?:the\s+)?(?:content|text|data)\s*[:\-]?\s*"
+    r")(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_SHELL_CMD_RE = re.compile(
+    r"\b(?:"
+    r"(?:run|execute)\s+(?:this\s+)?(?:shell\s+|terminal\s+)?command\s*[:\-]?\s*`([^`]+)`"
+    r"|(?:run|execute)\s+`([^`]+)`"
+    r"|(?:run|execute)\s+(?:in\s+)?(?:the\s+)?(?:shell|terminal)\s*[:\-]?\s*(.+)$"
+    r"|shell\s*:\s*(.+)$"
+    r")",
+    re.IGNORECASE,
+)
+# create/make folder named X inside/on/in Y
+_MKDIR_NAMED_IN_RE = re.compile(
+    r"\b(?:make|create|add)\s+(?:a\s+|the\s+)?(?:new\s+)?(?:folder|directory|dir)\s+"
+    r"(?:named|called)\s+['\"]?([^'\"\n,]+?)['\"]?\s+"
+    r"(?:inside|in|under|within|on|at|onto|to)\s+(?:my\s+|the\s+|sir'?s\s+)?"
+    r"['\"]?([^'\"\n]+?)['\"]?\s*$",
+    re.IGNORECASE,
+)
+# create/make folder X inside/on/in Y  (no named/called)
+_MKDIR_BARE_IN_RE = re.compile(
+    r"\b(?:make|create|add)\s+(?:a\s+|the\s+)?(?:new\s+)?(?:folder|directory|dir)\s+"
+    r"['\"]?([^'\"\n,]+?)['\"]?\s+"
+    r"(?:inside|in|under|within|on|at|onto|to)\s+(?:my\s+|the\s+|sir'?s\s+)?"
+    r"['\"]?([^'\"\n]+?)['\"]?\s*$",
+    re.IGNORECASE,
+)
+# mkdir [-p] path  OR  create folder at path  OR  create folder ~/Desktop/Foo
+_MKDIR_PATH_RE = re.compile(
+    r"\b(?:"
+    r"mkdir\s+(?:-p\s+)?['\"]?([~/][^\s'\"]+|/(?:Users|home)/[^\s'\"]+|Desktop/[^\s'\"]+|Documents/[^\s'\"]+|Downloads/[^\s'\"]+)['\"]?"
+    r"|(?:make|create|add)\s+(?:a\s+|the\s+)?(?:new\s+)?(?:folder|directory|dir)\s+(?:at\s+)?"
+    r"['\"]?([~/][^\s'\"]+|/(?:Users|home)/[^\s'\"]+|Desktop/[^\s'\"]+|Documents/[^\s'\"]+|Downloads/[^\s'\"]+)['\"]?\s*$"
+    r")",
+    re.IGNORECASE,
+)
+# create a folder named X  (default parent = Desktop)
+_MKDIR_NAMED_ONLY_RE = re.compile(
+    r"\b(?:make|create|add)\s+(?:a\s+|the\s+)?(?:new\s+)?(?:folder|directory|dir)\s+"
+    r"(?:named|called)\s+['\"]?([^'\"\n]+?)['\"]?\s*$",
+    re.IGNORECASE,
+)
+# create a file named X on/in Y with content: ...
+_CREATE_FILE_CONTENT_RE = re.compile(
+    r"\b(?:create|write|make|save)\s+(?:a\s+|the\s+)?(?:new\s+)?(?:text\s+)?file\s+"
+    r"(?:(?:named|called)\s+)?['\"]?([^'\"\n]+?\.\w+|[^'\"\n]+?)['\"]?\s+"
+    r"(?:inside|in|under|within|on|at|to)\s+(?:my\s+|the\s+|sir'?s\s+)?"
+    r"(?:that\s+folder|the\s+folder|it|['\"]?([^'\"\n]+?)['\"]?)\s*"
+    r"(?:with\s+(?:the\s+)?(?:content|text|data)\s*[:\-]?\s*|\s*[:\-]\s*)(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+# create a file inside that folder with content: ...
+_CREATE_FILE_SIMPLE_RE = re.compile(
+    r"\b(?:create|write|make)\s+(?:a\s+)?(?:text\s+)?file\s+"
+    r"(?:inside|in)\s+(?:that\s+folder|the\s+folder|it)\s+"
+    r"(?:with\s+(?:the\s+)?(?:content|text|data)\s*[:\-]?\s*)(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+# create empty/new file path (no content)
+_CREATE_EMPTY_FILE_RE = re.compile(
+    r"\b(?:create|make)\s+(?:a\s+|an\s+)?(?:new\s+|empty\s+)?(?:text\s+)?file\s+"
+    r"(?:(?:named|called)\s+)?['\"]?([~/]?[\w./\\-]+\.[\w]+)['\"]?"
+    r"(?:\s+(?:inside|in|on|at|under)\s+(?:my\s+|the\s+)?['\"]?([^'\"\n]+?)['\"]?)?\s*$",
+    re.IGNORECASE,
+)
 _PATH_HINTS = (
     (re.compile(r"\b(?:apps?|applications)\b", re.I), "/Applications"),
     (re.compile(r"\bdesktop\b", re.I), "~/Desktop"),
@@ -679,8 +889,8 @@ _PSEUDO_TOOL_CALL_RE = re.compile(
 _KNOWN_TOOL_NAMES = frozenset({
     "web_search", "search_and_summarize", "recall_memory", "save_memory_note",
     "manage_task_plan", "generate_image", "execute_python_code",
-    "read_file", "write_file", "list_directory", "run_terminal_command",
-    "open_url_in_browser", "get_current_time",
+    "read_file", "write_file", "create_directory", "list_directory",
+    "run_terminal_command", "open_url_in_browser", "get_current_time",
 })
 
 
@@ -699,7 +909,8 @@ def run_tool(
 
     payload = dict(args or {})
     if name in _CONTROL_GATED:
-        payload["control_allowed"] = control_allowed
+        # Always pass the authoritative file flag (or explicit override)
+        payload["control_allowed"] = bool(control_allowed) or permissions.is_control_allowed()
     if name in _CONFIRMATION_GATED:
         payload["thread_id"] = thread_id
         payload["user_confirmed"] = user_confirmed
@@ -728,13 +939,13 @@ def _infer_list_path(user_text: str) -> str:
 def _args_from_pseudo_rest(name: str, paren: str, rest: str) -> dict:
     """Map free-form pseudo tool-call text into tool args."""
     blob = " ".join(p for p in (paren or "", rest or "") if p).strip()
-    if name == "list_directory":
-        path = "~"
+    if name in ("list_directory", "create_directory", "read_file"):
+        path = "~" if name == "list_directory" else ""
         pm = re.search(r"path\s*[=:]\s*['\"]?([^\s'\",}]+)", blob, re.I)
         if pm:
-            path = pm.group(1)
+            path = _clean_path_arg(pm.group(1))
         elif blob:
-            token = blob.split()[0].strip("'\",;")
+            token = _clean_path_arg(blob.split()[0].strip("'\",;"))
             if token.startswith(("~", "/", "./")) or token.lower() in {
                 "desktop", "documents", "downloads", "applications", "home",
             }:
@@ -745,11 +956,24 @@ def _args_from_pseudo_rest(name: str, paren: str, rest: str) -> dict:
                     "applications": "/Applications",
                     "home": "~",
                 }.get(token.lower(), token)
-        return {"path": path}
-    if name == "read_file":
+            else:
+                path = token
+        if name == "read_file" and not path and blob:
+            file_tok = re.search(r"([~/]?[\w./\\-]+\.[\w]+)", blob)
+            path = file_tok.group(1) if file_tok else blob.split()[0]
+            path = _clean_path_arg(path)
+        return {"path": path or "~"}
+    if name == "write_file":
         pm = re.search(r"path\s*[=:]\s*['\"]?([^\s'\",}]+)", blob, re.I)
-        path = pm.group(1) if pm else (blob.split()[0] if blob else "")
-        return {"path": path}
+        cm = re.search(r"content\s*[=:]\s*['\"]?(.+)", blob, re.I | re.S)
+        path = pm.group(1) if pm else ""
+        if not path and blob:
+            file_tok = re.search(r"([~/]?[\w./\\-]+\.[\w]+)", blob)
+            path = file_tok.group(1) if file_tok else ""
+        return {
+            "path": _clean_path_arg(path),
+            "content": (cm.group(1).strip().strip("'\"") if cm else ""),
+        }
     if name == "run_terminal_command":
         pm = re.search(r"command\s*[=:]\s*['\"](.+?)['\"]\s*$", blob, re.I)
         if pm:
@@ -824,6 +1048,174 @@ def _dedupe_planned(planned: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
     return unique
 
 
+def _normalize_location_phrase(name: str) -> str:
+    """Strip my/the/sir's and map well-known locations to real paths."""
+    raw = (name or "").strip().strip("'\"")
+    raw = re.sub(r"^(?:my|the|sir'?s|our)\s+", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"\s+$", "", raw)
+    # Drop trailing filler words
+    raw = re.sub(r"\s+(?:please|now|thanks|thank you)\s*$", "", raw, flags=re.IGNORECASE)
+    return sanitize_path_string(raw) if raw else raw
+
+
+def _resolve_parent_folder(parent_name: str) -> str:
+    """Resolve a parent folder name to a real absolute path string (no deep rglob)."""
+    parent_name = (parent_name or "").strip().strip("'\"")
+    lower = parent_name.lower().strip()
+    lower = re.sub(r"^(?:my|the|sir'?s|our)\s+", "", lower).strip()
+
+    if lower in ("that folder", "the folder", "it", "there", "same folder", "same place"):
+        last = last_remembered_path()
+        if last is not None:
+            target = last if last.is_dir() else last.parent
+            try:
+                return str(target.resolve(strict=False))
+            except TypeError:
+                return str(target.resolve())
+        return str(real_home() / "Desktop")
+
+    # Well-known locations: Desktop, Documents, ...
+    cleaned = _normalize_location_phrase(parent_name)
+    if cleaned:
+        try:
+            primary = resolve_mac_path(cleaned)
+            # If it's an existing dir, use it; if well-known (Desktop etc.), use even if empty
+            if primary.exists() and primary.is_dir():
+                return str(primary)
+            # Bare Desktop/Documents path even if somehow missing
+            for key, folder in (
+                ("desktop", "Desktop"),
+                ("documents", "Documents"),
+                ("downloads", "Downloads"),
+            ):
+                if lower == key or lower == folder.lower():
+                    return str(real_home() / folder)
+            # Parent path for a new subfolder under a known root
+            if any(
+                str(primary).startswith(str(real_home() / f))
+                for f in ("Desktop", "Documents", "Downloads")
+            ):
+                return str(primary)
+        except Exception:
+            pass
+
+    found = find_named_path(parent_name if not cleaned else Path(cleaned).name)
+    if found and found.is_dir():
+        return str(found)
+
+    # Default: under Desktop (real home — never invent usernames)
+    name_only = Path(cleaned or parent_name).name
+    try:
+        return str((real_home() / "Desktop" / name_only).resolve(strict=False))
+    except TypeError:
+        return str((real_home() / "Desktop" / name_only).resolve())
+
+
+def _infer_mkdir(text: str) -> tuple[str, dict] | None:
+    """Infer create_directory with a real absolute path (not shell mkdir)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    m = _MKDIR_NAMED_IN_RE.search(text) or _MKDIR_BARE_IN_RE.search(text)
+    if m:
+        folder_name = m.group(1).strip().strip("'\"")
+        parent_name = m.group(2).strip().strip("'\"")
+        # Guard: folder name should not be a location word alone
+        if folder_name.lower() in ("folder", "directory", "dir", "new"):
+            return None
+        parent = _resolve_parent_folder(parent_name)
+        target = str(Path(parent) / folder_name)
+        return ("create_directory", {"path": target})
+
+    m_path = _MKDIR_PATH_RE.search(text)
+    if m_path:
+        raw_path = next((g for g in m_path.groups() if g), "").strip().strip("'\"")
+        if raw_path:
+            try:
+                target = str(resolve_mac_path(raw_path))
+            except Exception:
+                target = sanitize_path_string(raw_path)
+            return ("create_directory", {"path": target})
+
+    m_named = _MKDIR_NAMED_ONLY_RE.search(text)
+    if m_named:
+        folder_name = m_named.group(1).strip().strip("'\"")
+        if folder_name.lower() in ("folder", "directory", "dir"):
+            return None
+        # If name itself is a path, use it; else put on Desktop
+        if folder_name.startswith(("~", "/", "Desktop/", "Documents/", "Downloads/")):
+            try:
+                target = str(resolve_mac_path(folder_name))
+            except Exception:
+                target = str(real_home() / "Desktop" / Path(folder_name).name)
+        else:
+            target = str(real_home() / "Desktop" / folder_name)
+        return ("create_directory", {"path": target})
+
+    return None
+
+
+def _ensure_text_filename(name: str) -> str:
+    name = (name or "note.txt").strip().strip("'\"")
+    if not name:
+        return "note.txt"
+    if "." not in Path(name).name:
+        return f"{name}.txt"
+    return name
+
+
+def _infer_create_file(text: str) -> tuple[str, dict] | None:
+    """Infer write_file with content (or empty create) into a named / last folder."""
+    m = _CREATE_FILE_CONTENT_RE.search(text)
+    if m:
+        filename = _ensure_text_filename(m.group(1) or "note.txt")
+        parent_name = (m.group(2) or "that folder").strip().strip("'\"")
+        content = (m.group(3) or "").strip()
+        # If parent_name looks empty because group was optional path
+        if not parent_name or parent_name.lower() in ("with", "content", "text"):
+            parent_name = "that folder"
+        parent = _resolve_parent_folder(parent_name)
+        path = str(Path(parent) / Path(filename).name)
+        return ("write_file", {"path": path, "content": content})
+
+    m2 = _CREATE_FILE_SIMPLE_RE.search(text)
+    if m2:
+        content = (m2.group(1) or "").strip()
+        parent = _resolve_parent_folder("that folder")
+        path = str(Path(parent) / "note.txt")
+        return ("write_file", {"path": path, "content": content})
+
+    # write/save file X with content / write file X: content
+    for pattern in (_WRITE_FILE_CONTENT_RE, _WRITE_FILE_CONTENT_RE2):
+        wm = pattern.search(text)
+        if wm:
+            path = _clean_path_arg(wm.group(1))
+            content = (wm.group(2) or "").strip()
+            if path and content:
+                return ("write_file", {"path": path, "content": content})
+
+    # create empty/new file (explicit create only — never wipe via "edit")
+    m3 = _CREATE_EMPTY_FILE_RE.search(text)
+    if m3:
+        filename = _ensure_text_filename(m3.group(1))
+        parent_name = (m3.group(2) or "").strip() if m3.lastindex and m3.lastindex >= 2 else ""
+        if parent_name:
+            parent = _resolve_parent_folder(parent_name)
+            path = str(Path(parent) / Path(filename).name)
+        else:
+            # Absolute-ish path in filename itself
+            try:
+                path = str(resolve_mac_path(filename)) if filename.startswith(("~", "/")) or "/" in filename else str(
+                    real_home() / "Desktop" / Path(filename).name
+                )
+            except Exception:
+                path = str(real_home() / "Desktop" / Path(filename).name)
+        return ("write_file", {"path": path, "content": ""})
+
+    return None
+
+
 def infer_forced_tools(user_text: str) -> list[tuple[str, dict]]:
     """
     Infer which tools should run deterministically when the LLM fails to call them.
@@ -837,19 +1229,49 @@ def infer_forced_tools(user_text: str) -> list[tuple[str, dict]]:
     if _TIME_QUERY_RE.search(text):
         inferred.append(("get_current_time", {}))
 
+    # Create folder (before generic list/read to avoid false matches)
+    mkdir = _infer_mkdir(text)
+    if mkdir:
+        inferred.append(mkdir)
+
+    create_file = _infer_create_file(text)
+    if create_file:
+        inferred.append(create_file)
+
     # Apps on Mac → /Applications (and user Applications if present)
     if _LIST_APPS_RE.search(text) or (
         _LIST_DIR_RE.search(text) and re.search(r"\b(?:apps?|applications)\b", text, re.I)
     ):
         inferred.append(("list_directory", {"path": "/Applications", "max_entries": 400}))
-        user_apps = str(Path.home() / "Applications")
+        user_apps = real_home() / "Applications"
         try:
-            if Path(user_apps).is_dir() and any(Path(user_apps).iterdir()):
-                inferred.append(("list_directory", {"path": "~/Applications", "max_entries": 200}))
+            if user_apps.is_dir() and any(user_apps.iterdir()):
+                inferred.append(("list_directory", {"path": str(user_apps), "max_entries": 200}))
         except OSError:
             pass
-    elif _LIST_DIR_RE.search(text):
+    elif _LIST_DIR_RE.search(text) and not mkdir and not create_file:
         inferred.append(("list_directory", {"path": _infer_list_path(text)}))
+
+    read_m = _READ_FILE_RE.search(text)
+    if read_m and not create_file:
+        inferred.append(("read_file", {"path": _clean_path_arg(read_m.group(1))}))
+    elif not create_file:
+        loose = re.search(
+            r"\b(?:read|open|cat|view)\s+['\"]?([~/]?[\w./\\-]+\.[\w]+)['\"]?",
+            text,
+            re.I,
+        )
+        if loose:
+            inferred.append(("read_file", {"path": _clean_path_arg(loose.group(1))}))
+
+    # NOTE: never force write_file with empty content from "edit file" — that wipes files.
+    # Contentful writes are handled by _infer_create_file above.
+
+    shell_m = _SHELL_CMD_RE.search(text)
+    if shell_m and not mkdir:
+        cmd = next((g for g in shell_m.groups() if g), "").strip()
+        if cmd:
+            inferred.append(("run_terminal_command", {"command": rewrite_paths_in_command(cmd)}))
 
     if _SEARCH_QUERY_RE.search(text):
         inferred.append(("web_search", {"query": text}))

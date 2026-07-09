@@ -156,6 +156,8 @@ def _system_info() -> dict:
 @app.get("/health")
 def health_check():
     """Lightweight liveness probe — local Mac instance + inference readiness."""
+    import brain_registry
+
     local = local_status()
     search_memory = search_memory_status()
     local_llm_available = bool(local.get("ollama_healthy"))
@@ -173,10 +175,142 @@ def health_check():
         "groq_configured": bool(os.getenv("GROQ_API_KEY")),
         "llm_routing_mode": os.getenv("LLM_ROUTING_MODE", "auto"),
         "hybrid": hybrid_status(),
+        "brain": brain_registry.status(),
         "last_route": llm_router.last_route_used,
         "last_route_is_fallback": llm_router.last_route_is_fallback,
         "last_local_model": llm_router.last_local_model or None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Self-healing Mac brain tunnel registry
+# tunnel_manager.py on your Mac POSTs each new trycloudflare.com URL here.
+# Stable global links on Render: /go  /brain  /api/global-brain
+# ---------------------------------------------------------------------------
+
+@app.post("/api/update-brain")
+async def update_brain_endpoint(request: Request):
+    """
+    Register the live Mac Cloudflare tunnel URL.
+    Called by tunnel_manager.py whenever a new trycloudflare.com link is minted.
+    """
+    import brain_registry
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    secret = (
+        payload.get("secret_key")
+        or payload.get("secret")
+        or request.headers.get("X-Brain-Secret")
+        or ""
+    )
+    # Also accept Authorization: Bearer <secret>
+    auth = request.headers.get("Authorization", "")
+    if not secret and auth.lower().startswith("bearer "):
+        secret = auth[7:].strip()
+
+    if not brain_registry.verify_secret(str(secret)):
+        return JSONResponse(
+            {"error": "unauthorized", "hint": "Set BRAIN_REGISTRY_SECRET on both Mac and Render"},
+            status_code=403,
+        )
+
+    brain_url = str(payload.get("brain_url") or payload.get("url") or "").strip()
+    heartbeat = bool(payload.get("heartbeat", False))
+    source = str(payload.get("source") or "tunnel_manager")
+
+    try:
+        result = brain_registry.set_brain_url(
+            brain_url, source=source, heartbeat=heartbeat,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    print(
+        f"[TESrACT:brain] "
+        f"{'heartbeat' if result.get('heartbeat') else 'updated'} "
+        f"url={result.get('brain_url')} changed={result.get('changed')}"
+    )
+    return {
+        "status": "success",
+        "active_url": result.get("brain_url"),
+        "changed": result.get("changed"),
+        "heartbeat": result.get("heartbeat"),
+        "updated_at": result.get("updated_at"),
+        "global_link": "/go",
+    }
+
+
+@app.get("/api/global-brain")
+def global_brain_endpoint():
+    """JSON: where the live Mac tunnel currently points (for frontends / scripts)."""
+    import brain_registry
+
+    st = brain_registry.status()
+    if not st.get("brain_url"):
+        return JSONResponse(
+            {
+                "online": False,
+                "error": "Mac brain is offline — start tunnel_manager.py on the Mac",
+                "url": None,
+            },
+            status_code=503,
+        )
+    return {
+        "online": True,
+        "url": st["brain_url"],
+        "updated_at": st.get("updated_at"),
+        "age_seconds": st.get("age_seconds"),
+        "source": st.get("source"),
+        "global_link": "/go",
+    }
+
+
+@app.get("/api/brain-status")
+def brain_status_endpoint():
+    """Full registry status (no secret)."""
+    import brain_registry
+
+    return brain_registry.status()
+
+
+@app.get("/go")
+@app.get("/brain")
+def global_brain_redirect():
+    """
+    Stable global link: always 302-redirects to the current Mac tunnel URL.
+
+    Bookmark https://your-app.onrender.com/go — when Cloudflare rotates the
+    trycloudflare.com host, this still lands on the live tunnel.
+    """
+    import brain_registry
+    from fastapi.responses import RedirectResponse
+
+    url = brain_registry.get_brain_url()
+    if not url:
+        return HTMLResponse(
+            content=(
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<title>TESrACT — Mac offline</title></head>"
+                "<body style='font-family:system-ui;background:#0a0a0f;color:#e8e8f0;"
+                "display:flex;min-height:100vh;align-items:center;justify-content:center'>"
+                "<div style='max-width:32rem;padding:2rem;border:1px solid #333;border-radius:12px'>"
+                "<h1 style='color:#7cf;margin:0 0 .5rem'>Mac brain offline</h1>"
+                "<p>No live Cloudflare tunnel is registered.</p>"
+                "<p style='opacity:.8'>On your Mac run:</p>"
+                "<pre style='background:#111;padding:1rem;border-radius:8px;"
+                "overflow:auto'>python tunnel_manager.py</pre>"
+                "<p style='opacity:.7;font-size:.9rem'>Then refresh this page.</p>"
+                "</div></body></html>"
+            ),
+            status_code=503,
+        )
+    return RedirectResponse(url=url, status_code=302)
 
 
 @app.get("/memory/stats")
@@ -245,179 +379,71 @@ _generated_dir = os.path.join(_base_dir, "generated_images")
 os.makedirs(_generated_dir, exist_ok=True)
 app.mount("/generated", StaticFiles(directory=_generated_dir), name="generated")
 
-# Permission helpers — persisted per thread for the session (survives restarts)
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_FILE = os.path.join(_BASE_DIR, "user_settings.json")
+# ---------------------------------------------------------------------------
+# Permission — thin wrappers around permissions.py (single source of truth)
+# ---------------------------------------------------------------------------
+import permissions as _perm
 
-_GRANT_CONTROL_RE = re.compile(
-    r"\b("
-    r"allow(?:\s+me)?\s+control|"
-    r"allow\s+(?:full\s+)?(?:access|control)|"
-    r"grant(?:\s+me)?\s+(?:access|control)|"
-    r"elevate(?:d)?(?:\s+access)?|"
-    r"enable\s+control|"
-    r"give\s+(?:me\s+)?(?:access|control)|"
-    r"unlock\s+(?:control|access)|"
-    r"turn\s+on\s+control"
-    r")\b",
-    re.IGNORECASE,
-)
-_REVOKE_CONTROL_RE = re.compile(
-    r"\b("
-    r"stop\s+control|"
-    r"restrict\s+control|"
-    r"revoke\s+(?:access|control)|"
-    r"disable\s+control|"
-    r"lock\s+(?:control|access)|"
-    r"turn\s+off\s+control"
-    r")\b",
-    re.IGNORECASE,
-)
-# Polite / conversational filler around a pure grant or revoke.
-_PERMISSION_FILLER_RE = re.compile(
-    r"\b("
-    r"yes|yep|yeah|yup|ok|okay|sure|please|now|thanks|thank\s*you|sir|"
-    r"go\s*ahead|alright|fine|do\s*it|i|i'?m|am|will|would|like|to|you|"
-    r"can|may|have|give|me|the|a|an|my|your|pc|computer|mac|system|"
-    r"device|machine|permission|elevated|mode|session|just|really|"
-    r"right|then|here|there|once|for|this|that"
-    r")\b",
-    re.IGNORECASE,
-)
-
-PERMISSION_GRANTED_REPLY = (
-    "Elevated Mac control granted for this session, Sir. "
-    "I can read, write, and run commands on your Mac until you say 'Stop Control'."
-)
-PERMISSION_REVOKED_REPLY = (
-    "Mac control revoked, Sir. I am back in restricted mode — "
-    "filesystem and terminal tools are locked until you say 'Allow Control' again."
-)
-PERMISSION_ALREADY_ACTIVE_REPLY = (
-    "Mac control is already active this session, Sir. "
-    "Tell me what to read, write, or run."
-)
-PERMISSION_ALREADY_RESTRICTED_REPLY = (
-    "I am already in restricted mode, Sir. "
-    "Say 'Allow Control' when you want Mac filesystem or terminal access."
-)
+PERMISSION_GRANTED_REPLY = _perm.GRANTED_REPLY
+PERMISSION_REVOKED_REPLY = _perm.REVOKED_REPLY
+PERMISSION_ALREADY_ACTIVE_REPLY = _perm.ALREADY_ON_REPLY
+PERMISSION_ALREADY_RESTRICTED_REPLY = _perm.ALREADY_OFF_REPLY
 
 
 def get_permission(thread_id: str = "web_user_001") -> bool:
-    if not os.path.exists(SETTINGS_FILE):
-        return False
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return bool(json.load(f).get(thread_id, False))
-    except Exception:
-        return False
+    """Read control flag. thread_id kept for API compat; flag is global."""
+    return _perm.is_control_allowed()
 
 
 def set_permission(status: bool, thread_id: str = "web_user_001") -> None:
-    data: dict = {}
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            pass
-    data[thread_id] = bool(status)
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    """Write control flag. Only call from explicit user actions (toggle / voice)."""
+    _perm.set_control_allowed(bool(status))
 
 
-def parse_permission_intent(text: str) -> bool | None:
-    """Return True (grant), False (revoke), or None (no permission change)."""
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    lower = raw.lower()
-    if _REVOKE_CONTROL_RE.search(lower):
-        return False
-    if _GRANT_CONTROL_RE.search(lower):
-        return True
-    return None
-
-
-def is_permission_only_message(text: str) -> bool:
-    """True when the message only grants/revokes control (no other task attached).
-
-    Accepts conversational forms like 'yes allow control', 'please grant access',
-    'ok, stop control' so they never fall through to the LLM path.
-    """
-    if parse_permission_intent(text) is None:
-        return False
-    cleaned = (text or "").strip()
-    cleaned = _GRANT_CONTROL_RE.sub(" ", cleaned)
-    cleaned = _REVOKE_CONTROL_RE.sub(" ", cleaned)
-    cleaned = _PERMISSION_FILLER_RE.sub(" ", cleaned)
-    cleaned = re.sub(r"[\s,.;:!?\"'`~_\-/\\|()[\]{}]+", "", cleaned)
-    return len(cleaned) == 0
+def resolve_control_allowed(state: JProState | dict | None = None) -> bool:
+    """Always the persisted file flag — never invent permission from graph state."""
+    return _perm.is_control_allowed()
 
 
 def is_grant_only_message(text: str) -> bool:
-    return parse_permission_intent(text) is True and is_permission_only_message(text)
+    return _perm.parse_control_command(text) is True
 
 
 def is_revoke_only_message(text: str) -> bool:
-    return parse_permission_intent(text) is False and is_permission_only_message(text)
+    return _perm.parse_control_command(text) is False
 
 
-def apply_permission_change(text: str, thread_id: str) -> tuple[bool, bool | None]:
+def apply_permission_change(text: str, thread_id: str = "web_user_001") -> tuple[bool, bool | None]:
     """
-    Apply grant/revoke from user text.
-    Returns (new_control_allowed, changed):
-      - changed is True if permission keyword present and state flipped
-      - changed is False if keyword present but already in that state
-      - changed is None if no permission keyword
+    Apply pure control commands only.
+    Returns (control_allowed, changed) where changed is None if not a control command.
     """
-    intent = parse_permission_intent(text)
+    intent = _perm.parse_control_command(text)
     if intent is None:
-        current = get_permission(thread_id)
-        return current, None
-    previous = get_permission(thread_id)
-    set_permission(intent, thread_id)
-    flipped = previous != intent
-    print(
-        f"[TESrACT:perm] thread={thread_id} control={'ACTIVE' if intent else 'RESTRICTED'}"
-        f"{'' if flipped else ' (no change)'}"
-    )
-    return intent, flipped
-
-
-def resolve_control_allowed(state: JProState | dict | None) -> bool:
-    """Session permission: persisted store OR in-graph state (whichever is granted)."""
-    state = state or {}
-    thread_id = str(state.get("thread_id") or "web_user_001")
-    in_graph = bool(state.get("control_allowed"))
-    persisted = get_permission(thread_id)
-    return in_graph or persisted
+        return _perm.is_control_allowed(), None
+    now, flipped = _perm.set_control_allowed(intent)
+    return now, flipped
 
 
 def permission_reply_for(
     text: str,
     *,
-    was_allowed: bool,
-    now_allowed: bool | None = None,
-    currently_allowed: bool | None = None,
-    just_changed: bool | None = None,
+    was_allowed: bool | None = None,
+    **_kwargs,
 ) -> str | None:
-    """Immediate UX reply for grant/revoke-only messages (no LLM needed)."""
-    # Back-compat: older callers used currently_allowed / just_changed
-    if now_allowed is None:
-        now_allowed = currently_allowed if currently_allowed is not None else was_allowed
-    if not is_permission_only_message(text):
+    """
+    Reply for pure Allow/Stop Control messages; None otherwise.
+    Does NOT write the flag — caller must already have applied via apply_permission_change.
+    """
+    intent = _perm.parse_control_command(text)
+    if intent is None:
         return None
-    intent = parse_permission_intent(text)
-    if intent is True:
-        if just_changed is False or was_allowed:
-            return PERMISSION_ALREADY_ACTIVE_REPLY
-        return PERMISSION_GRANTED_REPLY
-    if intent is False:
-        if just_changed is False or not was_allowed:
-            return PERMISSION_ALREADY_RESTRICTED_REPLY
-        return PERMISSION_REVOKED_REPLY
-    return None
+    now = _perm.is_control_allowed()
+    if was_allowed is None:
+        was_allowed = now and not intent  # best-effort fallback
+    if intent:
+        return PERMISSION_ALREADY_ACTIVE_REPLY if was_allowed else PERMISSION_GRANTED_REPLY
+    return PERMISSION_ALREADY_RESTRICTED_REPLY if not was_allowed else PERMISSION_REVOKED_REPLY
 
 
 def set_session_permission(
@@ -426,25 +452,17 @@ def set_session_permission(
     *,
     sync_graph: bool = True,
 ) -> tuple[bool, bool]:
-    """
-    Authoritatively set session Mac control.
-    Returns (new_status, changed).
-    """
-    previous = get_permission(thread_id)
-    new_status = bool(allowed)
-    set_permission(new_status, thread_id)
+    """UI toggle entry point. Returns (new_status, changed)."""
+    now, changed = _perm.set_control_allowed(bool(allowed))
     if sync_graph:
-        config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
-        sync_graph_permission(
-            compiled_app, config, thread_id=thread_id, control_allowed=new_status,
-        )
-    changed = previous != new_status
-    print(
-        f"[TESrACT:perm] set_session thread={thread_id} "
-        f"control={'ACTIVE' if new_status else 'RESTRICTED'}"
-        f"{'' if changed else ' (no change)'}"
-    )
-    return new_status, changed
+        try:
+            config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+            sync_graph_permission(
+                compiled_app, config, thread_id=thread_id, control_allowed=now,
+            )
+        except Exception:
+            pass
+    return now, changed
 
 
 def sync_graph_permission(
@@ -454,11 +472,67 @@ def sync_graph_permission(
     thread_id: str,
     control_allowed: bool,
 ) -> None:
-    """Keep LangGraph checkpoint aligned with persisted session permission."""
+    """Optional checkpoint mirror of the file flag (tools still read the file)."""
     try:
-        app.update_state(config, {"control_allowed": bool(control_allowed), "thread_id": thread_id})
+        app.update_state(
+            config,
+            {"control_allowed": bool(control_allowed), "thread_id": thread_id},
+        )
     except Exception as exc:
         print(f"[TESrACT:perm] checkpoint sync skipped: {exc}")
+
+
+_DIRECT_MAC_TOOLS = frozenset({
+    "list_directory",
+    "read_file",
+    "write_file",
+    "create_directory",
+    "run_terminal_command",
+    "get_current_time",
+})
+
+
+def _try_direct_mac_tools(
+    user_text: str,
+    *,
+    control_allowed: bool,
+    thread_id: str = "web_user_001",
+) -> str | None:
+    """
+    Execute pure Mac filesystem/time tools without the LLM.
+
+    This is the reliable path when local models cannot bind tools and would
+    otherwise emit plain-text 'tool_call:' stubs or trip graph recursion.
+    """
+    planned = actions.infer_forced_tools(user_text)
+    if not planned:
+        return None
+    if any(name not in _DIRECT_MAC_TOOLS for name, _ in planned):
+        return None
+    needs_control = any(name in actions._CONTROL_GATED for name, _ in planned)
+    if needs_control and not control_allowed:
+        return (
+            "Mac control is restricted, Sir. Please say 'Allow Control' "
+            "or flip the MAC CONTROL toggle so I can use filesystem and terminal tools."
+        )
+
+    tool_messages: list[ToolMessage] = []
+    for i, (name, args) in enumerate(planned):
+        print(f"[TESrACT:tools] Direct-executing {name}({args}) control_allowed={control_allowed}")
+        result = actions.run_tool(
+            name,
+            args,
+            control_allowed=control_allowed,
+            thread_id=thread_id,
+            user_confirmed=False,
+        )
+        tool_messages.append(ToolMessage(
+            content=result,
+            name=name,
+            tool_call_id=f"direct_{i}_{name}",
+        ))
+    return _format_tool_fallback_reply(tool_messages)
+
 
 def try_simple_command(text: str, control_allowed: bool) -> str | None:
     """Handle very simple commands directly (bypass LLM to save tokens and work under rate limits)."""
@@ -524,7 +598,7 @@ While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask
   generate_image, get_current_time
 
 ### Require Allow Control (Mac filesystem & system actions):
-  read_file, write_file, list_directory, run_terminal_command,
+  read_file, write_file, create_directory, list_directory, run_terminal_command,
   execute_python_code, open_url_in_browser
 
 ### Terminal safety (run_terminal_command):
@@ -534,7 +608,9 @@ While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask
 - BLOCKED commands (rm -rf /, system path edits) are never executed — explain why and suggest a safer alternative.
 
 ### Filesystem safety:
-- Paths support ~ and absolute Mac paths (~/Desktop, ~/Documents, /Users/...).
+- Paths: always use ~ or real home (e.g. ~/Desktop/...). NEVER invent /Users/yourusername or other fake usernames.
+- Creating folders → ALWAYS call create_directory (not prose). Prefer ~/Desktop/Name.
+- Creating/editing files → ALWAYS call write_file with the real path and full content.
 - Protected system paths (/System, /usr, /etc, SSH keys) cannot be written or deleted.
 - Prefer non-destructive operations; never delete without explicit Sir request and confirmation.
 
@@ -544,6 +620,7 @@ While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask
 - Past context/remember/previous → recall_memory
 - Remember this preference/fact → save_memory_note
 - Complex multi-step work → manage_task_plan
+- Create folder/directory on Mac → create_directory
 - Read/list/edit files on Mac → read_file / list_directory / write_file
 - Shell/terminal/build/git/npm → run_terminal_command
 - Calculate/code snippet → execute_python_code
@@ -554,6 +631,7 @@ While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask
 If a tool fails: try an alternative tool or approach. Do not give up or hallucinate success.
 If PERMISSION_DENIED: ask Sir for "Allow Control" and retry the same tool.
 If CONFIRMATION_REQUIRED: quote the command to Sir and wait for confirmation — do not claim it ran.
+NEVER say a folder or file was created unless a ToolMessage shows STATUS: SUCCESS for that action.
 
 Use Mac access responsibly to help Sir with coding, file management, and real tasks.
 Reply concisely in character. Be proactive, precise, and evidence-based."""
@@ -582,14 +660,15 @@ _REFUSAL_PATTERNS = (
 _ACTION_REQUEST_RE = re.compile(
     r"\b(generate|create|draw|make|build|search|look up|research|run|execute|"
     r"calculate|open|read|write|save|list|find|fetch|download|summarize|image|"
-    r"picture|photo|code|python|file|url|website|browse|remember|recall)\b",
+    r"picture|photo|code|python|file|folder|directory|mkdir|url|website|browse|"
+    r"remember|recall)\b",
     re.IGNORECASE,
 )
 _RETRY_NUDGE = (
     "CRITICAL: You must use your available tools to fulfill Sir's request. "
     "Do NOT refuse or claim you are text-only. Call the appropriate tool now "
     "(generate_image, web_search, search_and_summarize, recall_memory, "
-    "read_file, list_directory, write_file, run_terminal_command, "
+    "read_file, list_directory, write_file, create_directory, run_terminal_command, "
     "execute_python_code, get_current_time, etc.) and report the actual result."
 )
 _HALLUCINATION_NUDGE = (
@@ -599,12 +678,25 @@ _HALLUCINATION_NUDGE = (
 )
 _FAKE_EXECUTION_RE = re.compile(
     r"\b("
-    r"i(?:'ve| have) (?:generated|created|executed|searched|saved|written|run|opened)|"
-    r"(?:i'm|i am) (?:generating|creating|executing|searching|running|opening)|"
-    r"(?:generating|creating|executing|searching|running) (?:your |the |an? )|"
+    r"i(?:'ve| have|'m| am)?\s*(?:just\s+)?(?:generated|created|executed|searched|saved|written|wrote|run|opened|made|built)|"
+    r"(?:i'm|i am) (?:generating|creating|executing|searching|running|opening|making|writing|saving)|"
+    r"(?:generating|creating|executing|searching|running|making|writing) (?:your |the |an? )|"
     r"image has been (?:created|generated)|here is your image|"
-    r"let me (?:generate|create|search|run|execute|open)|"
-    r"the image (?:is|has been)|successfully generated"
+    r"let me (?:generate|create|search|run|execute|open|make|write|save)|"
+    r"the image (?:is|has been)|successfully (?:generated|created|written|saved|made)|"
+    r"(?:folder|directory|file|dir) (?:has been |was |is |successfully )?(?:created|made|written|saved)|"
+    r"(?:created|made|wrote|written|saved) (?:the |a |your |an? )?(?:folder|directory|file|dir)|"
+    r"(?:folder|directory) (?:is )?(?:ready|done|complete)"
+    r")\b",
+    re.IGNORECASE,
+)
+_FILESYSTEM_ACTION_RE = re.compile(
+    r"\b("
+    r"(?:create|make|add|write|save|edit|delete|remove|mkdir|touch)\s+"
+    r"(?:a\s+|the\s+|an?\s+|new\s+|empty\s+)?(?:folder|directory|dir|file)|"
+    r"(?:create|make|add)\s+(?:a\s+|the\s+)?(?:new\s+)?folder|"
+    r"write_file|create_directory|list_directory|read_file|"
+    r"mkdir\b|touch\b"
     r")\b",
     re.IGNORECASE,
 )
@@ -704,15 +796,25 @@ def _reply_uses_tool_evidence(text: str, tool_messages: list[ToolMessage]) -> bo
                 if len(token) >= 4 and token.lower() in lower:
                     return True
             return False
-        if name in ("list_directory", "read_file", "write_file", "run_terminal_command"):
+        if name in (
+            "list_directory", "read_file", "write_file",
+            "create_directory", "run_terminal_command",
+        ):
             # Require at least one distinctive token from tool output in the reply
             tokens = [
                 tok for tok in re.split(r"[\s,\[\]()/:]+", body)
-                if len(tok) >= 4 and tok.lower() not in {"file", "files", "contents", "bytes", "status", "success", "result"}
+                if len(tok) >= 4 and tok.lower() not in {
+                    "file", "files", "contents", "bytes", "status",
+                    "success", "result", "created", "directory", "folder",
+                }
             ]
             hits = sum(1 for tok in tokens[:40] if tok.lower() in lower)
             if hits >= 1:
                 return True
+            # Explicit success lines from tools are enough evidence anchors
+            if "created directory" in body.lower() or "written " in body.lower() or "directory already exists" in body.lower():
+                if any(x in lower for x in ("created", "written", "exists", "desktop", "documents", "folder", "file")):
+                    return True
             continue
         if name in ("web_search", "search_and_summarize", "recall_memory"):
             return _is_valid_synthesis(text)
@@ -810,15 +912,22 @@ def _format_tool_fallback_reply(tool_messages: list[ToolMessage]) -> str:
     lines: list[str] = []
     for tm in tool_messages:
         name = str(getattr(tm, "name", "") or "tool")
-        body = _parse_tool_result(str(tm.content or ""))
+        raw = str(tm.content or "")
+        body = _parse_tool_result(raw)
         if not body:
+            continue
+        if "STATUS: ERROR" in raw.upper() or "PERMISSION_DENIED" in raw.upper():
+            lines.append(body[:800])
             continue
         if name == "get_current_time":
             return f"{body}, Sir."
         if name == "manage_task_plan":
             clean = body.replace("STATUS: EMPTY", "No active task plan.").replace("STATUS: ACTIVE", "").strip()
             return f"{clean}, Sir." if clean else "No active task plan, Sir."
-        if name in ("web_search", "search_and_summarize", "recall_memory", "run_terminal_command"):
+        if name == "create_directory":
+            # body is e.g. "Created directory: /Users/.../Foo"
+            lines.append(body[:800])
+        elif name in ("web_search", "search_and_summarize", "recall_memory", "run_terminal_command"):
             lines.append(body[:1200])
         elif name in ("read_file", "write_file", "list_directory"):
             # Apps listing can be long — keep a useful chunk
@@ -857,11 +966,40 @@ def extract_final_reply(messages: list[BaseMessage]) -> str:
                     return text
             return tool_reply
 
+    user_text = ""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            user_text = str(msg.content or "")
+            break
+
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
             text = str(msg.content or "").strip()
-            if _is_valid_synthesis(text):
-                return text
+            if not _is_valid_synthesis(text):
+                continue
+            # Never allow "I created the folder" style replies without tool evidence
+            if _FILESYSTEM_ACTION_RE.search(user_text) and _looks_like_fake_execution(text):
+                continue
+            if _FILESYSTEM_ACTION_RE.search(user_text) and not turn_tools:
+                # Prefer honesty over a fabricated success claim
+                if re.search(
+                    r"\b(created|made|written|saved|folder|directory|file)\b",
+                    text,
+                    re.I,
+                ) and not re.search(
+                    r"\b(allow control|permission|restricted|could not|unable|failed|error)\b",
+                    text,
+                    re.I,
+                ):
+                    continue
+            return text
+
+    if _FILESYSTEM_ACTION_RE.search(user_text) and not turn_tools:
+        return (
+            "I could not complete that filesystem action with tools, Sir. "
+            "Please ensure Mac Control is ON and try again with a clear path "
+            "(e.g. 'create a folder named Project on Desktop')."
+        )
 
     return "At your service, Sir."
 
@@ -942,6 +1080,9 @@ def _tool_status_ok(content: str) -> bool:
         or "IMAGE GENERATED" in upper
         or "BROWSER OPENED" in upper
         or "WRITTEN " in upper
+        or "APPENDED " in upper
+        or "CREATED DIRECTORY" in upper
+        or "DIRECTORY ALREADY EXISTS" in upper
         or "FILE:" in upper
         or "CONTENTS OF" in upper
     )
@@ -996,32 +1137,16 @@ def _build_system_prompt(
 
 
 def permission_gate(state: JProState) -> dict[str, object]:
-    """Sync session permission from graph state, persisted settings, and latest user text.
-
-    Critical: never clobber an already-granted in-graph flag with a stale file read.
-    Once granted, control_allowed stays True until an explicit Stop Control message.
-    """
+    """Mirror file flag into graph state. Never grants/revokes here (no side effects)."""
     thread_id = str(state.get("thread_id") or "web_user_001")
-    # OR of checkpoint + persisted store (either source can unlock the session)
-    allowed = bool(state.get("control_allowed")) or get_permission(thread_id)
-
-    for msg in reversed(state.get("messages", [])):
-        if isinstance(msg, HumanMessage):
-            new_allowed, changed = apply_permission_change(str(msg.content or ""), thread_id)
-            if changed is not None:
-                # Explicit grant/revoke always wins for this turn
-                allowed = bool(new_allowed)
-            break
-
-    # Keep file and graph aligned for the rest of the session
-    set_permission(allowed, thread_id)
-    print(f"[TESrACT:perm] gate thread={thread_id} control={'ACTIVE' if allowed else 'RESTRICTED'}")
+    allowed = _perm.is_control_allowed()
+    print(f"[TESrACT:perm] gate control={'ON' if allowed else 'OFF'}")
     return {"control_allowed": allowed, "thread_id": thread_id}
 
 
 def call_brain(state: JProState):
-    is_allowed = resolve_control_allowed(state)
-    status = "ACTIVE" if is_allowed else "RESTRICTED"
+    is_allowed = _perm.is_control_allowed()
+    status = "ON" if is_allowed else "OFF"
 
     raw_history = state.get("messages", [])
     history = [
@@ -1099,28 +1224,45 @@ def call_brain(state: JProState):
         return {"messages": [AIMessage(content=err_msg)]}
 
 
+_REVIEWER_RETRY_MARKERS = (
+    _RETRY_NUDGE[:40],
+    "HALLUCINATION BLOCKED",
+    "SYNTHESIS REQUIRED",
+    "Reassess Sir's request",
+    "Tool returned an error",
+)
+
+
+def _turn_retry_nudges(messages: list[BaseMessage]) -> int:
+    """How many reviewer retry SystemMessages were already injected this user turn."""
+    count = 0
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            break
+        if isinstance(m, SystemMessage):
+            content = str(m.content or "")
+            if any(marker in content for marker in _REVIEWER_RETRY_MARKERS):
+                count += 1
+    return count
+
+
 def reviewer_node(state: JProState) -> dict[str, object]:
-    """Post-tool reviewer: permission sync, error recovery, refusal retry nudges."""
+    """Post-tool reviewer: permission sync, error recovery, refusal retry nudges.
+
+    Important: never infinite-loop. At most one retry nudge per user turn for tool
+    errors, and stop once a valid final AI reply exists after tools.
+    """
     if not state.get("messages"):
         return {}
 
     messages = state["messages"]
-    recent_content = " ".join(
-        str(m.content or "").lower() for m in messages[-4:]
-    )
     updates: dict[str, object] = {}
 
     thread_id = str(state.get("thread_id") or "web_user_001")
-    last_user_msg = next((m for m in reversed(messages) if isinstance(m, HumanMessage)), None)
-    if last_user_msg:
-        new_allowed, changed = apply_permission_change(str(last_user_msg.content or ""), thread_id)
-        if changed is not None:
-            updates["control_allowed"] = new_allowed
-            if not new_allowed:
-                mac_access.clear_pending_confirmation(thread_id)
-    elif resolve_control_allowed(state):
-        updates["control_allowed"] = True
+    # Read-only mirror of the file flag — never grant/revoke from chat history
+    updates["control_allowed"] = _perm.is_control_allowed()
 
+    last_user_msg = next((m for m in reversed(messages) if isinstance(m, HumanMessage)), None)
     if last_user_msg and mac_access.is_confirmation_message(str(last_user_msg.content or "")):
         updates["command_confirmed"] = True
 
@@ -1132,35 +1274,56 @@ def reviewer_node(state: JProState) -> dict[str, object]:
         (m for m in reversed(messages) if isinstance(m, HumanMessage)),
         None,
     )
+    turn_tools = _current_turn_tool_messages(messages)
+    retries_already = _turn_retry_nudges(messages)
+
+    # Cap retries hard — prevents GraphRecursionError → "temporary issue"
+    if retries_already >= 1:
+        return updates
 
     if last_ai and not getattr(last_ai, "tool_calls", None):
         ai_text = str(last_ai.content or "")
-        turn_tools = _current_turn_tool_messages(messages)
-        needs_synthesis = (
-            _recent_tool_use(messages)
-            and turn_tools
-            and not _reply_uses_tool_evidence(ai_text, turn_tools)
-        )
-        if needs_synthesis:
+        # Valid final answer after tools → done (no more nudges)
+        if turn_tools and _is_valid_synthesis(ai_text):
+            if _reply_uses_tool_evidence(ai_text, turn_tools) or any(
+                "STATUS: SUCCESS" in str(tm.content or "").upper() for tm in turn_tools
+            ):
+                return updates
+            # Tools ran but reply is empty/wrong — one synthesis nudge only
             if not _nudge_already_sent(messages, "SYNTHESIS REQUIRED"):
                 updates["messages"] = [SystemMessage(content=_SYNTHESIS_NUDGE)]
-        elif (
+            return updates
+
+        if (
             last_user
             and _ACTION_REQUEST_RE.search(str(last_user.content or ""))
-            and not _recent_tool_use(messages)
+            and not turn_tools
         ):
+            if actions.looks_like_pseudo_tool_call(ai_text):
+                # force_tools path will handle; do not loop agent
+                return updates
             if _looks_like_fake_execution(ai_text) and not _nudge_already_sent(messages, "HALLUCINATION BLOCKED"):
                 updates["messages"] = [SystemMessage(content=_HALLUCINATION_NUDGE)]
-            elif (_looks_like_refusal(ai_text) or len(ai_text) < 30) and not _nudge_already_sent(messages, _RETRY_NUDGE[:40]):
+            elif (
+                (_looks_like_refusal(ai_text) or _looks_like_backend_failure(ai_text) or len(ai_text) < 30)
+                and not _nudge_already_sent(messages, _RETRY_NUDGE[:40])
+            ):
                 updates["messages"] = [SystemMessage(content=_RETRY_NUDGE)]
 
-    if "messages" not in updates:
-        last_tool = next((m for m in reversed(messages) if isinstance(m, ToolMessage)), None)
-        if last_tool:
-            tool_body = str(last_tool.content or "").lower()
-            if "confirmation_required" in tool_body:
-                pass
-            elif any(kw in tool_body for kw in ("error", "failed", "permission_denied", "denied")):
+    # Tool error recovery — once only. Prefer ending with synthesize's error reply.
+    if "messages" not in updates and turn_tools:
+        last_tool = turn_tools[-1]
+        tool_body = str(last_tool.content or "")
+        tool_lower = tool_body.lower()
+        if "confirmation_required" in tool_lower:
+            pass
+        elif any(kw in tool_lower for kw in ("permission_denied", "status: error", "failed")):
+            # If we already synthesized an error message to the user, stop.
+            if last_ai and not getattr(last_ai, "tool_calls", None):
+                ai_l = str(last_ai.content or "").lower()
+                if any(x in ai_l for x in ("error", "permission", "allow control", "could not", "restricted")):
+                    return updates
+            if not _nudge_already_sent(messages, "Tool returned an error"):
                 updates["messages"] = [SystemMessage(
                     content=(
                         "Tool returned an error or permission denial. "
@@ -1168,14 +1331,6 @@ def reviewer_node(state: JProState) -> dict[str, object]:
                         "or retry with corrected parameters. Do not fabricate success."
                     )
                 )]
-
-    if "error" in recent_content and "messages" not in updates:
-        updates["messages"] = [SystemMessage(
-            content=(
-                "The previous action encountered an issue. Reassess Sir's request, "
-                "try an alternative tool or approach, and execute it — do not give up."
-            )
-        )]
 
     return updates
 
@@ -1235,12 +1390,11 @@ def _inject_mac_tool_args(
 
 
 def execute_tools(state: JProState):
-    """Run tools and enforce control_allowed on gated tools."""
+    """Run tools. Gated tools re-check permissions.is_control_allowed() themselves."""
     messages = list(state.get("messages", []) or [])
     thread_id = str(state.get("thread_id") or "web_user_001")
     command_confirmed = bool(state.get("command_confirmed", False))
-    allowed = resolve_control_allowed(state)
-    # Ensure ToolNode InjectedState("control_allowed") sees the resolved session flag
+    allowed = _perm.is_control_allowed()
     exec_state: dict = {
         **dict(state),
         "control_allowed": allowed,
@@ -1322,7 +1476,7 @@ def force_tools_node(state: JProState) -> dict[str, object]:
     if not planned:
         return {}
 
-    allowed = resolve_control_allowed(state)
+    allowed = _perm.is_control_allowed()
     thread_id = str(state.get("thread_id") or "web_user_001")
     tool_messages: list[ToolMessage] = []
     for i, (name, args) in enumerate(planned):
@@ -1419,19 +1573,16 @@ def route_after_agent(state: JProState):
 
 def route_after_reviewer(state: JProState):
     messages = state.get("messages", [])
-    if messages and isinstance(messages[-1], SystemMessage):
-        content = str(messages[-1].content or "")
-        retry_markers = (
-            _RETRY_NUDGE[:40],
-            "HALLUCINATION BLOCKED",
-            "SYNTHESIS REQUIRED",
-            "Reassess Sir's request",
-            "Tool returned an error",
-        )
-        if any(marker in content for marker in retry_markers):
-            return "agent"
+    # Prefer deterministic tools before another LLM retry
     if _should_force_tools(state):
         return "force_tools"
+    if messages and isinstance(messages[-1], SystemMessage):
+        content = str(messages[-1].content or "")
+        # Only one agent retry per marker family this turn
+        if any(marker in content for marker in _REVIEWER_RETRY_MARKERS):
+            if _turn_retry_nudges(messages) <= 1:
+                return "agent"
+            return END
     if _pending_tool_synthesis(messages):
         return "synthesize"
     return END
@@ -1469,36 +1620,33 @@ async def serve_interface():
 
 @app.get("/permission")
 def permission_status():
-    """Current Mac control flag for the web session (used by the HUD toggle)."""
-    thread_id = "web_user_001"
-    allowed = get_permission(thread_id)
+    """Current Mac control flag for the HUD toggle."""
+    allowed = _perm.is_control_allowed()
     return {
         "control_status": allowed,
-        "thread_id": thread_id,
         "label": "ELEVATED" if allowed else "RESTRICTED",
     }
 
 
 @app.post("/permission")
 async def permission_set(request: Request):
-    """Toggle Mac control from the UI switch — bypasses the LLM entirely."""
+    """Toggle Mac control from the UI switch — only place (with voice cmds) that writes the flag."""
     try:
         payload = await request.json()
     except Exception:
         payload = {}
-    thread_id = "web_user_001"
     if "control_allowed" in payload:
         desired = bool(payload.get("control_allowed"))
     elif "enabled" in payload:
         desired = bool(payload.get("enabled"))
     else:
         return JSONResponse(
-            {"error": "control_allowed (bool) is required", "control_status": get_permission(thread_id)},
+            {"error": "control_allowed (bool) is required", "control_status": _perm.is_control_allowed()},
             status_code=400,
         )
 
-    was_allowed = get_permission(thread_id)
-    current_allowed, changed = set_session_permission(desired, thread_id, sync_graph=True)
+    was_allowed = _perm.is_control_allowed()
+    current_allowed, changed = _perm.set_control_allowed(desired)
     if current_allowed and not was_allowed:
         reply = PERMISSION_GRANTED_REPLY
     elif current_allowed and was_allowed:
@@ -1508,7 +1656,6 @@ async def permission_set(request: Request):
     else:
         reply = PERMISSION_ALREADY_RESTRICTED_REPLY
 
-    # Optional: speak the change (non-blocking)
     if changed:
         _run_speak(reply)
 
@@ -1516,7 +1663,7 @@ async def permission_set(request: Request):
         "reply": reply,
         "control_status": current_allowed,
         "changed": changed,
-        "pending_command": mac_access.get_pending_confirmation(thread_id),
+        "pending_command": mac_access.get_pending_confirmation("web_user_001"),
     }
 
 
@@ -1529,29 +1676,21 @@ async def chat_endpoint(request: Request):
         thread_id = "web_user_001"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
-        # Snapshot pre-change state so first-time "Allow Control" gets the granted reply
-        was_allowed = get_permission(thread_id)
-        current_allowed, perm_changed = apply_permission_change(user_text, thread_id)
-        if perm_changed is None:
-            current_allowed = get_permission(thread_id)
-
-        # Pure grant/revoke (including "yes allow control") — never hit the LLM
-        perm_reply = permission_reply_for(
-            user_text,
-            was_allowed=was_allowed,
-            now_allowed=current_allowed,
-            just_changed=perm_changed,
-        )
-        if perm_reply:
-            sync_graph_permission(
-                compiled_app, config, thread_id=thread_id, control_allowed=current_allowed,
-            )
+        # --- Control commands (Allow / Stop) — only writer besides the toggle ---
+        was_allowed = _perm.is_control_allowed()
+        current_allowed, perm_changed = apply_permission_change(user_text)
+        if perm_changed is not None:
+            perm_reply = permission_reply_for(user_text, was_allowed=was_allowed)
+            if not perm_reply:
+                perm_reply = PERMISSION_GRANTED_REPLY if current_allowed else PERMISSION_REVOKED_REPLY
             _run_speak(perm_reply)
             return {
                 "reply": perm_reply,
                 "control_status": current_allowed,
                 "pending_command": mac_access.get_pending_confirmation(thread_id),
             }
+
+        current_allowed = _perm.is_control_allowed()
 
         # Handle simple commands directly (bypass LLM entirely to save tokens and remain usable under rate limits)
         simple_reply = try_simple_command(user_text, current_allowed)
@@ -1574,10 +1713,19 @@ async def chat_endpoint(request: Request):
                 "pending_command": None,
             }
 
-        # Standard way: pass only the new user message.
-        # The checkpointer + add_messages reducer will append it to the thread history automatically.
-        sync_graph_permission(compiled_app, config, thread_id=thread_id, control_allowed=current_allowed)
+        # Fast path: pure filesystem/time tools — skip the LLM (avoids recursion / temporary issue)
+        direct_reply = _try_direct_mac_tools(
+            user_text, control_allowed=current_allowed, thread_id=thread_id,
+        )
+        if direct_reply:
+            _run_speak(direct_reply)
+            return {
+                "reply": direct_reply,
+                "control_status": current_allowed,
+                "pending_command": mac_access.get_pending_confirmation(thread_id),
+            }
 
+        # Standard agent graph — pass current flag; tools also re-read the file
         inputs = cast(JProState, {
             "messages": [HumanMessage(content=user_text)],
             "control_allowed": current_allowed,
@@ -1587,19 +1735,42 @@ async def chat_endpoint(request: Request):
 
         agent_config: RunnableConfig = {
             **config,
-            "recursion_limit": 40,
+            "recursion_limit": 16,
         }
         try:
             compiled_app.invoke(inputs, config=agent_config)
         except RateLimitError as e:
-            # On rate limit, still return friendly msg but note that basic commands work
             print(f"[TESrACT] RateLimitError caught in chat_endpoint: {e}")
-            return {"reply": "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work.", "control_status": current_allowed}
+            recovery = _try_direct_mac_tools(
+                user_text, control_allowed=current_allowed, thread_id=thread_id,
+            )
+            if recovery:
+                return {
+                    "reply": recovery,
+                    "control_status": current_allowed,
+                    "pending_command": mac_access.get_pending_confirmation(thread_id),
+                }
+            return {
+                "reply": "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work.",
+                "control_status": current_allowed,
+            }
         except Exception as e:
             print(f"[TESrACT] Graph invoke error: {e}")
-            return {"reply": "I encountered a temporary issue. Please try again shortly, Sir.", "control_status": current_allowed}
+            traceback.print_exc()
+            recovery = _try_direct_mac_tools(
+                user_text, control_allowed=current_allowed, thread_id=thread_id,
+            )
+            if recovery:
+                return {
+                    "reply": recovery,
+                    "control_status": current_allowed,
+                    "pending_command": mac_access.get_pending_confirmation(thread_id),
+                }
+            return {
+                "reply": "I encountered a temporary issue. Please try again shortly, Sir.",
+                "control_status": current_allowed,
+            }
 
-        # Always fetch the latest state after the full graph run (agent/tools/reviewer loop)
         final_state = compiled_app.get_state(config)
         state_values = final_state.values if final_state else None
         messages = (state_values or {}).get("messages", [])
@@ -1620,15 +1791,14 @@ async def chat_endpoint(request: Request):
         except Exception as mem_exc:
             print(f"[TESrACT] Turn memory store skipped: {mem_exc}")
 
-        updated_allowed = resolve_control_allowed(cast(JProState, state_values or {}))
-        set_permission(updated_allowed, thread_id)
-        sync_graph_permission(compiled_app, config, thread_id=thread_id, control_allowed=updated_allowed)
+        # Do NOT rewrite permission from graph state — flag only changes via toggle / control commands
+        current_allowed = _perm.is_control_allowed()
 
         _run_speak(final_reply)
 
         return {
             "reply": final_reply,
-            "control_status": updated_allowed,
+            "control_status": current_allowed,
             "pending_command": mac_access.get_pending_confirmation(thread_id),
         }
 
@@ -1637,7 +1807,7 @@ async def chat_endpoint(request: Request):
         traceback.print_exc()
         return {
             "reply": "TESrACT is having a temporary issue. Please try again shortly, Sir.",
-            "control_status": get_permission("web_user_001"),
+            "control_status": _perm.is_control_allowed(),
         }
 
 
@@ -1653,31 +1823,17 @@ def main_loop():
             _run_speak("Powering down.", wait_for_speech=True)
             break
 
-        state = compiled_app.get_state(config)
         thread_id = "jarvis_session_001"
-        is_allowed = (
-            resolve_control_allowed(cast(JProState, state.values or {}))
-            if state and state.values
-            else get_permission(thread_id)
-        )
-        was_allowed = is_allowed
-        new_allowed, changed = apply_permission_change(command, thread_id)
+        was_allowed = _perm.is_control_allowed()
+        is_allowed, changed = apply_permission_change(command)
         if changed is not None:
-            is_allowed = new_allowed
+            perm_reply = permission_reply_for(command, was_allowed=was_allowed)
+            if perm_reply:
+                print(f"TESrACT: {perm_reply}")
+                _run_speak(perm_reply, wait_for_speech=True)
+                continue
 
-        perm_reply = permission_reply_for(
-            command,
-            was_allowed=was_allowed,
-            now_allowed=is_allowed,
-            just_changed=changed,
-        )
-        if perm_reply:
-            sync_graph_permission(
-                compiled_app, config, thread_id=thread_id, control_allowed=is_allowed,
-            )
-            print(f"TESrACT: {perm_reply}")
-            _run_speak(perm_reply, wait_for_speech=True)
-            continue
+        is_allowed = _perm.is_control_allowed()
 
         # Handle simple commands directly (works even under rate limits)
         simple_reply = try_simple_command(command, is_allowed)
@@ -1686,7 +1842,12 @@ def main_loop():
             _run_speak(simple_reply, wait_for_speech=True)
             continue
 
-        sync_graph_permission(compiled_app, config, thread_id=thread_id, control_allowed=is_allowed)
+        direct = _try_direct_mac_tools(command, control_allowed=is_allowed, thread_id=thread_id)
+        if direct:
+            print(f"TESrACT: {direct}")
+            _run_speak(direct, wait_for_speech=True)
+            continue
+
         inputs = cast(JProState, {
             "messages": [HumanMessage(content=command)],
             "control_allowed": is_allowed,

@@ -11,9 +11,21 @@ services:
       - key: GROQ_API_KEY
         description: "Your Groq API key (required for the agent brain)"
         sync: false
+      - key: ENABLE_HYBRID_ROUTING
+        value: "true"
+      - key: BRAIN_REGISTRY_SECRET
+        description: "Shared secret — must match Mac tunnel_manager.py / .env"
+        sync: false
+      - key: LOCAL_INSTANCE_API_KEY
+        description: "Optional Bearer secret for /internal/llm/invoke on the Mac"
+        sync: false
       # Optional: if you have a different Colab/ngrok speak endpoint for server TTS
       # - key: SPEAK_COLAB_URL
       #   sync: false
     healthCheckPath: /health
+# Self-healing Mac tunnel:
+#   1) Set BRAIN_REGISTRY_SECRET on Render (and Mac .env)
+#   2) On Mac: uvicorn main:app --port 8000  +  python tunnel_manager.py
+#   3) Bookmark https://YOUR-APP.onrender.com/go  (always redirects to live tunnel)
 # Note: Rate limit handling (429 for llama-3.3-70b-versatile) added in main.py
 # with retries + fallback. Redeploy after changes to apply graceful degradation.

@@ -21,10 +21,13 @@ Environment variables:
   COLAB_LLM_TIMEOUT     — seconds (default: 120)
   COLAB_HEALTH_TTL      — cache health check seconds (default: 60)
   ENABLE_HYBRID_ROUTING — true to prefer a remote Mac instance (tunnel URL) before cloud
-  LOCAL_INSTANCE_URL    — Mac TESrACT URL (Cloudflare Tunnel / ngrok), e.g. https://mac.example.com
+  LOCAL_INSTANCE_URL    — fallback Mac TESrACT URL (static). Live URL comes from brain_registry
+                          (tunnel_manager auto-updates via POST /api/update-brain).
   LOCAL_INSTANCE_API_KEY — optional shared secret for /internal/llm/invoke
   LOCAL_INSTANCE_HEALTH_TTL — cache remote /health seconds (default: 30)
   LOCAL_INSTANCE_TIMEOUT    — remote invoke timeout seconds (default: 90)
+  BRAIN_REGISTRY_SECRET     — shared secret for tunnel_manager ↔ Render registry
+  TESRACT_RENDER_URL        — stable Render URL used by tunnel_manager to register
 
 Future local media hooks (not implemented yet — structure only):
   LOCAL_IMAGE_GEN_BACKEND  — e.g. mlx-stable-diffusion
@@ -109,6 +112,8 @@ TOOL_FRIENDLY_PHRASES = (
     "generate image", "create image", "draw ", "make an image", "make a picture",
     "generate a picture", "image of", "picture of", "generate_image",
     "read file", "write file", "save file", "list files", "list directory",
+    "create folder", "create directory", "make folder", "make a folder",
+    "create a folder", "mkdir", "create_directory",
     "read_file", "write_file", "list_directory", "run_terminal_command",
     "terminal", "shell command", "run command", "execute command",
     "ls ", "cd ", "git ", "npm ", "pip ", "brew ",
@@ -147,6 +152,7 @@ COLAB_TIMEOUT = float(os.getenv("COLAB_LLM_TIMEOUT", "120"))
 COLAB_HEALTH_TTL = int(os.getenv("COLAB_HEALTH_TTL", "60"))
 
 ENABLE_HYBRID_ROUTING = os.getenv("ENABLE_HYBRID_ROUTING", "").strip().lower() in ("1", "true", "yes")
+# Static env fallback — live URL comes from brain_registry (tunnel_manager updates).
 LOCAL_INSTANCE_URL = (os.getenv("LOCAL_INSTANCE_URL") or "").rstrip("/")
 LOCAL_INSTANCE_API_KEY = os.getenv("LOCAL_INSTANCE_API_KEY", "")
 LOCAL_INSTANCE_HEALTH_TTL = int(os.getenv("LOCAL_INSTANCE_HEALTH_TTL", "30"))
@@ -159,10 +165,11 @@ _ollama_models_cache: dict[str, Any] = {
     "checked_at": 0.0,
 }
 _colab_health_cache: dict[str, float | bool] = {"ok": False, "checked_at": 0.0}
-_remote_mac_health_cache: dict[str, float | bool | dict[str, Any]] = {
+_remote_mac_health_cache: dict[str, Any] = {
     "ok": False,
     "checked_at": 0.0,
     "info": {},
+    "url": "",
 }
 _ollama_llm_cache: dict[str, Any] = {}
 _mlx_loaded: bool = False
@@ -600,17 +607,52 @@ def hybrid_routing_enabled() -> bool:
     return ENABLE_HYBRID_ROUTING
 
 
+def get_local_instance_url() -> str:
+    """
+    Live Mac tunnel URL for hybrid routing.
+
+    Prefer brain_registry (updated automatically by tunnel_manager every time
+    Cloudflare issues a new trycloudflare.com link). Fall back to LOCAL_INSTANCE_URL env.
+    """
+    try:
+        import brain_registry
+
+        live = brain_registry.get_brain_url()
+        if live:
+            return live.rstrip("/")
+    except Exception:
+        pass
+    return (LOCAL_INSTANCE_URL or "").rstrip("/")
+
+
+def on_local_instance_url_changed(url: str) -> None:
+    """Called by brain_registry when tunnel_manager posts a new URL — bust health cache."""
+    _remote_mac_health_cache["ok"] = False
+    _remote_mac_health_cache["checked_at"] = 0.0
+    _remote_mac_health_cache["info"] = {}
+    _log(f"Remote Mac URL updated → {(url or '')[:64]}")
+
+
 def remote_mac_configured() -> bool:
-    return bool(LOCAL_INSTANCE_URL)
+    return bool(get_local_instance_url())
 
 
 def remote_mac_is_healthy(force: bool = False, *, log_failure: bool = True) -> bool:
-    """Ping LOCAL_INSTANCE_URL/health — True when the Mac TESrACT instance can serve locally."""
+    """Ping live Mac tunnel /health — True when the Mac TESrACT instance can serve locally."""
     if not hybrid_routing_enabled() or not remote_mac_configured():
         return False
 
+    base = get_local_instance_url()
+    if not base:
+        return False
+
     now = time.time()
-    if not force and now - float(_remote_mac_health_cache["checked_at"]) < LOCAL_INSTANCE_HEALTH_TTL:
+    cached_url = str(_remote_mac_health_cache.get("url") or "")
+    if (
+        not force
+        and cached_url == base
+        and now - float(_remote_mac_health_cache["checked_at"]) < LOCAL_INSTANCE_HEALTH_TTL
+    ):
         return bool(_remote_mac_health_cache["ok"])
 
     ok = False
@@ -621,7 +663,7 @@ def remote_mac_is_healthy(force: bool = False, *, log_failure: bool = True) -> b
         if LOCAL_INSTANCE_API_KEY:
             headers["Authorization"] = f"Bearer {LOCAL_INSTANCE_API_KEY}"
         with httpx.Client(timeout=5.0) as client:
-            res = client.get(f"{LOCAL_INSTANCE_URL}/health", headers=headers)
+            res = client.get(f"{base}/health", headers=headers)
             if res.status_code == 200:
                 data = res.json()
                 ok = data.get("status") == "ok" and bool(data.get("local_llm_available"))
@@ -638,10 +680,11 @@ def remote_mac_is_healthy(force: bool = False, *, log_failure: bool = True) -> b
     _remote_mac_health_cache["ok"] = ok
     _remote_mac_health_cache["checked_at"] = now
     _remote_mac_health_cache["info"] = info
+    _remote_mac_health_cache["url"] = base
     if log_failure and not ok:
         _log(
             f"Remote Mac health check failed ({err_detail or 'unreachable'}) — "
-            f"{LOCAL_INSTANCE_URL}"
+            f"{base}"
         )
     return ok
 
@@ -649,7 +692,8 @@ def remote_mac_is_healthy(force: bool = False, *, log_failure: bool = True) -> b
 def hybrid_status() -> dict[str, Any]:
     """Snapshot for /health and startup logs."""
     enabled = hybrid_routing_enabled()
-    configured = remote_mac_configured()
+    live_url = get_local_instance_url()
+    configured = bool(live_url)
     healthy = (
         remote_mac_is_healthy(log_failure=False)
         if enabled and configured
@@ -659,10 +703,12 @@ def hybrid_status() -> dict[str, Any]:
     ram = info.get("ram_available_gb") if isinstance(info, dict) else None
     return {
         "enabled": enabled,
-        "local_instance_url": LOCAL_INSTANCE_URL or None,
+        "local_instance_url": live_url or None,
+        "local_instance_url_env": LOCAL_INSTANCE_URL or None,
         "remote_mac_healthy": healthy,
         "remote_ram_available_gb": ram,
         "direct_ollama_healthy": ollama_is_healthy(log_failure=False),
+        "brain_registry": True,
     }
 
 
@@ -1061,11 +1107,15 @@ def _try_remote_mac(
         "local_tier": tier,
     }
 
+    base = get_local_instance_url()
+    if not base:
+        return None
+
     try:
-        _log_remote_mac(tier, "", f"{reason} — {LOCAL_INSTANCE_URL}")
+        _log_remote_mac(tier, "", f"{reason} — {base}")
         with httpx.Client(timeout=LOCAL_INSTANCE_TIMEOUT) as client:
             res = client.post(
-                f"{LOCAL_INSTANCE_URL}/internal/llm/invoke",
+                f"{base}/internal/llm/invoke",
                 json=payload,
                 headers=headers,
             )

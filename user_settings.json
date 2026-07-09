@@ -1,3 +1,4 @@
 {
-  "web_user_001": false
+  "web_user_001": true,
+  "control_allowed": true
 }
