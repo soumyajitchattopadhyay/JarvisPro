@@ -12,7 +12,16 @@ from typing import Optional
 import httpx
 from langchain_core.tools import tool
 from langchain_experimental.utilities import PythonREPL
-from duckduckgo_search import DDGS
+
+# Package was renamed duckduckgo_search → ddgs; support both.
+try:
+    from ddgs import DDGS  # type: ignore
+except ImportError:  # pragma: no cover
+    try:
+        from duckduckgo_search import DDGS  # type: ignore
+    except ImportError:  # pragma: no cover
+        DDGS = None  # type: ignore
+
 from local_search_memory import (
     format_recall_for_context,
     recall_memory,
@@ -166,17 +175,87 @@ def _resolve_path(path: str) -> Path:
         ) from exc
 
 
-def _search_duckduckgo(query: str, max_results: int = 5) -> list[dict[str, str]]:
-    with DDGS() as ddgs:
-        hits = ddgs.text(query, max_results=max_results, backend="lite")
-        return [
+def _normalize_ddg_hits(raw_hits) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for r in raw_hits or []:
+        if not isinstance(r, dict):
+            continue
+        out.append(
             {
                 "title": r.get("title") or "Untitled",
-                "body": r.get("body") or "",
-                "url": r.get("href") or r.get("link") or "",
+                "body": r.get("body") or r.get("snippet") or r.get("content") or "",
+                "url": r.get("href") or r.get("link") or r.get("url") or "",
             }
-            for r in hits
-        ]
+        )
+    return out
+
+
+def _search_duckduckgo(query: str, max_results: int = 5) -> list[dict[str, str]]:
+    """
+    DuckDuckGo text search with backend fallbacks.
+
+    `backend="lite"` (older code path) now often returns 0 hits. Prefer `auto` /
+    `html`, and treat empty result sets as failures so we rotate backends.
+    """
+    if DDGS is None:
+        raise RuntimeError(
+            "No DuckDuckGo client installed. Run: pip install ddgs"
+        )
+
+    # Order matters: auto/html are currently reliable; lite is last-resort.
+    backends: list[str | None] = ["auto", "html", None, "lite"]
+    errors: list[str] = []
+
+    for backend in backends:
+        try:
+            with DDGS() as ddgs:
+                kwargs: dict = {"max_results": max_results}
+                if backend is not None:
+                    kwargs["backend"] = backend
+                raw = ddgs.text(query, **kwargs)
+                # Some versions return a generator; materialize fully.
+                hits = _normalize_ddg_hits(list(raw) if raw is not None else [])
+            if hits:
+                return hits
+            errors.append(f"backend={backend!r}: 0 hits")
+        except TypeError:
+            # Older/newer API without `backend=` kwarg
+            try:
+                with DDGS() as ddgs:
+                    raw = ddgs.text(query, max_results=max_results)
+                    hits = _normalize_ddg_hits(list(raw) if raw is not None else [])
+                if hits:
+                    return hits
+                errors.append("backend=<default>: 0 hits")
+            except Exception as exc:
+                errors.append(f"backend=<default>: {exc}")
+        except Exception as exc:
+            errors.append(f"backend={backend!r}: {exc}")
+
+    # News endpoint is a useful secondary path for current-events queries.
+    try:
+        with DDGS() as ddgs:
+            raw_news = ddgs.news(query, max_results=max_results)
+            news_hits = []
+            for r in list(raw_news or []):
+                if not isinstance(r, dict):
+                    continue
+                news_hits.append(
+                    {
+                        "title": r.get("title") or "Untitled",
+                        "body": r.get("body") or r.get("excerpt") or "",
+                        "url": r.get("url") or r.get("href") or "",
+                    }
+                )
+            if news_hits:
+                return news_hits
+            errors.append("news: 0 hits")
+    except Exception as exc:
+        errors.append(f"news: {exc}")
+
+    raise RuntimeError(
+        "DuckDuckGo returned no results. " + "; ".join(errors[:6])
+    )
 
 
 def _search_tavily(query: str, max_results: int = 5) -> tuple[str, list[dict[str, str]]]:
@@ -252,27 +331,42 @@ def _run_web_search(query: str, *, max_results: int = 5, focus: str = "") -> str
     provider = "duckduckgo"
     summary = ""
     hits: list[dict[str, str]] = []
+    last_error = ""
 
-    try:
-        if os.getenv("TAVILY_API_KEY", "").strip():
+    # Prefer Tavily when configured; always fall back to DuckDuckGo.
+    if os.getenv("TAVILY_API_KEY", "").strip():
+        try:
             provider = "tavily"
             summary, hits = _search_tavily(query, max_results=max_results)
-        else:
+        except Exception as exc:
+            last_error = f"tavily: {exc}"
+            provider = "duckduckgo"
+            hits = []
+
+    if not hits:
+        try:
+            provider = "duckduckgo"
             hits = _search_duckduckgo(query, max_results=max_results)
-    except Exception as exc:
-        if provider == "tavily":
-            try:
-                provider = "duckduckgo"
-                hits = _search_duckduckgo(query, max_results=max_results)
-            except Exception as fallback_exc:
-                return f"Search Error: {fallback_exc}"
-        else:
-            return f"Search Error: {exc}"
+        except Exception as exc:
+            detail = str(exc)
+            if last_error:
+                detail = f"{last_error}; {detail}"
+            return f"Search Error: {detail}"
+
+    if not hits:
+        return (
+            f"Search Error: no web results for {query!r}. "
+            "Try a more specific query, or set TAVILY_API_KEY for a paid search API."
+        )
 
     formatted = _format_search_results(
         query, hits, provider=provider, summary=summary, focus=focus,
     )
-    store_search(query, formatted, source=provider)
+    try:
+        store_search(query, formatted, source=provider)
+    except Exception as mem_exc:
+        # Memory is best-effort — never fail the tool because of Chroma/storage.
+        print(f"[TESrACT:search] memory store skipped: {mem_exc}")
     header = f"Query: {query}\n"
     return header + (prior + formatted if prior else formatted)
 
@@ -349,6 +443,8 @@ def web_search(query: str):
     """Search the web for current information, facts, or news. Use for any question needing up-to-date data."""
     try:
         body = _run_web_search(query, max_results=5)
+        if body.startswith("Search Error:"):
+            return _tool_err("web_search", body)
         return _tool_ok("web_search", body)
     except Exception as exc:
         return _tool_err("web_search", str(exc))
@@ -359,6 +455,8 @@ def search_and_summarize(query: str, focus: str = ""):
     """Deep web research with structured summary and numbered citations. Use for research, news, or 'find out about X'."""
     try:
         body = _run_web_search(query, max_results=6, focus=(focus or "").strip())
+        if body.startswith("Search Error:"):
+            return _tool_err("search_and_summarize", body)
         return _tool_ok("search_and_summarize", body)
     except Exception as exc:
         return _tool_err("search_and_summarize", str(exc))
@@ -770,6 +868,34 @@ _SEARCH_QUERY_RE = re.compile(
     r"\b(search|look up|lookup|research|find out|latest|news about|web search)\b",
     re.IGNORECASE,
 )
+_SEARCH_DEEP_RE = re.compile(
+    r"\b(research|summarize|summary|deep dive|find out about|comprehensive)\b",
+    re.IGNORECASE,
+)
+# Strip chat-command wrappers so DDG gets a real topic, not "search the web for …".
+_SEARCH_WRAPPER_RE = re.compile(
+    r"^(?:please\s+|can you\s+|could you\s+|would you\s+)?"
+    r"(?:search(?:\s+the\s+web)?(?:\s+for)?|look\s*up|lookup|research|find\s+out(?:\s+about)?|"
+    r"web\s+search(?:\s+for)?|google)\s+",
+    re.IGNORECASE,
+)
+_SEARCH_TRAILING_RE = re.compile(
+    r"\s+(?:and\s+summarize(?:\s+it)?|please|for me|thanks|thank you)\.?$",
+    re.IGNORECASE,
+)
+
+
+def _clean_search_query(text: str) -> str:
+    """Extract the topical query from a natural-language search request."""
+    q = (text or "").strip().strip("\"'")
+    if not q:
+        return q
+    cleaned = _SEARCH_WRAPPER_RE.sub("", q).strip()
+    cleaned = _SEARCH_TRAILING_RE.sub("", cleaned).strip(" .,?!")
+    # Avoid empty / ultra-short leftovers after stripping wrappers
+    if len(cleaned) >= 2:
+        return cleaned
+    return q
 _RECALL_QUERY_RE = re.compile(
     r"\b(recall|remember|what did we|previous|last time|earlier|before)\b",
     re.IGNORECASE,
@@ -1294,9 +1420,13 @@ def infer_forced_tools(user_text: str) -> list[tuple[str, dict]]:
             inferred.append(("run_terminal_command", {"command": rewrite_paths_in_command(cmd)}))
 
     if _SEARCH_QUERY_RE.search(text):
-        inferred.append(("web_search", {"query": text}))
+        query = _clean_search_query(text)
+        if _SEARCH_DEEP_RE.search(text):
+            inferred.append(("search_and_summarize", {"query": query, "focus": ""}))
+        else:
+            inferred.append(("web_search", {"query": query}))
     if _RECALL_QUERY_RE.search(text):
-        inferred.append(("recall_memory", {"query": text}))
+        inferred.append(("recall_memory", {"query": _clean_search_query(text) or text}))
     if _TASK_VIEW_RE.search(text):
         inferred.append(("manage_task_plan", {"action": "view"}))
 

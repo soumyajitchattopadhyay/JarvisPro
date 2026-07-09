@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -421,8 +422,32 @@ def format_recall_for_context(query: str, n: int = 2) -> str:
     if not hits:
         return ""
 
+    # Cosine distance in Chroma: 0 = identical, higher = less similar.
+    # Drop weak matches so unrelated prior searches (e.g. OpenAI vs Python) do not pollute results.
+    max_distance = float(os.getenv("MEMORY_SEARCH_MAX_DISTANCE", "0.55") or "0.55")
+    filtered = []
+    for hit in hits:
+        dist = hit.get("distance")
+        if dist is not None:
+            try:
+                if float(dist) > max_distance:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        # Also require a little lexical overlap as a safety net
+        q_prev = str(hit.get("query") or "").lower()
+        q_now = (query or "").lower()
+        tokens_now = {t for t in re.findall(r"[a-z0-9]{3,}", q_now)}
+        tokens_prev = {t for t in re.findall(r"[a-z0-9]{3,}", q_prev)}
+        if tokens_now and tokens_prev and not (tokens_now & tokens_prev):
+            continue
+        filtered.append(hit)
+
+    if not filtered:
+        return ""
+
     lines = ["[Prior local search memory — may be stale]"]
-    for i, hit in enumerate(hits, 1):
+    for i, hit in enumerate(filtered, 1):
         q = hit.get("query") or "unknown"
         src = hit.get("source") or "unknown"
         body = str(hit.get("results") or "")[:600]

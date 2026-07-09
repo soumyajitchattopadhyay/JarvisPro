@@ -484,6 +484,7 @@ def sync_graph_permission(
         print(f"[TESrACT:perm] checkpoint sync skipped: {exc}")
 
 
+# Tools that can run without the LLM (reliable when local models skip tool_calls).
 _DIRECT_MAC_TOOLS = frozenset({
     "list_directory",
     "read_file",
@@ -491,6 +492,10 @@ _DIRECT_MAC_TOOLS = frozenset({
     "create_directory",
     "run_terminal_command",
     "get_current_time",
+    # Web search must not depend on the model emitting tool_calls — DDG is deterministic.
+    "web_search",
+    "search_and_summarize",
+    "recall_memory",
 })
 
 
@@ -501,7 +506,7 @@ def _try_direct_mac_tools(
     thread_id: str = "web_user_001",
 ) -> str | None:
     """
-    Execute pure Mac filesystem/time tools without the LLM.
+    Execute pure tools (filesystem/time/search) without the LLM.
 
     This is the reliable path when local models cannot bind tools and would
     otherwise emit plain-text 'tool_call:' stubs or trip graph recursion.
