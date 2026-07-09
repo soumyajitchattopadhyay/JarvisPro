@@ -7,6 +7,8 @@ A proactive, agentic AI assistant with a JARVIS-inspired personality.
 - Voice + text + GUI modes
 - Tool use, access control, and memory
 - **Self-healing Cloudflare tunnel** → stable global link on Render
+- **Secure Brain mode** — host never mutates the OS for public requests; physical actions return client-side intents
+- **HMAC handshake** on `/chat` and `/api/update-brain` (`BRAIN_REGISTRY_SECRET`)
 
 Run locally:
 ```
@@ -59,3 +61,32 @@ https://YOUR-APP.onrender.com/go
 
 When the free tunnel drops, `tunnel_manager` restarts cloudflared, scrapes the new
 URL, and updates Render again — no manual `.env` edits.
+
+## Secure Brain architecture
+
+The Mac process is a **cognitive engine** only:
+
+| Concern | Behavior |
+|--------|----------|
+| Shell / `subprocess` / host writes | **Disabled** on the Brain |
+| File creation | Returns `action: DOWNLOAD_FILE` for the client |
+| List/read/mkdir/open/shell | Returns `action: DISPLAY_DATA` client intents |
+| Pure Q&A / math / search | `action: LOGIC_ONLY` (Brain-local) |
+| Public `/chat`, `/api/update-brain` | Require HMAC or Bearer `BRAIN_REGISTRY_SECRET` |
+| Localhost HUD | Allowed without headers when `BRAIN_AUTH_LOCALHOST_BYPASS=true` (default) |
+
+Example authenticated `/chat` response when packaging a file:
+
+```json
+{
+  "status": "success",
+  "execution_target": "client",
+  "action": "DOWNLOAD_FILE",
+  "payload": { "filename": "notes.txt", "content": "..." },
+  "reply": "Prepared file for client-side download...",
+  "executions": [ ... ]
+}
+```
+
+Sign outbound requests (tunnel_manager / hybrid Render→Mac) with headers from `brain_auth.sign()`:
+`X-Brain-Timestamp`, `X-Brain-Signature`, optional `X-Brain-Token`, or `Authorization: Bearer <secret>`.

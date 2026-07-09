@@ -35,6 +35,7 @@ Future local media hooks (not implemented yet — structure only):
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -1095,8 +1096,6 @@ def _try_remote_mac(
         "Content-Type": "application/json",
         "ngrok-skip-browser-warning": "true",
     }
-    if LOCAL_INSTANCE_API_KEY:
-        headers["Authorization"] = f"Bearer {LOCAL_INSTANCE_API_KEY}"
 
     payload = {
         "messages": serialize_messages(messages),
@@ -1106,6 +1105,28 @@ def _try_remote_mac(
         "needs_tools": needs_tools,
         "local_tier": tier,
     }
+    body_bytes = json.dumps(payload).encode("utf-8")
+
+    # Cryptographic handshake with the remote Brain
+    try:
+        import brain_auth
+
+        headers.update(
+            brain_auth.sign(
+                method="POST",
+                path="/internal/llm/invoke",
+                body=body_bytes,
+            )
+        )
+    except Exception:
+        secret = (
+            os.getenv("BRAIN_REGISTRY_SECRET")
+            or os.getenv("LOCAL_INSTANCE_API_KEY")
+            or LOCAL_INSTANCE_API_KEY
+            or ""
+        ).strip()
+        if secret:
+            headers["Authorization"] = f"Bearer {secret}"
 
     base = get_local_instance_url()
     if not base:
@@ -1116,7 +1137,7 @@ def _try_remote_mac(
         with httpx.Client(timeout=LOCAL_INSTANCE_TIMEOUT) as client:
             res = client.post(
                 f"{base}/internal/llm/invoke",
-                json=payload,
+                content=body_bytes,
                 headers=headers,
             )
         if res.status_code >= 400:

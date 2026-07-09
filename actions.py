@@ -3,10 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import time
 import urllib.parse
-import webbrowser
 import datetime
 from pathlib import Path
 from typing import Optional
@@ -24,21 +22,22 @@ from local_search_memory import (
 )
 from mac_access import (
     classify_command,
-    ensure_directory,
     find_named_path,
     format_confirmation_request,
+    intent_create_directory,
+    intent_download_file,
+    intent_list_directory,
+    intent_open_url,
+    intent_read_file,
+    intent_run_command,
     last_remembered_path,
-    list_path,
-    read_text_file,
     real_home,
     remember_path,
     resolve_mac_path,
     rewrite_paths_in_command,
-    run_shell_command,
     sanitize_path_string,
     set_pending_confirmation,
-    write_text_file,
-)  # resolve_mac_path used by mkdir/file inference
+)
 import permissions
 
 repl = PythonREPL()
@@ -67,12 +66,18 @@ def _tool_err(name: str, message: str) -> str:
 
 def _permission_denied(tool_name: str, detail: str = "") -> str:
     msg = (
-        "PERMISSION_DENIED: Mac control is OFF. "
-        "Turn on the MAC CONTROL toggle or say 'Allow Control'."
+        "PERMISSION_DENIED: Client-action authorization is OFF. "
+        "Turn on the MAC CONTROL toggle or say 'Allow Control' "
+        "to authorize client-side execution intents."
     )
     if detail:
         msg = f"{msg} ({detail})"
     return _tool_err(tool_name, msg)
+
+
+def _client_intent_ok(name: str, intent_blob: str) -> str:
+    """Wrap a client execution intent as a successful tool result."""
+    return _tool_ok(name, intent_blob)
 
 
 def _clean_path_arg(path: str) -> str:
@@ -391,36 +396,59 @@ def generate_image(prompt: str, style: str = ""):
 
 @tool
 def execute_python_code(code: str, control_allowed: bool = False):
-    """Run Python code for calculations, data analysis, logic, or automation. Requires elevated control."""
+    """
+    Run process-local Python for math, logic, data transforms, or code experiments.
+    Does NOT touch the host filesystem or shell. Requires Allow Control.
+    """
     if not _control_ok(control_allowed):
         return _permission_denied("execute_python_code")
     code = (code or "").strip()
     if not code:
         return _tool_err("execute_python_code", "code cannot be empty.")
+    # Soft guard: reject obvious OS-mutation / network escapes inside the REPL
+    lowered = code.lower()
+    banned = (
+        "subprocess", "os.system", "os.popen", "os.remove", "os.unlink",
+        "os.rmdir", "shutil.rmtree", "shutil.move", "shutil.copy",
+        "webbrowser", "socket.", "pty.", "ctypes.",
+        "__import__('subprocess')", '__import__("subprocess")',
+    )
+    if any(tok in lowered for tok in banned):
+        return _tool_err(
+            "execute_python_code",
+            "BLOCKED: code attempts host I/O or process control. "
+            "Use client-execution tools (write_file / run_terminal_command) instead.",
+        )
     try:
         result = repl.run(code)
         output = str(result).strip() if result is not None else "(no output)"
-        return _tool_ok("execute_python_code", f"Execution complete:\n{output}")
+        return _tool_ok(
+            "execute_python_code",
+            f"Brain-local execution complete (no host mutation):\n{output}",
+        )
     except Exception as exc:
         return _tool_err("execute_python_code", str(exc))
 
 
 @tool
 def read_file(path: str, max_chars: int = 12000, control_allowed: bool = False):
-    """Read a text file on Sir's Mac. Use ~ or real paths (e.g. ~/Desktop/notes.txt). Requires Allow Control."""
+    """
+    Request a text-file read as a CLIENT-SIDE intent.
+    The Brain does not read the host filesystem; the client must supply content.
+    """
     if not _control_ok(control_allowed):
         return _permission_denied("read_file")
     if not (path or "").strip():
         return _tool_err("read_file", "path cannot be empty.")
     try:
-        target = _resolve_path(sanitize_path_string(path))
-        body = read_text_file(target, max_chars=max_chars)
-        return _tool_ok("read_file", body)
-    except Exception as exc:
-        return _tool_err(
+        logical = str(_resolve_path(sanitize_path_string(path)))
+        remember_path(logical)
+        return _client_intent_ok(
             "read_file",
-            f"{exc} | home={real_home()} original_path={path!r}",
+            intent_read_file(path=logical, max_chars=max_chars),
         )
+    except Exception as exc:
+        return _tool_err("read_file", f"{exc} | original_path={path!r}")
 
 
 @tool
@@ -430,31 +458,38 @@ def write_file(
     control_allowed: bool = False,
     append: bool = False,
 ):
-    """Create or edit a text file on Sir's Mac. Prefer ~/Desktop/... paths. Requires Allow Control."""
+    """
+    Package file content as a CLIENT-SIDE DOWNLOAD_FILE intent.
+    The Brain never writes to the host filesystem.
+    """
     if not _control_ok(control_allowed):
         return _permission_denied("write_file")
     path = (path or "").strip()
     if not path:
         return _tool_err("write_file", "path cannot be empty.")
-    # Always sanitize LLM placeholder homes (/Users/yourusername, wrong usernames, etc.)
     path = sanitize_path_string(path)
     try:
-        target = _resolve_path(path)
-        result = write_text_file(target, content or "", append=bool(append))
-        return _tool_ok("write_file", result)
-    except Exception as exc:
-        return _tool_err(
+        logical = str(_resolve_path(path))
+        remember_path(logical)
+        filename = Path(logical).name or "download.txt"
+        return _client_intent_ok(
             "write_file",
-            f"{exc} | home={real_home()} original_path={path!r}",
+            intent_download_file(
+                filename=filename,
+                content=content or "",
+                suggested_path=logical,
+                append=bool(append),
+            ),
         )
+    except Exception as exc:
+        return _tool_err("write_file", f"{exc} | original_path={path!r}")
 
 
 @tool
 def create_directory(path: str, control_allowed: bool = False):
     """
-    Create a folder (and parents) on Sir's Mac.
-    Prefer ~/Desktop/... paths. Requires Allow Control.
-    Use this instead of shell mkdir for reliable folder creation.
+    Package a mkdir request as a CLIENT-SIDE DISPLAY_DATA intent.
+    Prefer ~/Desktop/... logical paths. Brain does not create host folders.
     """
     if not _control_ok(control_allowed):
         return _permission_denied("create_directory")
@@ -463,14 +498,14 @@ def create_directory(path: str, control_allowed: bool = False):
         return _tool_err("create_directory", "path cannot be empty.")
     path = sanitize_path_string(path)
     try:
-        target = _resolve_path(path)
-        result = ensure_directory(target)
-        return _tool_ok("create_directory", result)
-    except Exception as exc:
-        return _tool_err(
+        logical = str(_resolve_path(path))
+        remember_path(logical)
+        return _client_intent_ok(
             "create_directory",
-            f"{exc} | home={real_home()} original_path={path!r}",
+            intent_create_directory(path=logical),
         )
+    except Exception as exc:
+        return _tool_err("create_directory", f"{exc} | original_path={path!r}")
 
 
 @tool
@@ -479,23 +514,21 @@ def list_directory(
     max_entries: int = 200,
     control_allowed: bool = False,
 ):
-    """List files/folders on Sir's Mac. Prefer ~ paths (e.g. ~/Desktop). Requires Allow Control."""
+    """
+    Package a directory listing as a CLIENT-SIDE DISPLAY_DATA intent.
+    The Brain does not enumerate the host filesystem.
+    """
     if not _control_ok(control_allowed):
         return _permission_denied("list_directory")
     try:
         raw = (path or "~").strip() or "~"
-        raw = sanitize_path_string(raw)
-        target = _resolve_path(raw)
-        limit = int(max_entries or 200)
-        if "applications" in str(target).lower():
-            limit = max(limit, 400)
-        body = list_path(target, max_entries=limit)
-        return _tool_ok("list_directory", body)
-    except Exception as exc:
-        return _tool_err(
+        logical = str(_resolve_path(sanitize_path_string(raw)))
+        return _client_intent_ok(
             "list_directory",
-            f"{exc} | home={real_home()} original_path={path!r}",
+            intent_list_directory(path=logical, max_entries=max_entries),
         )
+    except Exception as exc:
+        return _tool_err("list_directory", f"{exc} | original_path={path!r}")
 
 
 @tool
@@ -507,10 +540,9 @@ def run_terminal_command(
     thread_id: str = "web_user_001",
 ):
     """
-    Run a shell command on Sir's Mac. Safe commands (ls, pwd, git status, mkdir) run immediately.
-    Dangerous commands (rm, sudo, install) require Sir to confirm first.
-    Blocked commands (rm -rf /, system edits) are never executed.
-    Always use real paths (~/Desktop/...) — never /Users/yourusername.
+    Package a shell command as a CLIENT-SIDE intent. Never executed on the Brain host.
+    Dangerous commands require confirmation before packaging.
+    Blocked commands are refused entirely.
     """
     if not _control_ok(control_allowed):
         return _permission_denied("run_terminal_command")
@@ -523,49 +555,37 @@ def run_terminal_command(
     if level == "blocked":
         return _tool_err(
             "run_terminal_command",
-            f"BLOCKED: protected system command refused. command={cmd!r}",
+            f"BLOCKED: destructive system command refused by Brain policy. command={cmd!r}",
         )
     if level == "confirm" and not user_confirmed:
         set_pending_confirmation(
             thread_id,
             tool="run_terminal_command",
             command=cmd,
-            reason="potentially dangerous",
+            reason="client-side dangerous command",
             working_directory=(working_directory or "").strip(),
         )
         return _tool_err(
             "run_terminal_command",
-            format_confirmation_request(cmd, reason="potentially dangerous"),
+            format_confirmation_request(cmd, reason="client-side dangerous command"),
         )
 
-    try:
-        wd = sanitize_path_string(working_directory) if working_directory else ""
-        output = run_shell_command(cmd, working_directory=wd)
-        return _tool_ok("run_terminal_command", output)
-    except subprocess.TimeoutExpired:
-        return _tool_err("run_terminal_command", f"Command timed out after 120s: {cmd}")
-    except Exception as exc:
-        return _tool_err(
-            "run_terminal_command",
-            f"{exc} | command={cmd!r} home={real_home()}",
-        )
+    wd = sanitize_path_string(working_directory) if working_directory else ""
+    return _client_intent_ok(
+        "run_terminal_command",
+        intent_run_command(command=cmd, working_directory=wd),
+    )
 
 
 @tool
 def open_url_in_browser(url: str, control_allowed: bool = False):
-    """Open a URL in the system browser. Requires elevated control."""
+    """Package a URL open as a CLIENT-SIDE DISPLAY_DATA intent (no host browser launch)."""
     if not _control_ok(control_allowed):
         return _permission_denied("open_url_in_browser")
     url = (url or "").strip()
     if not url:
         return _tool_err("open_url_in_browser", "URL cannot be empty.")
-    if not url.startswith(("http://", "https://")):
-        url = f"https://{url}"
-    try:
-        webbrowser.open(url)
-        return _tool_ok("open_url_in_browser", f"Browser opened to {url}.")
-    except Exception as exc:
-        return _tool_err("open_url_in_browser", str(exc))
+    return _client_intent_ok("open_url_in_browser", intent_open_url(url=url))
 
 
 @tool

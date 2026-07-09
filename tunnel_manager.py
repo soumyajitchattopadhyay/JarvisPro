@@ -22,6 +22,7 @@ Env (see .env.example):
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -128,16 +129,33 @@ def post_brain_url(tunnel_url: str, *, heartbeat: bool = False) -> bool:
         return False
 
     endpoint = f"{base}/api/update-brain"
+    path = "/api/update-brain"
     payload = {
         "brain_url": tunnel_url.rstrip("/"),
-        "secret_key": secret,
+        "secret_key": secret,  # legacy body field (HMAC headers preferred)
         "heartbeat": heartbeat,
         "source": "tunnel_manager",
     }
+    body_bytes = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "TESrACT-tunnel-manager/1.0",
     }
+    # Cryptographic handshake — HMAC-SHA256 + static token + Bearer
+    try:
+        import brain_auth
+
+        headers.update(
+            brain_auth.sign(
+                method="POST",
+                path=path,
+                body=body_bytes,
+                secret=secret,
+            )
+        )
+    except Exception as exc:
+        _log(f"HMAC sign failed ({exc}); falling back to Bearer secret only")
+        headers["Authorization"] = f"Bearer {secret}"
 
     if httpx is None:
         _log("httpx not installed — pip install httpx")
@@ -145,7 +163,7 @@ def post_brain_url(tunnel_url: str, *, heartbeat: bool = False) -> bool:
 
     try:
         with httpx.Client(timeout=20.0, follow_redirects=True) as client:
-            res = client.post(endpoint, json=payload, headers=headers)
+            res = client.post(endpoint, content=body_bytes, headers=headers)
         if res.status_code >= 400:
             _log(f"Register failed HTTP {res.status_code}: {res.text[:300]}")
             return False

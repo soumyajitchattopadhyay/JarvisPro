@@ -1,14 +1,18 @@
 """
 TESrACT — JARVIS-style agent with smart LLM routing.
 
-Routing (llm_router.py) — local-first on Apple Silicon unified RAM:
-  - Ollama  → light models (Llama 3.2 3B) for Q&A/tools; heavy (Gemma2 9B) for analysis
-  - MLX     → optional Apple Silicon text path when OLLAMA is unavailable
-  - Groq    → cloud fallback + reliable tool calling
-  - Colab   → deepest inference when local RAM is insufficient
-  - Web search results stored in Chroma in-RAM for recall across turns
+Secure Brain architecture:
+  - Host Mac is a cognitive engine (logic, LLM, API orchestration)
+  - No public request may mutate the host OS; physical actions return
+    client-side execution intents (DOWNLOAD_FILE / DISPLAY_DATA / LOGIC_ONLY)
+  - /chat and /api/update-brain require HMAC or shared-secret handshake
 
-Configure via .env: OLLAMA_* , GROQ_API_KEY, COLAB_LLM_URL, LLM_ROUTING_MODE.
+Routing (llm_router.py) — local-first on Apple Silicon unified RAM:
+  - Ollama  → light models for Q&A/tools; heavy for analysis
+  - Groq / Colab → cloud fallbacks
+  - Web search memory in Chroma (in-RAM)
+
+Configure via .env: OLLAMA_* , GROQ_API_KEY, BRAIN_REGISTRY_SECRET, LLM_ROUTING_MODE.
 """
 from __future__ import annotations
 from dotenv import load_dotenv
@@ -21,9 +25,8 @@ import json
 import threading
 import traceback
 import datetime
-import webbrowser
 import re
-from typing import Annotated, TypedDict, List, Callable, cast
+from typing import Annotated, TypedDict, List, Callable, cast, Any
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
@@ -38,6 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import actions
+import brain_auth
 import llm_router
 import mac_access
 from llm_router import (
@@ -192,33 +196,16 @@ def health_check():
 async def update_brain_endpoint(request: Request):
     """
     Register the live Mac Cloudflare tunnel URL.
+    Requires cryptographic handshake (HMAC / shared secret headers).
     Called by tunnel_manager.py whenever a new trycloudflare.com link is minted.
     """
     import brain_registry
 
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
+    _body, payload, auth_err = await brain_auth.gate_brain_auth(request)
+    if auth_err is not None:
+        return auth_err
     if not isinstance(payload, dict):
         payload = {}
-
-    secret = (
-        payload.get("secret_key")
-        or payload.get("secret")
-        or request.headers.get("X-Brain-Secret")
-        or ""
-    )
-    # Also accept Authorization: Bearer <secret>
-    auth = request.headers.get("Authorization", "")
-    if not secret and auth.lower().startswith("bearer "):
-        secret = auth[7:].strip()
-
-    if not brain_registry.verify_secret(str(secret)):
-        return JSONResponse(
-            {"error": "unauthorized", "hint": "Set BRAIN_REGISTRY_SECRET on both Mac and Render"},
-            status_code=403,
-        )
 
     brain_url = str(payload.get("brain_url") or payload.get("url") or "").strip()
     heartbeat = bool(payload.get("heartbeat", False))
@@ -238,6 +225,14 @@ async def update_brain_endpoint(request: Request):
     )
     return {
         "status": "success",
+        "execution_target": "brain",
+        "action": "LOGIC_ONLY",
+        "payload": {
+            "active_url": result.get("brain_url"),
+            "changed": result.get("changed"),
+            "heartbeat": result.get("heartbeat"),
+            "updated_at": result.get("updated_at"),
+        },
         "active_url": result.get("brain_url"),
         "changed": result.get("changed"),
         "heartbeat": result.get("heartbeat"),
@@ -328,17 +323,16 @@ def memory_cleanup_endpoint():
 @app.post("/internal/llm/invoke")
 async def internal_llm_invoke(request: Request):
     """
-    Internal endpoint for hybrid routing — executes LLM inference on this Mac instance.
-    Called by Render/cloud when ENABLE_HYBRID_ROUTING routes through LOCAL_INSTANCE_URL.
+    Internal endpoint for hybrid routing — LLM inference only (no host OS mutation).
+    Requires the same cryptographic handshake as /chat.
     """
-    api_key = os.getenv("LOCAL_INSTANCE_API_KEY", "")
-    if api_key:
-        auth = request.headers.get("Authorization", "")
-        if auth != f"Bearer {api_key}":
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    _raw, body, auth_err = await brain_auth.gate_brain_auth(request)
+    if auth_err is not None:
+        return auth_err
+    if not isinstance(body, dict):
+        body = {}
 
     try:
-        body = await request.json()
         messages = deserialize_messages(body.get("messages") or [])
         if not messages:
             return JSONResponse({"error": "messages required"}, status_code=400)
@@ -360,6 +354,13 @@ async def internal_llm_invoke(request: Request):
             allow_remote_mac=False,
         )
         return {
+            "status": "success",
+            "execution_target": "brain",
+            "action": "LOGIC_ONLY",
+            "payload": {
+                "route": route,
+                "model": llm_router.last_local_model or None,
+            },
             "message": serialize_aimessage(response),
             "route": route,
             "model": llm_router.last_local_model or None,
@@ -512,8 +513,8 @@ def _try_direct_mac_tools(
     needs_control = any(name in actions._CONTROL_GATED for name, _ in planned)
     if needs_control and not control_allowed:
         return (
-            "Mac control is restricted, Sir. Please say 'Allow Control' "
-            "or flip the MAC CONTROL toggle so I can use filesystem and terminal tools."
+            "Client-action authorization is restricted, Sir. Please say 'Allow Control' "
+            "or flip the MAC CONTROL toggle so I can package client execution intents."
         )
 
     tool_messages: list[ToolMessage] = []
@@ -535,15 +536,13 @@ def _try_direct_mac_tools(
 
 
 def try_simple_command(text: str, control_allowed: bool) -> str | None:
-    """Handle very simple commands directly (bypass LLM to save tokens and work under rate limits)."""
+    """Handle simple commands directly. Host OS is never mutated."""
     t = text.lower().strip()
 
-    # Time queries
     if any(kw in t for kw in ["what time", "current time", "tell time", "what's the time"]):
         now = datetime.datetime.now()
         return now.strftime("It is %A, %B %d %Y, %I:%M %p, Sir.")
 
-    # Open sites / URLs (basic support)
     open_match = re.search(r"open\s+([a-zA-Z0-9\.\-]+)", t)
     if open_match:
         site = open_match.group(1).strip()
@@ -559,21 +558,97 @@ def try_simple_command(text: str, control_allowed: bool) -> str | None:
             else:
                 url = site if site.startswith(("http://", "https://")) else f"https://{site}"
         if not control_allowed:
-            return "I need elevated access to open pages, Sir. Please say 'Allow Control'."
-        try:
-            webbrowser.open(url)
-            return f"Opened {url}, Sir."
-        except Exception:
-            return f"Attempted to open {url}, Sir."
+            return "I need authorization to package client actions, Sir. Please say 'Allow Control'."
+        return (
+            f"URL open packaged for the client, Sir: {url}\n"
+            f"{mac_access.intent_open_url(url=url)}"
+        )
 
     return None
 
-# --- TESrACT CORE DIRECTIVES (agentic Jarvis-style) ---
+
+def _harvest_executions(*texts: str) -> list[dict[str, Any]]:
+    """Collect client execution intents from tool/reply text blobs."""
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for text in texts:
+        for intent in mac_access.extract_client_intents(text or ""):
+            key = json.dumps(intent, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(intent)
+    return found
+
+
+def _primary_action_from_executions(
+    executions: list[dict[str, Any]],
+) -> tuple[str, str, dict[str, Any]]:
+    if not executions:
+        return "brain", "LOGIC_ONLY", {}
+    for ex in executions:
+        if ex.get("action") == "DOWNLOAD_FILE":
+            return (
+                str(ex.get("execution_target") or "client"),
+                "DOWNLOAD_FILE",
+                ex.get("payload") if isinstance(ex.get("payload"), dict) else {},
+            )
+    first = executions[0]
+    return (
+        str(first.get("execution_target") or "client"),
+        str(first.get("action") or "DISPLAY_DATA"),
+        first.get("payload") if isinstance(first.get("payload"), dict) else {},
+    )
+
+
+def build_chat_response(
+    reply: str,
+    *,
+    control_status: bool,
+    pending_command: dict | None = None,
+    extra_texts: list[str] | None = None,
+    status: str = "success",
+) -> dict[str, Any]:
+    """
+    Protocol envelope for /chat:
+
+      status, execution_target, action, payload, reply, executions, control_status
+    """
+    blobs = [reply or ""]
+    if extra_texts:
+        blobs.extend(extra_texts)
+    executions = _harvest_executions(*blobs)
+    target, action, payload = _primary_action_from_executions(executions)
+    clean_reply = reply or ""
+    if mac_access.CLIENT_INTENT_MARKER in clean_reply:
+        clean_reply = clean_reply.split(mac_access.CLIENT_INTENT_MARKER)[0].strip()
+        if not clean_reply and executions:
+            pl = executions[0].get("payload") if isinstance(executions[0].get("payload"), dict) else {}
+            clean_reply = str(
+                executions[0].get("reply") or (pl or {}).get("message") or ""
+            ).strip()
+    if not clean_reply:
+        clean_reply = "At your service, Sir."
+
+    return {
+        "status": status,
+        "execution_target": target,
+        "action": action,
+        "payload": payload,
+        "reply": clean_reply,
+        "executions": executions,
+        "control_status": control_status,
+        "pending_command": pending_command,
+    }
+
+
+# --- TESrACT CORE DIRECTIVES (secure Brain mode) ---
 TESRACT_SYSTEM_PROMPT = """You are TESrACT — a genuinely agentic AI assistant (JARVIS-style). Address the user as "Sir".
 
-## Identity
-You solve problems by EXECUTING TOOLS, not by chatting. You operate on Sir's Mac with real capabilities:
-file management, terminal commands, coding tasks, web research, and automation.
+## Identity — Secure Computational Brain
+You are the cognitive engine. You reason, search, calculate, and orchestrate tools.
+You do NOT mutate the host OS. Physical actions become CLIENT-SIDE execution intents.
+Never claim a file was written or a shell command ran on the host — report the client intent.
 
 ## Anti-hallucination rules (CRITICAL — never violate)
 1. NEVER claim you executed an action unless you received a ToolMessage result in this conversation.
@@ -582,58 +657,41 @@ file management, terminal commands, coding tasks, web research, and automation.
 4. If no tool has run yet for Sir's request, your NEXT output MUST be tool_calls (not prose).
 5. Only report facts from tool output. Quote STATUS lines (SUCCESS, PERMISSION_DENIED, etc.) honestly.
 6. NEVER use placeholders like [Insert Current Time], {time}, TODO, or bracketed filler text.
-7. After tools run, your NEXT message must be plain text that copies the RESULT section from ToolMessage exactly.
+7. After tools run, summarize the RESULT (including client intents) in plain text.
 
 ## Two-phase tool workflow
 Phase 1 — Call tools: emit tool_calls only (minimal or empty text).
-Phase 2 — Synthesize: after ToolMessage appears, write a final answer in plain text using the RESULT data. No more tool_calls.
+Phase 2 — Synthesize: after ToolMessage appears, write a final answer using RESULT data.
 
-## Mac access & permission model
-Sir says "Allow Control" once to unlock Mac filesystem and terminal tools for the session.
-Permission persists until Sir says "Stop Control" or the session ends — no need to re-grant each turn.
-While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask Sir for "Allow Control".
+## Permission model (client-action authorization)
+Sir says "Allow Control" to authorize packaging of client-side actions for the session.
+While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask for "Allow Control".
 
-### No elevation needed (safe / read-only cloud tools):
+### No elevation needed (Brain-local / cloud):
   web_search, search_and_summarize, recall_memory, save_memory_note, manage_task_plan,
   generate_image, get_current_time
 
-### Require Allow Control (Mac filesystem & system actions):
+### Require Allow Control (client-intent tools — never host-mutating):
   read_file, write_file, create_directory, list_directory, run_terminal_command,
   execute_python_code, open_url_in_browser
 
-### Terminal safety (run_terminal_command):
-- Safe commands (ls, pwd, git status, cat) run immediately when control is ACTIVE.
-- Dangerous commands (rm, sudo, install, chmod) return CONFIRMATION_REQUIRED — show Sir the exact command and wait.
-- Sir confirms with "Confirm command" or "Yes, run it" — then retry the SAME command with user_confirmed=true.
-- BLOCKED commands (rm -rf /, system path edits) are never executed — explain why and suggest a safer alternative.
-
-### Filesystem safety:
-- Paths: always use ~ or real home (e.g. ~/Desktop/...). NEVER invent /Users/yourusername or other fake usernames.
-- Creating folders → ALWAYS call create_directory (not prose). Prefer ~/Desktop/Name.
-- Creating/editing files → ALWAYS call write_file with the real path and full content.
-- Protected system paths (/System, /usr, /etc, SSH keys) cannot be written or deleted.
-- Prefer non-destructive operations; never delete without explicit Sir request and confirmation.
+### Client execution protocol
+- write_file → DOWNLOAD_FILE intent for the front-end
+- create_directory / list / read / shell / open_url → DISPLAY_DATA intents
+- Pure reasoning / search / time / math → LOGIC_ONLY
+- BLOCKED destructive commands are refused. Dangerous ones need "Confirm command".
+- Paths: use ~ labels (e.g. ~/Desktop/...). NEVER invent /Users/yourusername.
 
 ## Tool guide
-- Image/draw/create picture → generate_image
-- Research/news/look up → search_and_summarize (deep) or web_search (quick)
-- Past context/remember/previous → recall_memory
-- Remember this preference/fact → save_memory_note
-- Complex multi-step work → manage_task_plan
-- Create folder/directory on Mac → create_directory
-- Read/list/edit files on Mac → read_file / list_directory / write_file
-- Shell/terminal/build/git/npm → run_terminal_command
-- Calculate/code snippet → execute_python_code
-- Time/date → get_current_time
-- Open URL → open_url_in_browser
+- Image → generate_image | Research → search_and_summarize / web_search
+- Memory → recall_memory / save_memory_note | Tasks → manage_task_plan
+- Files/folders/shell/URL → corresponding tools (client intents only)
+- Math/code logic → execute_python_code (process-local; no host I/O)
+- Time → get_current_time
 
 ## Error recovery
-If a tool fails: try an alternative tool or approach. Do not give up or hallucinate success.
-If PERMISSION_DENIED: ask Sir for "Allow Control" and retry the same tool.
-If CONFIRMATION_REQUIRED: quote the command to Sir and wait for confirmation — do not claim it ran.
-NEVER say a folder or file was created unless a ToolMessage shows STATUS: SUCCESS for that action.
-
-Use Mac access responsibly to help Sir with coding, file management, and real tasks.
+If PERMISSION_DENIED: ask for "Allow Control". If CONFIRMATION_REQUIRED: quote and wait.
+NEVER say a folder or file was created on the Mac host — say it was packaged for the client.
 Reply concisely in character. Be proactive, precise, and evidence-based."""
 
 PROTOCOLS = {"CORE": TESRACT_SYSTEM_PROMPT}  # kept for backward compat in status messages
@@ -879,7 +937,7 @@ def _try_execute_pending_command(
     thread_id: str,
     control_allowed: bool,
 ) -> str | None:
-    """Run a previously queued shell command after Sir confirms."""
+    """Package a previously queued shell command as a client intent after Sir confirms."""
     if not control_allowed or not mac_access.is_confirmation_message(user_text):
         return None
     pending = mac_access.get_pending_confirmation(thread_id)
@@ -900,8 +958,8 @@ def _try_execute_pending_command(
     mac_access.clear_pending_confirmation(thread_id)
     body = _parse_tool_result(result)
     if "STATUS: ERROR" in result.upper():
-        return f"I could not run the command, Sir. {body}"
-    return f"Command executed, Sir.\n\n{body}"
+        return f"I could not package the command, Sir. {body}"
+    return f"Command packaged for client-side execution, Sir.\n\n{body}"
 
 
 def _format_tool_fallback_reply(tool_messages: list[ToolMessage]) -> str:
@@ -1533,8 +1591,8 @@ def synthesize_node(state: JProState) -> dict[str, object]:
         err_body = error_msgs[0]
         if "PERMISSION_DENIED" in err_body.upper() or "PERMISSION_DENIED" in str(turn_tools[0].content or "").upper():
             reply = (
-                "Mac control is restricted, Sir. Please say 'Allow Control' "
-                "so I can use filesystem and terminal tools."
+                "Client-action authorization is restricted, Sir. Please say 'Allow Control' "
+                "so I can package filesystem and system intents for the client."
             )
         else:
             reply = f"I encountered a tool error, Sir. {err_body}"
@@ -1669,12 +1727,34 @@ async def permission_set(request: Request):
 
 @app.post("/chat")
 async def chat_endpoint(request: Request):
-    """Main chat endpoint used by the Three.js frontend. Full agentic flow."""
+    """
+    Main chat endpoint. Requires cryptographic handshake for non-localhost callers.
+    Physical host actions are never executed — returned as client execution intents.
+    """
     try:
-        payload = await request.json()
+        _raw, payload, auth_err = await brain_auth.gate_brain_auth(request)
+        if auth_err is not None:
+            return auth_err
+        if not isinstance(payload, dict):
+            payload = {}
+
         user_text = (payload.get("text") or "").strip()
         thread_id = "web_user_001"
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+
+        def _respond(reply: str, *, pending: dict | None = ..., extra: list[str] | None = None):
+            allowed_now = _perm.is_control_allowed()
+            pend = (
+                mac_access.get_pending_confirmation(thread_id)
+                if pending is ...
+                else pending
+            )
+            return build_chat_response(
+                reply,
+                control_status=allowed_now,
+                pending_command=pend,
+                extra_texts=extra,
+            )
 
         # --- Control commands (Allow / Stop) — only writer besides the toggle ---
         was_allowed = _perm.is_control_allowed()
@@ -1684,48 +1764,33 @@ async def chat_endpoint(request: Request):
             if not perm_reply:
                 perm_reply = PERMISSION_GRANTED_REPLY if current_allowed else PERMISSION_REVOKED_REPLY
             _run_speak(perm_reply)
-            return {
-                "reply": perm_reply,
-                "control_status": current_allowed,
-                "pending_command": mac_access.get_pending_confirmation(thread_id),
-            }
+            return _respond(perm_reply)
 
         current_allowed = _perm.is_control_allowed()
 
-        # Handle simple commands directly (bypass LLM entirely to save tokens and remain usable under rate limits)
         simple_reply = try_simple_command(user_text, current_allowed)
         if simple_reply:
-            _run_speak(simple_reply)
-            return {
-                "reply": simple_reply,
-                "control_status": current_allowed,
-                "pending_command": mac_access.get_pending_confirmation(thread_id),
-            }
+            spoken = simple_reply.split(mac_access.CLIENT_INTENT_MARKER)[0].strip() or simple_reply
+            _run_speak(spoken)
+            return _respond(simple_reply)
 
         confirmed_reply = _try_execute_pending_command(
             user_text, thread_id=thread_id, control_allowed=current_allowed,
         )
         if confirmed_reply:
-            _run_speak(confirmed_reply)
-            return {
-                "reply": confirmed_reply,
-                "control_status": current_allowed,
-                "pending_command": None,
-            }
+            spoken = confirmed_reply.split(mac_access.CLIENT_INTENT_MARKER)[0].strip()
+            _run_speak(spoken or "Command packaged for the client, Sir.")
+            return _respond(confirmed_reply, pending=None)
 
-        # Fast path: pure filesystem/time tools — skip the LLM (avoids recursion / temporary issue)
+        # Fast path: client-intent tools / time — skip the LLM
         direct_reply = _try_direct_mac_tools(
             user_text, control_allowed=current_allowed, thread_id=thread_id,
         )
         if direct_reply:
-            _run_speak(direct_reply)
-            return {
-                "reply": direct_reply,
-                "control_status": current_allowed,
-                "pending_command": mac_access.get_pending_confirmation(thread_id),
-            }
+            spoken = direct_reply.split(mac_access.CLIENT_INTENT_MARKER)[0].strip()
+            _run_speak(spoken or direct_reply[:200])
+            return _respond(direct_reply)
 
-        # Standard agent graph — pass current flag; tools also re-read the file
         inputs = cast(JProState, {
             "messages": [HumanMessage(content=user_text)],
             "control_allowed": current_allowed,
@@ -1745,15 +1810,10 @@ async def chat_endpoint(request: Request):
                 user_text, control_allowed=current_allowed, thread_id=thread_id,
             )
             if recovery:
-                return {
-                    "reply": recovery,
-                    "control_status": current_allowed,
-                    "pending_command": mac_access.get_pending_confirmation(thread_id),
-                }
-            return {
-                "reply": "TESrACT is rate-limited right now, Sir. Basic commands like time or open may still work.",
-                "control_status": current_allowed,
-            }
+                return _respond(recovery)
+            return _respond(
+                "TESrACT is rate-limited right now, Sir. Basic commands like time may still work.",
+            )
         except Exception as e:
             print(f"[TESrACT] Graph invoke error: {e}")
             traceback.print_exc()
@@ -1761,15 +1821,8 @@ async def chat_endpoint(request: Request):
                 user_text, control_allowed=current_allowed, thread_id=thread_id,
             )
             if recovery:
-                return {
-                    "reply": recovery,
-                    "control_status": current_allowed,
-                    "pending_command": mac_access.get_pending_confirmation(thread_id),
-                }
-            return {
-                "reply": "I encountered a temporary issue. Please try again shortly, Sir.",
-                "control_status": current_allowed,
-            }
+                return _respond(recovery)
+            return _respond("I encountered a temporary issue. Please try again shortly, Sir.")
 
         final_state = compiled_app.get_state(config)
         state_values = final_state.values if final_state else None
@@ -1778,6 +1831,7 @@ async def chat_endpoint(request: Request):
         final_reply = extract_final_reply(messages)
 
         tools_used: list[str] = []
+        tool_blobs: list[str] = []
         for msg in reversed(messages):
             if isinstance(msg, HumanMessage):
                 break
@@ -1785,30 +1839,28 @@ async def chat_endpoint(request: Request):
                 name = str(getattr(msg, "name", "") or "").strip()
                 if name:
                     tools_used.append(name)
+                tool_blobs.append(str(msg.content or ""))
         tools_used.reverse()
+        tool_blobs.reverse()
         try:
             store_turn_summary(user_text, final_reply, tools_used=tools_used)
         except Exception as mem_exc:
             print(f"[TESrACT] Turn memory store skipped: {mem_exc}")
 
-        # Do NOT rewrite permission from graph state — flag only changes via toggle / control commands
         current_allowed = _perm.is_control_allowed()
+        spoken = final_reply.split(mac_access.CLIENT_INTENT_MARKER)[0].strip() if final_reply else ""
+        _run_speak(spoken or final_reply)
 
-        _run_speak(final_reply)
-
-        return {
-            "reply": final_reply,
-            "control_status": current_allowed,
-            "pending_command": mac_access.get_pending_confirmation(thread_id),
-        }
+        return _respond(final_reply, extra=tool_blobs)
 
     except Exception as e:
         print("--- /chat ERROR ---")
         traceback.print_exc()
-        return {
-            "reply": "TESrACT is having a temporary issue. Please try again shortly, Sir.",
-            "control_status": _perm.is_control_allowed(),
-        }
+        return build_chat_response(
+            "TESrACT is having a temporary issue. Please try again shortly, Sir.",
+            control_status=_perm.is_control_allowed(),
+            status="error",
+        )
 
 
 # --- EXECUTION LOOP ---

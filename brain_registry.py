@@ -60,11 +60,17 @@ def secret_configured() -> bool:
 
 
 def verify_secret(provided: str | None) -> bool:
+    """Constant-time compare against the shared brain secret."""
     expected = _secret()
     if not expected:
         # Fail closed when no secret is configured — prevent open rewrite of the brain URL.
         return False
-    return (provided or "").strip() == expected
+    try:
+        import hmac
+
+        return hmac.compare_digest((provided or "").strip(), expected)
+    except Exception:
+        return (provided or "").strip() == expected
 
 
 def _allow_any_host() -> bool:
