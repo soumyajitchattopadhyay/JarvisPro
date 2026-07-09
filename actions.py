@@ -288,6 +288,140 @@ def _search_tavily(query: str, max_results: int = 5) -> tuple[str, list[dict[str
     return summary, hits
 
 
+def _search_wikipedia(query: str, max_results: int = 5) -> tuple[str, list[dict[str, str]]]:
+    """
+    Free Wikipedia search + page summary. Much more reliable for factual
+    questions (sports results, capitals, etc.) than flaky DDG scrapers.
+    """
+    headers = {
+        "User-Agent": "TESrACT/1.0 (local assistant; contact: local)",
+        "Accept": "application/json",
+    }
+    with httpx.Client(timeout=20.0, headers=headers, follow_redirects=True) as client:
+        search_res = client.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": max_results,
+                "format": "json",
+            },
+        )
+        search_res.raise_for_status()
+        search_data = search_res.json()
+        results = (search_data.get("query") or {}).get("search") or []
+        if not results:
+            raise RuntimeError("Wikipedia returned no search hits")
+
+        hits: list[dict[str, str]] = []
+        summary = ""
+        for i, hit in enumerate(results[:max_results]):
+            title = str(hit.get("title") or "Untitled")
+            page_id = hit.get("pageid")
+            snippet = re.sub(r"<[^>]+>", "", str(hit.get("snippet") or ""))
+            url = f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}"
+            body = snippet
+            # Enrich the top hit: plain extract + parsed lead HTML (infobox scores).
+            if i == 0 and title:
+                try:
+                    ext_res = client.get(
+                        "https://en.wikipedia.org/w/api.php",
+                        params={
+                            "action": "query",
+                            "prop": "extracts",
+                            "explaintext": 1,
+                            "exchars": 4500,
+                            "redirects": 1,
+                            "titles": title,
+                            "format": "json",
+                        },
+                    )
+                    extract = ""
+                    if ext_res.status_code == 200:
+                        pages = (ext_res.json().get("query") or {}).get("pages") or {}
+                        for page in pages.values():
+                            extract = (page.get("extract") or "").strip()
+                            if extract:
+                                body = extract
+                                break
+
+                    # Parse section 0 HTML — includes infobox lines like
+                    # "Argentina won 4–2 on penalties" that extracts often drop.
+                    parse_res = client.get(
+                        "https://en.wikipedia.org/w/api.php",
+                        params={
+                            "action": "parse",
+                            "page": title,
+                            "prop": "text",
+                            "section": 0,
+                            "format": "json",
+                            "redirects": 1,
+                        },
+                    )
+                    parsed_text = ""
+                    if parse_res.status_code == 200:
+                        try:
+                            from html import unescape as _unescape
+
+                            html = parse_res.json().get("parse", {}).get("text", {}).get("*", "")
+                            parsed_text = re.sub(r"<[^>]+>", " ", html or "")
+                            parsed_text = re.sub(r"\s+", " ", _unescape(parsed_text)).strip()
+                        except Exception:
+                            parsed_text = ""
+
+                    outcome_bits: list[str] = []
+                    for blob in (parsed_text, extract):
+                        if not blob:
+                            continue
+                        for pat in (
+                            r"([A-Z][A-Za-z .]{2,40}\s+won\s+\d[–-]\d\s+on\s+penalties)",
+                            r"([A-Z][A-Za-z .]{2,40}\s+won\s+the\s+(?:match|final|tournament)[^.]*\.)",
+                            r"((?:won|defeated|beat)\s+by\s+[A-Z][A-Za-z .]{2,40}[^.]*\.)",
+                        ):
+                            m = re.search(pat, blob, flags=re.I)
+                            if m:
+                                outcome_bits.append(m.group(1).strip())
+                    # Dedup
+                    seen = set()
+                    outcomes = []
+                    for bit in outcome_bits:
+                        key = bit.lower()
+                        if key not in seen:
+                            seen.add(key)
+                            outcomes.append(bit)
+
+                    lead = (extract.split("\n\n")[0] if extract else snippet)[:700].strip()
+                    if outcomes:
+                        summary = (lead + " " + " ".join(outcomes[:2])).strip()
+                        body = summary + ("\n\n" + extract if extract else "")
+                    elif extract:
+                        summary = extract[:1200]
+                    elif parsed_text:
+                        summary = parsed_text[:1200]
+                        body = summary
+
+                    sum_res = client.get(
+                        f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title.replace(' ', '_'))}"
+                    )
+                    if sum_res.status_code == 200:
+                        sum_data = sum_res.json()
+                        if sum_data.get("content_urls", {}).get("desktop", {}).get("page"):
+                            url = sum_data["content_urls"]["desktop"]["page"]
+                        if not summary:
+                            extract2 = (sum_data.get("extract") or "").strip()
+                            if extract2:
+                                body = extract2
+                                summary = extract2
+                except Exception:
+                    pass
+            hits.append({"title": title, "body": body, "url": url})
+
+        if not summary and hits:
+            summary = hits[0].get("body") or ""
+        return summary, hits
+
+
 def _format_search_results(
     query: str,
     hits: list[dict[str, str]],
@@ -331,16 +465,23 @@ def _run_web_search(query: str, *, max_results: int = 5, focus: str = "") -> str
     provider = "duckduckgo"
     summary = ""
     hits: list[dict[str, str]] = []
-    last_error = ""
+    errors: list[str] = []
 
-    # Prefer Tavily when configured; always fall back to DuckDuckGo.
+    # Prefer Tavily when configured; then Wikipedia (reliable facts); then DuckDuckGo.
     if os.getenv("TAVILY_API_KEY", "").strip():
         try:
             provider = "tavily"
             summary, hits = _search_tavily(query, max_results=max_results)
         except Exception as exc:
-            last_error = f"tavily: {exc}"
-            provider = "duckduckgo"
+            errors.append(f"tavily: {exc}")
+            hits = []
+
+    if not hits:
+        try:
+            provider = "wikipedia"
+            summary, hits = _search_wikipedia(query, max_results=max_results)
+        except Exception as exc:
+            errors.append(f"wikipedia: {exc}")
             hits = []
 
     if not hits:
@@ -348,14 +489,13 @@ def _run_web_search(query: str, *, max_results: int = 5, focus: str = "") -> str
             provider = "duckduckgo"
             hits = _search_duckduckgo(query, max_results=max_results)
         except Exception as exc:
-            detail = str(exc)
-            if last_error:
-                detail = f"{last_error}; {detail}"
-            return f"Search Error: {detail}"
+            errors.append(f"duckduckgo: {exc}")
+            hits = []
 
     if not hits:
+        detail = "; ".join(errors) if errors else "no providers returned results"
         return (
-            f"Search Error: no web results for {query!r}. "
+            f"Search Error: no web results for {query!r} ({detail}). "
             "Try a more specific query, or set TAVILY_API_KEY for a paid search API."
         )
 
@@ -686,12 +826,42 @@ def open_url_in_browser(url: str, control_allowed: bool = False):
     return _client_intent_ok("open_url_in_browser", intent_open_url(url=url))
 
 
+def _resolve_display_timezone():
+    """
+    Timezone for user-facing clock answers.
+
+    Priority:
+      1. TESRACT_TIMEZONE (e.g. Asia/Kolkata)
+      2. TZ
+      3. System local timezone
+    """
+    name = (os.getenv("TESRACT_TIMEZONE") or os.getenv("TZ") or "").strip()
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+
+            return ZoneInfo(name), name
+        except Exception:
+            pass
+    # Fall back to the host's local tz (Mac = IST for this project; Render = often UTC).
+    return datetime.datetime.now().astimezone().tzinfo, (
+        datetime.datetime.now().astimezone().tzname() or "local"
+    )
+
+
+def format_current_time() -> str:
+    """Human-readable current time with explicit timezone (never bare UTC on Render)."""
+    tz, label = _resolve_display_timezone()
+    now = datetime.datetime.now(tz) if tz is not None else datetime.datetime.now()
+    # %Z may be empty for some ZoneInfo builds — always append a clear label.
+    zone = now.strftime("%Z") or label or "local"
+    return now.strftime(f"It is %A, %B %d %Y, %I:%M %p {zone}.")
+
+
 @tool
 def get_current_time() -> str:
     """Returns the current local date and time. Use when Sir asks about time, date, or 'what day is it'. Always call this tool — never guess the time."""
-    now = datetime.datetime.now()
-    formatted = now.strftime("It is %A, %B %d %Y, %I:%M %p.")
-    return _tool_ok("get_current_time", formatted)
+    return _tool_ok("get_current_time", format_current_time())
 
 
 def _load_task_plan() -> dict:
@@ -868,6 +1038,18 @@ _SEARCH_QUERY_RE = re.compile(
     r"\b(search|look up|lookup|research|find out|latest|news about|web search)\b",
     re.IGNORECASE,
 )
+# Factual / current-events questions that MUST hit the web, not model memory.
+_FACT_SEARCH_RE = re.compile(
+    r"\b("
+    r"who won|who is the|who was the|who are the|"
+    r"what is the (?:current|latest|score)|what happened|"
+    r"when did|when was|when is the|"
+    r"world cup|fifa|olympics|election|prime minister|president of|"
+    r"stock price|weather in|score of|final of|"
+    r"which (?:team|country|player)|how many (?:goals|votes|seats)"
+    r")\b",
+    re.IGNORECASE,
+)
 _SEARCH_DEEP_RE = re.compile(
     r"\b(research|summarize|summary|deep dive|find out about|comprehensive)\b",
     re.IGNORECASE,
@@ -892,6 +1074,35 @@ def _clean_search_query(text: str) -> str:
         return q
     cleaned = _SEARCH_WRAPPER_RE.sub("", q).strip()
     cleaned = _SEARCH_TRAILING_RE.sub("", cleaned).strip(" .,?!")
+
+    # Rewrite factoid phrasings so DDG does not latch onto "won" (currency) etc.
+    who_won = re.match(
+        r"^(?:who\s+won)\s+(?:the\s+)?(.+?)\??$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if who_won:
+        topic = who_won.group(1).strip()
+        if topic:
+            cleaned = f"{topic} winner"
+    else:
+        who_is = re.match(
+            r"^(?:who\s+is|who\s+was)\s+(?:the\s+)?(.+?)\??$",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if who_is:
+            topic = who_is.group(1).strip()
+            if topic:
+                cleaned = topic
+
+    # Prefer keyword form for major tournaments — "final" ranks better on Wikipedia
+    # than "winner" (which often returns a generic tournament overview page).
+    if re.search(r"\bfifa\b.*\bworld\s*cup\b|\bworld\s*cup\b.*\bfifa\b", cleaned, re.I):
+        year = re.search(r"\b(19|20)\d{2}\b", cleaned)
+        y = year.group(0) if year else ""
+        cleaned = f"{y} FIFA World Cup final".strip()
+
     # Avoid empty / ultra-short leftovers after stripping wrappers
     if len(cleaned) >= 2:
         return cleaned
@@ -1419,8 +1630,8 @@ def infer_forced_tools(user_text: str) -> list[tuple[str, dict]]:
         if cmd:
             inferred.append(("run_terminal_command", {"command": rewrite_paths_in_command(cmd)}))
 
-    if _SEARCH_QUERY_RE.search(text):
-        query = _clean_search_query(text)
+    if _SEARCH_QUERY_RE.search(text) or _FACT_SEARCH_RE.search(text):
+        query = _clean_search_query(text) or text
         if _SEARCH_DEEP_RE.search(text):
             inferred.append(("search_and_summarize", {"query": query, "focus": ""}))
         else:

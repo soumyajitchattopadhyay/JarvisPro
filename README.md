@@ -63,6 +63,20 @@ https://YOUR-APP.onrender.com/go
 When the free tunnel drops, `tunnel_manager` restarts cloudflared, scrapes the new
 URL, and updates Render again — no manual `.env` edits.
 
+## Hybrid: Render edge → Mac brain
+
+When `ENABLE_HYBRID_ROUTING=true` on Render and `tunnel_manager.py` is healthy:
+
+1. The **browser talks to Render** (stable URL).
+2. Render **proxies full `/chat`** to the live Mac tunnel (tools + LLM run on the Mac).
+3. Fallback: if the Mac is offline, Render answers locally (Groq + edge tools).
+
+Check `/health` → `hybrid.proxy_chat_to_brain` / `hybrid.remote_mac_healthy`.
+Chat responses may include `"brain_route": "mac_proxy"` when the Mac handled the turn.
+
+Set on Render: `TESRACT_ROLE=edge`, `TESRACT_TIMEZONE=Asia/Kolkata` (or your zone).
+Set on Mac: `TESRACT_TIMEZONE=Asia/Kolkata` (host local is usually enough).
+
 ## Secure Brain architecture
 
 The Mac process is a **cognitive engine** only:

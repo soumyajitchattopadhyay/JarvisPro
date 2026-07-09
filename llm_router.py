@@ -690,6 +690,32 @@ def remote_mac_is_healthy(force: bool = False, *, log_failure: bool = True) -> b
     return ok
 
 
+def is_brain_host() -> bool:
+    """
+    True when THIS process is the Mac computational brain (local Ollama).
+
+    Render / edge hosts have no Ollama and should proxy full /chat to the Mac.
+    Override with TESRACT_ROLE=brain|edge if auto-detect is wrong.
+    """
+    role = (os.getenv("TESRACT_ROLE") or "").strip().lower()
+    if role in ("brain", "mac", "local"):
+        return True
+    if role in ("edge", "render", "cloud", "proxy"):
+        return False
+    return ollama_is_healthy(log_failure=False)
+
+
+def should_proxy_chat_to_brain() -> bool:
+    """Render/edge should forward the full agent turn to the live Mac tunnel."""
+    if is_brain_host():
+        return False
+    if not hybrid_routing_enabled():
+        return False
+    if not remote_mac_configured():
+        return False
+    return remote_mac_is_healthy(log_failure=False)
+
+
 def hybrid_status() -> dict[str, Any]:
     """Snapshot for /health and startup logs."""
     enabled = hybrid_routing_enabled()
@@ -709,6 +735,8 @@ def hybrid_status() -> dict[str, Any]:
         "remote_mac_healthy": healthy,
         "remote_ram_available_gb": ram,
         "direct_ollama_healthy": ollama_is_healthy(log_failure=False),
+        "is_brain_host": is_brain_host(),
+        "proxy_chat_to_brain": should_proxy_chat_to_brain(),
         "brain_registry": True,
     }
 

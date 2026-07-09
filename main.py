@@ -55,6 +55,9 @@ from llm_router import (
     hybrid_status,
     deserialize_messages,
     serialize_aimessage,
+    should_proxy_chat_to_brain,
+    get_local_instance_url,
+    remote_mac_is_healthy,
 )
 from local_search_memory import (
     format_memory_for_system,
@@ -485,6 +488,9 @@ def sync_graph_permission(
 
 
 # Tools that can run without the LLM (reliable when local models skip tool_calls).
+# NOTE: web_search / search_and_summarize intentionally excluded — they still need
+# the graph's synthesize step so Sir gets a real answer, not a raw source dump.
+# force_tools_node still runs them when the model fails to emit tool_calls.
 _DIRECT_MAC_TOOLS = frozenset({
     "list_directory",
     "read_file",
@@ -492,9 +498,6 @@ _DIRECT_MAC_TOOLS = frozenset({
     "create_directory",
     "run_terminal_command",
     "get_current_time",
-    # Web search must not depend on the model emitting tool_calls — DDG is deterministic.
-    "web_search",
-    "search_and_summarize",
     "recall_memory",
 })
 
@@ -546,8 +549,8 @@ def try_simple_command(text: str, control_allowed: bool) -> str | None:
     t = text.lower().strip()
 
     if any(kw in t for kw in ["what time", "current time", "tell time", "what's the time"]):
-        now = datetime.datetime.now()
-        return now.strftime("It is %A, %B %d %Y, %I:%M %p, Sir.")
+        # Use timezone-aware formatter (TESRACT_TIMEZONE / host local) — never bare UTC guess.
+        return f"{actions.format_current_time().rstrip('.')}, Sir."
 
     open_match = re.search(r"open\s+([a-zA-Z0-9\.\-]+)", t)
     if open_match:
@@ -898,23 +901,33 @@ def _tool_calls_pending(messages: list[BaseMessage]) -> bool:
 
 
 def _pending_tool_synthesis(messages: list[BaseMessage]) -> bool:
-    """True when tools ran this turn but no trustworthy final plain-text AI reply exists yet."""
-    saw_tool = False
-    turn_tools: list[ToolMessage] = []
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage):
-            if getattr(msg, "tool_calls", None):
-                continue
-            text = str(msg.content or "")
-            if _is_valid_synthesis(text) and _reply_uses_tool_evidence(text, turn_tools):
-                return False
-        if isinstance(msg, ToolMessage):
-            saw_tool = True
-            turn_tools.append(msg)
+    """True when tools ran this turn but no post-tool plain-text AI reply exists yet.
+
+    Critical: walk the *current turn only* (after the last HumanMessage) and require
+    an AI message that appears *after* the last ToolMessage. The previous logic
+    inspected messages in reverse with an empty tool list first, so valid
+    synthesises never counted — force_tools → synthesize → reviewer looped until
+    GraphRecursionError ("temporary issue" after ~15s).
+    """
+    turn: list[BaseMessage] = []
+    for msg in reversed(messages or []):
         if isinstance(msg, HumanMessage):
             break
-    turn_tools.reverse()
-    return saw_tool
+        turn.append(msg)
+    turn.reverse()
+
+    last_tool_i = -1
+    for i, msg in enumerate(turn):
+        if isinstance(msg, ToolMessage):
+            last_tool_i = i
+    if last_tool_i < 0:
+        return False
+
+    for msg in turn[last_tool_i + 1 :]:
+        if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+            if str(msg.content or "").strip():
+                return False  # synthesis (or any final text) already present
+    return True
 
 
 def _current_turn_tool_messages(messages: list[BaseMessage]) -> list[ToolMessage]:
@@ -968,6 +981,45 @@ def _try_execute_pending_command(
     return f"Command packaged for client-side execution, Sir.\n\n{body}"
 
 
+def _extract_search_answer(body: str) -> str:
+    """
+    Build a readable answer from web_search tool output when LLM synthesis is unavailable.
+    Prefers an explicit Summary section; otherwise lists the top source titles/snippets.
+    """
+    text = (body or "").strip()
+    if not text:
+        return ""
+    # Explicit summary block from Tavily / format_search_results
+    if "## Summary" in text:
+        after = text.split("## Summary", 1)[1]
+        summary = after.split("## Sources", 1)[0].strip()
+        if summary:
+            return summary
+    sources: list[str] = []
+    current_title = ""
+    current_snip = ""
+    for line in text.splitlines():
+        m = re.match(r"^\s*\d+\.\s+\*\*(.+?)\*\*\s*$", line)
+        if m:
+            if current_title:
+                sources.append(f"• {current_title}" + (f" — {current_snip}" if current_snip else ""))
+            current_title = m.group(1).strip()
+            current_snip = ""
+            continue
+        if line.strip().startswith("URL:"):
+            continue
+        if current_title and line.strip() and not line.strip().startswith("["):
+            # First non-empty content line under a title is the snippet
+            if not current_snip:
+                current_snip = line.strip()[:220]
+    if current_title:
+        sources.append(f"• {current_title}" + (f" — {current_snip}" if current_snip else ""))
+    if not sources:
+        return text[:800]
+    head = "Here is what I found, Sir:"
+    return head + "\n" + "\n".join(sources[:5])
+
+
 def _format_tool_fallback_reply(tool_messages: list[ToolMessage]) -> str:
     """Build a user-facing reply directly from tool output when the LLM fails to synthesize."""
     if not tool_messages:
@@ -991,7 +1043,11 @@ def _format_tool_fallback_reply(tool_messages: list[ToolMessage]) -> str:
         if name == "create_directory":
             # body is e.g. "Created directory: /Users/.../Foo"
             lines.append(body[:800])
-        elif name in ("web_search", "search_and_summarize", "recall_memory", "run_terminal_command"):
+        elif name in ("web_search", "search_and_summarize"):
+            # Prefer a tight extract for the HUD when LLM synthesis is skipped.
+            summary = _extract_search_answer(body)
+            lines.append(summary[:1500] if summary else body[:1200])
+        elif name in ("recall_memory", "run_terminal_command"):
             lines.append(body[:1200])
         elif name in ("read_file", "write_file", "list_directory"):
             # Apps listing can be long — keep a useful chunk
@@ -1421,12 +1477,20 @@ def _tool_call_as_dict(tc: object) -> dict:
     return out
 
 
+def _last_user_text(messages: list) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, HumanMessage):
+            return str(msg.content or "").strip()
+    return ""
+
+
 def _inject_mac_tool_args(
     tc: object,
     *,
     control_allowed: bool,
     thread_id: str,
     command_confirmed: bool,
+    user_text: str = "",
 ) -> dict:
     """Force session permission + confirmation flags onto gated tool calls."""
     call = _tool_call_as_dict(tc)
@@ -1450,6 +1514,12 @@ def _inject_mac_tool_args(
             args["user_confirmed"] = True
         else:
             args["user_confirmed"] = False
+    # Models often emit web_search({}) with an empty query — recover from Sir's text.
+    if name in ("web_search", "search_and_summarize", "recall_memory"):
+        q = str(args.get("query") or "").strip()
+        if not q and user_text:
+            cleaned = actions._clean_search_query(user_text) if hasattr(actions, "_clean_search_query") else user_text
+            args["query"] = (cleaned or user_text).strip()
     return call
 
 
@@ -1459,6 +1529,7 @@ def execute_tools(state: JProState):
     thread_id = str(state.get("thread_id") or "web_user_001")
     command_confirmed = bool(state.get("command_confirmed", False))
     allowed = _perm.is_control_allowed()
+    user_text = _last_user_text(messages)
     exec_state: dict = {
         **dict(state),
         "control_allowed": allowed,
@@ -1476,6 +1547,7 @@ def execute_tools(state: JProState):
                     control_allowed=allowed,
                     thread_id=thread_id,
                     command_confirmed=command_confirmed,
+                    user_text=user_text,
                 )
                 patched_calls.append(patched)
                 print(
@@ -1637,7 +1709,14 @@ def route_after_agent(state: JProState):
 
 def route_after_reviewer(state: JProState):
     messages = state.get("messages", [])
-    # Prefer deterministic tools before another LLM retry
+    # Hard stop: tools already ran and we have a post-tool AI reply → END.
+    # Prevents force_tools ↔ synthesize recursion (GraphRecursionError).
+    if not _pending_tool_synthesis(messages) and _current_turn_tool_messages(messages):
+        last = messages[-1] if messages else None
+        if isinstance(last, AIMessage) and not getattr(last, "tool_calls", None) and str(last.content or "").strip():
+            return END
+
+    # Prefer deterministic tools before another LLM retry (only if no tools yet)
     if _should_force_tools(state):
         return "force_tools"
     if messages and isinstance(messages[-1], SystemMessage):
@@ -1731,6 +1810,68 @@ async def permission_set(request: Request):
     }
 
 
+async def _proxy_chat_to_mac_brain(payload: dict) -> dict | None:
+    """
+    Forward the full agent turn to the live Mac tunnel.
+
+    Why: hybrid LLM-only routing still ran tools on Render (UTC clock, no
+    Mac-side search fix). Proxying /chat makes the Mac the real brain.
+    Returns None when proxy is unavailable so the edge can fall back locally.
+    """
+    if not should_proxy_chat_to_brain():
+        return None
+    base = get_local_instance_url()
+    if not base:
+        return None
+
+    import httpx
+
+    body = dict(payload or {})
+    body_bytes = json.dumps(body).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "TESrACT-edge-proxy/1.0",
+        "X-TESrACT-Proxied": "1",
+        "ngrok-skip-browser-warning": "true",
+    }
+    try:
+        headers.update(
+            brain_auth.sign(
+                method="POST",
+                path="/chat",
+                body=body_bytes,
+            )
+        )
+    except Exception:
+        secret = (
+            os.getenv("BRAIN_REGISTRY_SECRET")
+            or os.getenv("LOCAL_INSTANCE_API_KEY")
+            or ""
+        ).strip()
+        if secret:
+            headers["Authorization"] = f"Bearer {secret}"
+
+    timeout = float(os.getenv("LOCAL_INSTANCE_TIMEOUT", "120") or "120")
+    try:
+        print(f"[TESrACT:proxy] Forwarding /chat → Mac brain {base[:64]}")
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            res = await client.post(f"{base.rstrip('/')}/chat", content=body_bytes, headers=headers)
+        if res.status_code >= 400:
+            print(f"[TESrACT:proxy] Mac /chat failed HTTP {res.status_code}: {res.text[:300]}")
+            return None
+        data = res.json()
+        if not isinstance(data, dict):
+            return None
+        # Tag response so the HUD / debugging can confirm Mac path.
+        data.setdefault("brain_route", "mac_proxy")
+        data.setdefault("brain_url", base)
+        print("[TESrACT:proxy] Mac /chat OK")
+        return data
+    except Exception as exc:
+        print(f"[TESrACT:proxy] Mac /chat error: {exc}")
+        return None
+
+
 @app.post("/chat")
 async def chat_endpoint(request: Request):
     """
@@ -1740,9 +1881,17 @@ async def chat_endpoint(request: Request):
     Strict handshake still protects /api/update-brain and /internal/llm/invoke
     (Render → Mac hybrid). Set BRAIN_AUTH_REQUIRE_CHAT=true to lock /chat down.
 
+    On Render (edge): when the Mac tunnel is healthy, the FULL turn is proxied
+    to the Mac so tools (time, web search) run on the brain host — not UTC/Render.
+
     Physical host actions are never executed — returned as client execution intents.
     """
     try:
+        # Reject nested proxy loops (brain must execute locally).
+        if (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1":
+            # Already on the brain (or a misconfigured hop) — do not re-proxy.
+            pass
+
         _raw, payload, auth_err = await brain_auth.gate_chat_auth(request)
         if auth_err is not None:
             return auth_err
@@ -1760,12 +1909,22 @@ async def chat_endpoint(request: Request):
                 if pending is ...
                 else pending
             )
-            return build_chat_response(
+            out = build_chat_response(
                 reply,
                 control_status=allowed_now,
                 pending_command=pend,
                 extra_texts=extra,
             )
+            out["brain_route"] = "local"
+            return out
+
+        # --- Edge → Mac full-chat proxy (tools + LLM on Mac) ---
+        already_proxied = (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1"
+        if not already_proxied and should_proxy_chat_to_brain():
+            proxied = await _proxy_chat_to_mac_brain(payload)
+            if proxied is not None and (proxied.get("reply") or proxied.get("status") == "success"):
+                return proxied
+            print("[TESrACT:proxy] Falling back to edge-local agent graph")
 
         # --- Control commands (Allow / Stop) — only writer besides the toggle ---
         was_allowed = _perm.is_control_allowed()
@@ -1833,7 +1992,21 @@ async def chat_endpoint(request: Request):
             )
             if recovery:
                 return _respond(recovery)
-            return _respond("I encountered a temporary issue. Please try again shortly, Sir.")
+            # Surface a more useful message for debugging hybrid/tool failures.
+            err_s = str(e)
+            if "Recursion" in err_s or "recursion" in err_s:
+                return _respond(
+                    "I hit an internal reasoning loop, Sir. Please rephrase the request "
+                    "or try a simpler question."
+                )
+            if "timeout" in err_s.lower() or "timed out" in err_s.lower():
+                return _respond(
+                    "The Mac brain timed out on that request, Sir. Please try again — "
+                    "heavy local models can take a moment to warm up."
+                )
+            return _respond(
+                "I encountered a temporary issue. Please try again shortly, Sir."
+            )
 
         final_state = compiled_app.get_state(config)
         state_values = final_state.values if final_state else None

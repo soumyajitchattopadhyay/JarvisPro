@@ -13,6 +13,12 @@ services:
         sync: false
       - key: ENABLE_HYBRID_ROUTING
         value: "true"
+      - key: TESRACT_ROLE
+        value: "edge"
+      - key: TESRACT_TIMEZONE
+        value: "Asia/Kolkata"
+      - key: LOCAL_INSTANCE_TIMEOUT
+        value: "120"
       - key: BRAIN_REGISTRY_SECRET
         description: "Shared secret — must match Mac tunnel_manager.py / .env"
         sync: false
