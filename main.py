@@ -380,9 +380,17 @@ _icons_dir = os.path.join(_base_dir, "icons")
 if os.path.isdir(_icons_dir):
     app.mount("/icons", StaticFiles(directory=_icons_dir), name="icons")
 
-_generated_dir = os.path.join(_base_dir, "generated_images")
+# Free Pollinations pipeline assets (mac_access.generate_free_image → generated/)
+_generated_dir = os.path.join(_base_dir, "generated")
 os.makedirs(_generated_dir, exist_ok=True)
 app.mount("/generated", StaticFiles(directory=_generated_dir), name="generated")
+# Legacy folder (pre-refactor) — keep serving if present so old files still load
+_legacy_generated = os.path.join(_base_dir, "generated_images")
+if os.path.isdir(_legacy_generated) and os.path.abspath(_legacy_generated) != os.path.abspath(_generated_dir):
+    try:
+        app.mount("/generated_images", StaticFiles(directory=_legacy_generated), name="generated_images_legacy")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Permission — thin wrappers around permissions.py (single source of truth)
@@ -678,7 +686,7 @@ While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask
 
 ### No elevation needed (Brain-local / cloud):
   web_search, search_and_summarize, recall_memory, save_memory_note, manage_task_plan,
-  generate_image, get_current_time
+  generate_free_image, generate_image, get_current_time
 
 ### Require Allow Control (client-intent tools — never host-mutating):
   read_file, write_file, create_directory, list_directory, run_terminal_command,
@@ -692,7 +700,8 @@ While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask
 - Paths: use ~ labels (e.g. ~/Desktop/...). NEVER invent /Users/yourusername.
 
 ## Tool guide
-- Image → generate_image | Research → search_and_summarize / web_search
+- Image → generate_free_image (or generate_image) | Research → search_and_summarize / web_search
+- After generate_free_image, include the exact markdown ![Generated Image](/generated/…) in your reply so the HUD renders it.
 - Memory → recall_memory / save_memory_note | Tasks → manage_task_plan
 - Files/folders/shell/URL → corresponding tools (client intents only)
 - Math/code logic → execute_python_code (process-local; no host I/O)
@@ -1053,13 +1062,30 @@ def _format_tool_fallback_reply(tool_messages: list[ToolMessage]) -> str:
             # Apps listing can be long — keep a useful chunk
             limit = 3500 if "Applications" in body or "applications" in body.lower() else 1200
             lines.append(body[:limit])
-        elif name == "generate_image" and "Local URL:" in body:
-            for part in body.splitlines():
-                if part.startswith("Local URL:"):
-                    lines.append(f"Image ready, Sir. {part.strip()}")
-                    break
+        elif name in ("generate_image", "generate_free_image"):
+            # Prefer strict Pollinations markdown so the HUD injects an <img>.
+            md_match = re.search(
+                r"!\[[^\]]*\]\((/generated/[^)\s]+)\)",
+                body,
+            )
+            if md_match:
+                lines.append(
+                    f"Image ready, Sir.\n{md_match.group(0)}"
+                )
+            elif "Local URL:" in body:
+                for part in body.splitlines():
+                    if part.startswith("Local URL:"):
+                        url = part.split(":", 1)[1].strip()
+                        lines.append(f"Image ready, Sir.\n![Generated Image]({url})")
+                        break
+                else:
+                    lines.append(body[:400])
             else:
-                lines.append(body[:400])
+                bare = re.search(r"(/generated/[^\s)\]\"']+\.(?:png|jpe?g|webp|gif))", body, re.I)
+                if bare:
+                    lines.append(f"Image ready, Sir.\n![Generated Image]({bare.group(1)})")
+                else:
+                    lines.append(body[:400])
         else:
             lines.append(body[:600])
 

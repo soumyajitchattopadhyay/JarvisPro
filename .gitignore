@@ -11,3 +11,4 @@ venv/
 agent_data/
 user_settings.json
 generated_images/
+generated/

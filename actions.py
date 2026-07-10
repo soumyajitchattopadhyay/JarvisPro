@@ -33,6 +33,7 @@ from mac_access import (
     classify_command,
     find_named_path,
     format_confirmation_request,
+    generate_free_image as _mac_generate_free_image,
     intent_create_directory,
     intent_download_file,
     intent_list_directory,
@@ -51,7 +52,8 @@ import permissions
 
 repl = PythonREPL()
 WORKSPACE_ROOT = Path(__file__).resolve().parent
-GENERATED_DIR = WORKSPACE_ROOT / "generated_images"
+# Free Pollinations pipeline writes project-local generated/ (served at /generated)
+GENERATED_DIR = WORKSPACE_ROOT / "generated"
 AGENT_DATA_DIR = WORKSPACE_ROOT / "agent_data"
 TASKS_FILE = AGENT_DATA_DIR / "active_task.json"
 
@@ -512,33 +514,29 @@ def _run_web_search(query: str, *, max_results: int = 5, focus: str = "") -> str
 
 
 def _generate_via_pollinations(prompt: str, *, width: int = 1024, height: int = 1024) -> str:
-    _ensure_dirs()
-    encoded = urllib.parse.quote(prompt)
-    remote_url = (
-        f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?width={width}&height={height}&nologo=true&enhance=true"
-    )
-    stamp = int(time.time())
-    safe_slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()[:40]).strip("-") or "image"
-    filename = f"img_{stamp}_{safe_slug}.png"
-    local_path = GENERATED_DIR / filename
-
-    with httpx.Client(timeout=90.0, follow_redirects=True) as client:
-        res = client.get(remote_url)
-        res.raise_for_status()
-        local_path.write_bytes(res.content)
-
-    rel = local_path.relative_to(WORKSPACE_ROOT).as_posix()
-    result = (
+    """
+    Free Pollinations path — delegates to mac_access.generate_free_image.
+    width/height kept for API compat; free pipeline uses 1024×1024.
+    """
+    _ = width, height
+    md = _mac_generate_free_image(prompt)
+    if md.startswith("Image Error:") or md.startswith("Search Error:"):
+        raise RuntimeError(md)
+    # Keep memory + structured SUCCESS envelope while embedding the markdown
+    # the HUD renders inline.
+    m = re.search(r"\((/generated/[^)]+)\)", md)
+    local_url = m.group(1) if m else ""
+    try:
+        store_image_memory(prompt, md, backend="pollinations", image_ref=local_url.lstrip("/"))
+    except Exception as mem_exc:
+        print(f"[TESrACT:image] memory store skipped: {mem_exc}")
+    return (
         f"STATUS: SUCCESS\n"
-        f"Image generated successfully.\n"
+        f"Image generated successfully (free Pollinations pipeline).\n"
         f"Prompt: {prompt}\n"
-        f"Saved to: {rel}\n"
-        f"Local URL: /generated/{filename}\n"
-        f"Remote URL: {remote_url}"
+        f"Local URL: {local_url}\n"
+        f"{md}"
     )
-    store_image_memory(prompt, result, backend="pollinations", image_ref=rel)
-    return result
 
 
 def _generate_via_openai(prompt: str) -> str:
@@ -567,12 +565,14 @@ def _generate_via_openai(prompt: str) -> str:
         local_path.write_bytes(img_res.content)
 
     rel = local_path.relative_to(WORKSPACE_ROOT).as_posix()
+    md = f"![Generated Image](/generated/{filename})"
     result = (
         f"STATUS: SUCCESS\n"
         f"Image generated via DALL-E 3.\n"
         f"Prompt: {prompt}\n"
         f"Saved to: {rel}\n"
-        f"Local URL: /generated/{filename}"
+        f"Local URL: /generated/{filename}\n"
+        f"{md}"
     )
     store_image_memory(prompt, result, backend="openai", image_ref=rel)
     return result
@@ -603,32 +603,68 @@ def search_and_summarize(query: str, focus: str = ""):
 
 
 @tool
-def generate_image(prompt: str, style: str = ""):
-    """Generate an image from a text description. Always use this when Sir asks to create, draw, or generate an image."""
+def generate_free_image(prompt: str) -> str:
+    """
+    Free local image generation via Pollinations AI (no API key).
+    Always use this (or generate_image) when Sir asks to create, draw, or generate an image.
+    Returns markdown the HUD renders inline: ![Generated Image](/generated/img_….png)
+    """
     prompt = (prompt or "").strip()
     if not prompt:
-        return "Image Error: prompt cannot be empty."
+        return _tool_err("generate_free_image", "prompt cannot be empty.")
+    try:
+        md = _mac_generate_free_image(prompt)
+        if md.startswith("Image Error:"):
+            return _tool_err("generate_free_image", md)
+        try:
+            m = re.search(r"\((/generated/[^)]+)\)", md)
+            store_image_memory(
+                prompt,
+                md,
+                backend="pollinations",
+                image_ref=(m.group(1).lstrip("/") if m else ""),
+            )
+        except Exception as mem_exc:
+            print(f"[TESrACT:image] memory store skipped: {mem_exc}")
+        # Tool envelope + strict markdown for synthesis / HUD
+        return _tool_ok(
+            "generate_free_image",
+            f"Image ready for Sir.\n{md}",
+        )
+    except Exception as exc:
+        return _tool_err("generate_free_image", str(exc))
+
+
+@tool
+def generate_image(prompt: str, style: str = ""):
+    """Generate an image from a text description. Uses free Pollinations by default. Always call this when Sir asks to create, draw, or generate an image."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return _tool_err("generate_image", "prompt cannot be empty.")
 
     full_prompt = f"{prompt}, {style}".strip(", ") if style else prompt
-    backends: list[tuple[str, object]] = []
-
+    # Free pipeline first — no paid API required
+    backends: list[tuple[str, object]] = [
+        ("pollinations", lambda: _generate_via_pollinations(full_prompt)),
+    ]
     if os.getenv("OPENAI_API_KEY", "").strip():
         backends.append(("openai", lambda: _generate_via_openai(full_prompt)))
-    backends.append(("pollinations", lambda: _generate_via_pollinations(full_prompt)))
 
     errors: list[str] = []
     for name, fn in backends:
         try:
-            return fn()
+            body = fn()
+            return _tool_ok("generate_image", body)
         except Exception as exc:
             errors.append(f"{name}: {exc}")
 
     _ensure_dirs()
     prompt_path = GENERATED_DIR / f"prompt_{int(time.time())}.txt"
     prompt_path.write_text(full_prompt, encoding="utf-8")
-    return (
+    return _tool_err(
+        "generate_image",
         f"Image backends unavailable ({'; '.join(errors)}). "
-        f"Saved prompt to {prompt_path.relative_to(WORKSPACE_ROOT).as_posix()} for manual generation."
+        f"Saved prompt to {prompt_path.relative_to(WORKSPACE_ROOT).as_posix()}.",
     )
 
 
@@ -1004,6 +1040,7 @@ tools = [
     recall_memory_tool,
     save_memory_note,
     manage_task_plan,
+    generate_free_image,
     generate_image,
     execute_python_code,
     read_file,
@@ -1052,6 +1089,14 @@ _FACT_SEARCH_RE = re.compile(
 )
 _SEARCH_DEEP_RE = re.compile(
     r"\b(research|summarize|summary|deep dive|find out about|comprehensive)\b",
+    re.IGNORECASE,
+)
+_IMAGE_GEN_RE = re.compile(
+    r"\b("
+    r"generate(?:\s+an?)?\s+image|create(?:\s+an?)?\s+image|draw(?:\s+an?)?\s+(?:image|picture)|"
+    r"make(?:\s+an?)?\s+(?:image|picture)|image\s+of|picture\s+of|"
+    r"generate_free_image|generate_image"
+    r")\b",
     re.IGNORECASE,
 )
 # Strip chat-command wrappers so DDG gets a real topic, not "search the web for …".
@@ -1245,7 +1290,7 @@ _PSEUDO_TOOL_CALL_RE = re.compile(
 )
 _KNOWN_TOOL_NAMES = frozenset({
     "web_search", "search_and_summarize", "recall_memory", "save_memory_note",
-    "manage_task_plan", "generate_image", "execute_python_code",
+    "manage_task_plan", "generate_free_image", "generate_image", "execute_python_code",
     "read_file", "write_file", "create_directory", "list_directory",
     "run_terminal_command", "open_url_in_browser", "get_current_time",
 })
@@ -1636,6 +1681,16 @@ def infer_forced_tools(user_text: str) -> list[tuple[str, dict]]:
             inferred.append(("search_and_summarize", {"query": query, "focus": ""}))
         else:
             inferred.append(("web_search", {"query": query}))
+    if _IMAGE_GEN_RE.search(text):
+        # Strip the command wrapper so Pollinations gets a clean subject prompt.
+        img_prompt = re.sub(
+            r"^(?:please\s+|can you\s+|could you\s+)?"
+            r"(?:generate|create|draw|make)(?:\s+an?)?\s+(?:image|picture)(?:\s+of)?\s*",
+            "",
+            text.strip(),
+            flags=re.I,
+        ).strip(" .,?!") or text.strip()
+        inferred.append(("generate_free_image", {"prompt": img_prompt}))
     if _RECALL_QUERY_RE.search(text):
         inferred.append(("recall_memory", {"query": _clean_search_query(text) or text}))
     if _TASK_VIEW_RE.search(text):

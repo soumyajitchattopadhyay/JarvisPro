@@ -25,9 +25,13 @@ import hashlib
 import json
 import os
 import re
+import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+
+import httpx
 
 # ---------------------------------------------------------------------------
 # Brain-local data only (inside the project tree — never host root)
@@ -35,6 +39,8 @@ from typing import Any, Literal
 _PROJECT_ROOT = Path(__file__).resolve().parent
 AGENT_DATA_DIR = _PROJECT_ROOT / "agent_data"
 PENDING_FILE = AGENT_DATA_DIR / "pending_confirmations.json"
+# Free Pollinations assets (project-local — served by FastAPI /generated)
+GENERATED_DIR = _PROJECT_ROOT / "generated"
 
 ActionType = Literal["DOWNLOAD_FILE", "DISPLAY_DATA", "LOGIC_ONLY"]
 ExecutionTarget = Literal["client", "brain", "none"]
@@ -46,6 +52,65 @@ CLIENT_INTENT_MARKER = "CLIENT_EXECUTION_INTENT"
 def _ensure_agent_data() -> None:
     """Create brain-local agent_data only (project-relative, never host root)."""
     AGENT_DATA_DIR.mkdir(exist_ok=True)
+
+
+def _ensure_generated_dir() -> Path:
+    """Create project-local generated/ for free Pollinations images."""
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    return GENERATED_DIR
+
+
+def generate_free_image(prompt: str) -> str:
+    """
+    Completely free local image pipeline via Pollinations AI.
+
+    Downloads image bytes to project-local ``generated/img_{timestamp}.png``
+    and returns markdown the HUD can render inline:
+
+        ![Generated Image](/generated/img_{timestamp}.png)
+    """
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return "Image Error: prompt cannot be empty."
+
+    stamp = int(time.time())
+    filename = f"img_{stamp}.png"
+    out_dir = _ensure_generated_dir()
+    local_path = out_dir / filename
+
+    encoded = urllib.parse.quote(prompt, safe="")
+    # Primary: free Pollinations path requested by architecture; /prompt/ is the
+    # widely-documented fallback if /p/ is unavailable.
+    primary_url = (
+        f"https://image.pollinations.ai/p/{encoded}"
+        f"?seed={stamp}&width=1024&height=1024&nologo=true"
+    )
+    fallback_url = (
+        f"https://image.pollinations.ai/prompt/{encoded}"
+        f"?seed={stamp}&width=1024&height=1024&nologo=true"
+    )
+
+    last_err: Exception | None = None
+    for url in (primary_url, fallback_url):
+        try:
+            with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+                res = client.get(url)
+                res.raise_for_status()
+                content_type = (res.headers.get("content-type") or "").lower()
+                data = res.content
+                if not data or len(data) < 64:
+                    raise RuntimeError("Pollinations returned empty image bytes")
+                # Reject obvious HTML error pages
+                if "text/html" in content_type and data[:1] in (b"<", b"{"):
+                    raise RuntimeError("Pollinations returned non-image content")
+                local_path.write_bytes(data)
+            # Strict markdown for the LLM / HUD renderer
+            return f"![Generated Image](/generated/{filename})"
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    return f"Image Error: Pollinations generation failed ({last_err})"
 
 
 # ---------------------------------------------------------------------------

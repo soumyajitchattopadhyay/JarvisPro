@@ -204,6 +204,16 @@
             text-transform: uppercase;
         }
         .chat-msg--user .chat-msg__label { color: rgba(0, 251, 255, 0.7); margin-bottom: 4px; }
+        .chat-msg__body img.chat-gen-img,
+        .md-content img {
+            max-width: 100%;
+            border-radius: 4px;
+            border: 1px solid #00ffff;
+            box-shadow: 0 0 10px rgba(0, 255, 255, 0.2);
+            margin-top: 10px;
+            display: block;
+            background: rgba(0, 20, 30, 0.6);
+        }
         .chat-msg__body {
             color: rgba(210, 248, 255, 0.94);
             font-size: 13px;
@@ -1055,11 +1065,73 @@
             return marked.parse(text);
         }
 
+        /**
+         * Ensure free Pollinations assets surface as markdown images the HUD can render.
+         * Handles: ![alt](/generated/…) and bare /generated/img_….png paths.
+         */
+        function normalizeGeneratedImageMarkdown(text) {
+            let t = String(text || '');
+            // Bare path → markdown image (skip if already inside markdown/link parens)
+            t = t.replace(
+                /(^|[\s\n>])(\/generated\/[A-Za-z0-9._/-]+\.(?:png|jpe?g|webp|gif))(?=$|[\s\n)<\]])/gim,
+                (match, pre, path) => {
+                    // Already preceded by ](  → leave alone (handled as full markdown)
+                    return `${pre}![Generated Image](${path})`;
+                }
+            );
+            // Local URL: /generated/... lines from older tool envelopes
+            t = t.replace(
+                /^Local URL:\s*(\/generated\/[^\s]+)\s*$/gim,
+                '![Generated Image]($1)'
+            );
+            return t;
+        }
+
+        const GEN_IMG_STYLE =
+            'max-width: 100%; border-radius: 4px; border: 1px solid #00ffff; '
+            + 'box-shadow: 0 0 10px rgba(0, 255, 255, 0.2); margin-top: 10px; display: block;';
+
+        function enhanceGeneratedImages(root) {
+            if (!root) return;
+            root.querySelectorAll('img').forEach((img) => {
+                const src = img.getAttribute('src') || '';
+                if (/\/generated\//i.test(src) || img.classList.contains('chat-gen-img')) {
+                    img.classList.add('chat-gen-img');
+                    img.style.cssText = GEN_IMG_STYLE;
+                    img.loading = 'lazy';
+                    img.alt = img.alt || 'Generated Image';
+                    img.onerror = () => {
+                        img.style.opacity = '0.4';
+                        img.title = 'Image failed to load — is /generated mounted?';
+                    };
+                }
+            });
+            // Raw text fallback: if markdown left a lone path as text, upgrade it
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            const textNodes = [];
+            while (walker.nextNode()) textNodes.push(walker.currentNode);
+            textNodes.forEach((node) => {
+                const val = node.nodeValue || '';
+                if (!/\/generated\/[A-Za-z0-9._/-]+\.(?:png|jpe?g|webp|gif)/i.test(val)) return;
+                if (node.parentElement && node.parentElement.closest('a, code, pre, img')) return;
+                const span = document.createElement('span');
+                span.innerHTML = val.replace(
+                    /(\/generated\/[A-Za-z0-9._/-]+\.(?:png|jpe?g|webp|gif))/gi,
+                    (path) =>
+                        `<img class="chat-gen-img" src="${path}" alt="Generated Image" `
+                        + `style="${GEN_IMG_STYLE}" loading="lazy" />`
+                );
+                node.parentNode.replaceChild(span, node);
+            });
+        }
+
         function populateMessageBody(body, role, text) {
             if (role === 'assistant') {
                 body.classList.add('md-content');
-                body.innerHTML = renderMarkdown(text);
+                const normalized = normalizeGeneratedImageMarkdown(text);
+                body.innerHTML = renderMarkdown(normalized);
                 enhanceCodeBlocks(body);
+                enhanceGeneratedImages(body);
             } else {
                 body.textContent = text;
             }

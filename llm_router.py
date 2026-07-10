@@ -111,7 +111,7 @@ TOOL_FRIENDLY_PHRASES = (
     "open ", "browse", "go to", "navigate to", "visit ",
     "execute", "run code", "run python", "use the tool", "calculate",
     "generate image", "create image", "draw ", "make an image", "make a picture",
-    "generate a picture", "image of", "picture of", "generate_image",
+    "generate a picture", "image of", "picture of", "generate_image", "generate_free_image",
     "read file", "write file", "save file", "list files", "list directory",
     "create folder", "create directory", "make folder", "make a folder",
     "create a folder", "mkdir", "create_directory",
