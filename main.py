@@ -28,13 +28,15 @@ import traceback
 import datetime
 import re
 from typing import Annotated, TypedDict, List, Callable, cast, Any
+import sqlite3
+
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 from typing_extensions import NotRequired
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from groq import RateLimitError
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -1765,8 +1767,47 @@ workflow.add_edge("force_tools", "synthesize")
 workflow.add_edge("synthesize", "reviewer")
 workflow.add_conditional_edges("reviewer", route_after_reviewer)
 
-memory = MemorySaver()
+# ---------------------------------------------------------------------------
+# Persistent LangGraph memory bank (SQLite on Mac SSD — free, survives restarts)
+# Shares agent_data/ with OTP/history; LangGraph uses its own checkpoint tables.
+# ---------------------------------------------------------------------------
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_AGENT_DATA_DIR = os.path.join(_BASE_DIR, "agent_data")
+os.makedirs(_AGENT_DATA_DIR, exist_ok=True)
+_CHECKPOINT_DB_PATH = os.path.join(_AGENT_DATA_DIR, "tesract_sessions.db")
+# Keep a process-lifetime connection (check_same_thread=False for FastAPI workers).
+_checkpoint_conn = sqlite3.connect(_CHECKPOINT_DB_PATH, check_same_thread=False)
+try:
+    _checkpoint_conn.execute("PRAGMA journal_mode=WAL")
+except Exception:
+    pass
+memory = SqliteSaver(_checkpoint_conn)
+try:
+    memory.setup()  # create checkpoints / writes tables if missing
+except Exception as _ckpt_exc:
+    print(f"[TESrACT] SqliteSaver.setup warning: {_ckpt_exc}")
 compiled_app = workflow.compile(checkpointer=memory)
+print(f"[TESrACT] LangGraph checkpointer: SQLite → {_CHECKPOINT_DB_PATH}")
+
+
+def graph_thread_id_for_operator(
+    email: str | None = None,
+    conversation_id: str | None = None,
+) -> str:
+    """
+    Stable LangGraph thread_id so multi-turn tool/agent state persists per operator.
+
+    Prefer conversation_id when present so "New session" starts a clean graph.
+    """
+    safe_email = re.sub(
+        r"[^a-zA-Z0-9_]+",
+        "_",
+        (email or "anon").replace("@", "_at_").lower(),
+    ).strip("_") or "anon"
+    if conversation_id:
+        safe_conv = re.sub(r"[^a-zA-Z0-9_]+", "_", str(conversation_id))[:48]
+        return f"operator_{safe_email}_{safe_conv}"
+    return f"operator_{safe_email}_main"
 
 # ============================================
 # FULL WEB API ROUTES (Serves Three.js HUD + /chat)
@@ -2239,8 +2280,9 @@ async def chat_endpoint(request: Request):
         conversation_id = str(payload.get("conversation_id") or "").strip() or None
 
         user_text = (payload.get("text") or "").strip()
-        # Per-operator graph thread so history doesn't cross-contaminate
-        thread_id = f"user:{(session_email or 'anon').replace('@', '_at_')}"
+        # Persistent SQLite checkpointer key — must be stable across requests
+        # for the same operator/conversation so tool multi-turn state survives.
+        thread_id = graph_thread_id_for_operator(session_email, conversation_id)
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
         def _respond(reply: str, *, pending: dict | None = ..., extra: list[str] | None = None):
