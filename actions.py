@@ -668,6 +668,108 @@ def generate_image(prompt: str, style: str = ""):
     )
 
 
+def _resolve_project_file_path(file_path: str) -> Path:
+    """
+    Resolve upload / project-local paths for document extraction.
+
+    Accepts HUD paths like /agent_data/uploads/uuid.pdf or relative agent_data/...
+    Blocks path escape outside the project tree.
+    """
+    raw = (file_path or "").strip().strip("'\"")
+    if not raw:
+        raise FileNotFoundError("empty file_path")
+    # URL-style path from the upload endpoint
+    if raw.startswith("/agent_data/"):
+        candidate = WORKSPACE_ROOT / raw.lstrip("/")
+    elif raw.startswith("agent_data/") or raw.startswith("generated/"):
+        candidate = WORKSPACE_ROOT / raw
+    else:
+        p = Path(raw).expanduser()
+        candidate = p if p.is_absolute() else (WORKSPACE_ROOT / p)
+    try:
+        resolved = candidate.resolve()
+        root = WORKSPACE_ROOT.resolve()
+        # Allow only project-local files (uploads, generated, agent_data)
+        resolved.relative_to(root)
+    except Exception as exc:
+        raise FileNotFoundError(f"path not allowed or not found: {raw}") from exc
+    if not resolved.is_file():
+        raise FileNotFoundError(str(resolved))
+    return resolved
+
+
+@tool
+def extract_pdf_context(file_path: str) -> str:
+    """
+    Extract full text from a local PDF into active memory.
+
+    Use when Sir uploads a document, provides a path under /agent_data/uploads/,
+    or asks about a PDF/file contents. Call this BEFORE answering from the file.
+    """
+    try:
+        path = _resolve_project_file_path(file_path)
+    except FileNotFoundError as exc:
+        return _tool_err(
+            "extract_pdf_context",
+            f"FileNotFoundError: could not open PDF at {file_path!r} ({exc}).",
+        )
+    except Exception as exc:
+        return _tool_err("extract_pdf_context", f"Invalid path: {exc}")
+
+    if path.suffix.lower() != ".pdf":
+        return _tool_err(
+            "extract_pdf_context",
+            f"Not a PDF file: {path.name}. Provide a .pdf path (e.g. /agent_data/uploads/….pdf).",
+        )
+
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return _tool_err(
+            "extract_pdf_context",
+            "pypdf is not installed. Run: pip install pypdf",
+        )
+
+    try:
+        reader = PdfReader(str(path))
+        pages_text: list[str] = []
+        for i, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+            except Exception as page_exc:
+                text = f"[page {i + 1} extract error: {page_exc}]"
+            text = text.strip()
+            if text:
+                pages_text.append(f"--- Page {i + 1} ---\n{text}")
+        combined = "\n\n".join(pages_text).strip()
+        if not combined:
+            return _tool_ok(
+                "extract_pdf_context",
+                f"PDF opened ({path.name}, {len(reader.pages)} page(s)) but no extractable text "
+                "(may be scanned/image-only).",
+            )
+        # Soft cap so tool output does not blow the context window
+        max_chars = int(os.getenv("PDF_EXTRACT_MAX_CHARS", "80000") or "80000")
+        truncated = False
+        if len(combined) > max_chars:
+            combined = combined[:max_chars] + "\n\n[…truncated…]"
+            truncated = True
+        body = (
+            f"Source: {path.as_posix()}\n"
+            f"Pages: {len(reader.pages)}\n"
+            f"Truncated: {truncated}\n\n"
+            f"{combined}"
+        )
+        return _tool_ok("extract_pdf_context", body)
+    except FileNotFoundError as exc:
+        return _tool_err(
+            "extract_pdf_context",
+            f"FileNotFoundError: {exc}",
+        )
+    except Exception as exc:
+        return _tool_err("extract_pdf_context", f"Failed to read PDF: {exc}")
+
+
 @tool
 def execute_python_code(code: str, control_allowed: bool = False):
     """
@@ -1042,6 +1144,7 @@ tools = [
     manage_task_plan,
     generate_free_image,
     generate_image,
+    extract_pdf_context,
     execute_python_code,
     read_file,
     write_file,
@@ -1290,7 +1393,8 @@ _PSEUDO_TOOL_CALL_RE = re.compile(
 )
 _KNOWN_TOOL_NAMES = frozenset({
     "web_search", "search_and_summarize", "recall_memory", "save_memory_note",
-    "manage_task_plan", "generate_free_image", "generate_image", "execute_python_code",
+    "manage_task_plan", "generate_free_image", "generate_image", "extract_pdf_context",
+    "execute_python_code",
     "read_file", "write_file", "create_directory", "list_directory",
     "run_terminal_command", "open_url_in_browser", "get_current_time",
 })
@@ -1691,6 +1795,24 @@ def infer_forced_tools(user_text: str) -> list[tuple[str, dict]]:
             flags=re.I,
         ).strip(" .,?!") or text.strip()
         inferred.append(("generate_free_image", {"prompt": img_prompt}))
+    # Uploaded / mentioned PDF → force extract before answering
+    # Prefer the canonical upload URL path over bare filenames in the same line.
+    pdf_match = (
+        re.search(r"(/agent_data/uploads/[A-Za-z0-9._/-]+\.pdf)", text, re.I)
+        or re.search(r"(agent_data/uploads/[A-Za-z0-9._/-]+\.pdf)", text, re.I)
+        or re.search(r"\b([A-Za-z0-9._-]+\.pdf)\b", text, re.I)
+    )
+    if pdf_match and (
+        re.search(r"\b(pdf|document|upload|file|summarize|read|extract|what does)\b", text, re.I)
+        or "/agent_data/uploads/" in text
+        or "ATTACHED UPLOADS" in text
+    ):
+        path = pdf_match.group(1)
+        if path.startswith("agent_data/"):
+            path = "/" + path
+        elif not path.startswith("/") and ("uploads" in text or "ATTACHED" in text):
+            path = f"/agent_data/uploads/{Path(path).name}"
+        inferred.append(("extract_pdf_context", {"file_path": path}))
     if _RECALL_QUERY_RE.search(text):
         inferred.append(("recall_memory", {"query": _clean_search_query(text) or text}))
     if _TASK_VIEW_RE.search(text):
