@@ -225,7 +225,7 @@ def run_one_tunnel(port: int) -> int:
 
     bin_path = cloudflared_bin()
     target = f"http://127.0.0.1:{port}"
-    cmd = [bin_path, "tunnel", "--no-autoupdate", "--url", target]
+    cmd = [bin_path, "tunnel", "--protocol", "http2", "--no-autoupdate", "--url", target]
     _log(f"Starting: {' '.join(cmd)}")
 
     try:
