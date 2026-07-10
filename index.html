@@ -657,6 +657,115 @@
             opacity: 0.4;
             cursor: not-allowed;
         }
+        .attach-btn {
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            border: 1px solid rgba(0, 251, 255, 0.28);
+            background: linear-gradient(145deg, rgba(0, 251, 255, 0.08) 0%, rgba(0, 251, 255, 0.03) 100%);
+            color: rgba(0, 251, 255, 0.75);
+            cursor: pointer;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+            flex-shrink: 0;
+            position: relative;
+        }
+        .attach-btn:hover:not(:disabled) {
+            background: rgba(0, 251, 255, 0.18);
+            color: #00fbff;
+            border-color: rgba(0, 251, 255, 0.55);
+            box-shadow: 0 0 16px rgba(0, 251, 255, 0.22);
+        }
+        .attach-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        .attach-btn.has-pending::after {
+            content: '';
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #00fbff;
+            box-shadow: 0 0 8px #00fbff;
+        }
+        #file-upload-input { display: none; }
+        .upload-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 8px;
+            padding: 6px 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(0, 255, 255, 0.22);
+            background: rgba(0, 255, 255, 0.06);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: rgba(210, 248, 255, 0.9);
+            max-width: 100%;
+        }
+        .upload-chip img {
+            width: 48px;
+            height: 48px;
+            object-fit: cover;
+            border-radius: 4px;
+            border: 1px solid rgba(0, 255, 255, 0.35);
+            box-shadow: 0 0 12px rgba(0, 255, 255, 0.15);
+            flex-shrink: 0;
+        }
+        .upload-chip__meta {
+            min-width: 0;
+            overflow: hidden;
+        }
+        .upload-chip__name {
+            display: block;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 280px;
+            color: #00fbff;
+            letter-spacing: 0.5px;
+        }
+        .upload-chip__path {
+            display: block;
+            opacity: 0.55;
+            font-size: 10px;
+            margin-top: 2px;
+            word-break: break-all;
+        }
+        .pending-attachments {
+            pointer-events: auto;
+            width: min(1050px, 95vw);
+            margin: 0 auto 8px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            min-height: 0;
+        }
+        .pending-attachments:empty { display: none; }
+        .pending-attachments .upload-chip {
+            margin-top: 0;
+            position: relative;
+            padding-right: 28px;
+        }
+        .pending-attachments .upload-chip button {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            border: none;
+            background: transparent;
+            color: rgba(0, 251, 255, 0.55);
+            cursor: pointer;
+            font-size: 12px;
+            line-height: 1;
+            padding: 2px 4px;
+        }
+        .pending-attachments .upload-chip button:hover { color: #ff7a7a; }
         .mic-btn {
             background: linear-gradient(145deg, rgba(4, 12, 18, 0.8) 0%, rgba(0, 0, 0, 0.7) 100%);
             border: 1px solid rgba(0, 251, 255, 0.25);
@@ -1005,10 +1114,13 @@
             <span id="confirm-banner-text">A shell command is awaiting approval.</span>
             <code id="confirm-banner-cmd"></code>
         </div>
+        <div class="pending-attachments" id="pending-attachments" aria-live="polite"></div>
         <div class="input-wrapper">
             <div class="input-bar" id="input-bar">
                 <input type="text" id="user-input" placeholder="Enter command..." autocomplete="off">
                 <span class="input-hint">↵ SEND</span>
+                <input type="file" id="file-upload-input" accept="image/*,.pdf,.txt,.md,.csv,.json,.png,.jpg,.jpeg,.gif,.webp,.zip" multiple />
+                <button id="attach-btn" class="attach-btn" type="button" title="Attach file or image"><i class="fa-solid fa-paperclip"></i></button>
                 <button id="send-btn" class="send-btn" type="button" title="Send"><i class="fa-solid fa-arrow-up"></i></button>
             </div>
             <button id="mic-btn" class="mic-btn" type="button" title="Voice input"><i class="fa-solid fa-microphone"></i></button>
@@ -1406,6 +1518,8 @@
         function setInputBusy(busy) {
             userInputEl.disabled = busy;
             sendBtnEl.disabled = busy;
+            const attach = document.getElementById('attach-btn');
+            if (attach) attach.disabled = busy;
             inputBar.classList.toggle('is-busy', busy);
         }
 
@@ -1618,11 +1732,171 @@
         appendChatMessage('assistant', 'AT YOUR SERVICE');
         bootstrapAuth();
 
-        async function processCommand(text) {
-            const prompt = (text || '').trim();
-            if (!prompt) return;
+        // ── File / image upload → /upload (Mac or tunnel) ──
+        const pendingAttachments = []; // { file_path, original_name, is_image, content_type }
+        const attachBtnEl = document.getElementById('attach-btn');
+        const fileInputEl = document.getElementById('file-upload-input');
+        const pendingTrayEl = document.getElementById('pending-attachments');
 
-            appendChatMessage('user', prompt);
+        function renderPendingAttachments() {
+            if (!pendingTrayEl) return;
+            pendingTrayEl.innerHTML = '';
+            if (attachBtnEl) {
+                attachBtnEl.classList.toggle('has-pending', pendingAttachments.length > 0);
+            }
+            pendingAttachments.forEach((att, idx) => {
+                const chip = document.createElement('div');
+                chip.className = 'upload-chip';
+                let thumb = '';
+                if (att.is_image && att.file_path) {
+                    thumb = `<img src="${att.file_path}" alt="" />`;
+                } else {
+                    thumb = '<i class="fa-solid fa-file" style="color:#00fbff;opacity:.8"></i>';
+                }
+                chip.innerHTML = `
+                    ${thumb}
+                    <span class="upload-chip__meta">
+                        <span class="upload-chip__name">${(att.original_name || 'file').replace(/[<>&]/g, '')}</span>
+                        <span class="upload-chip__path">${(att.file_path || '').replace(/[<>&]/g, '')}</span>
+                    </span>
+                    <button type="button" title="Remove" data-idx="${idx}">×</button>
+                `;
+                chip.querySelector('button')?.addEventListener('click', () => {
+                    pendingAttachments.splice(idx, 1);
+                    renderPendingAttachments();
+                });
+                pendingTrayEl.appendChild(chip);
+            });
+        }
+
+        function appendUploadConfirmBubble(att) {
+            const name = att.original_name || 'file';
+            const path = att.file_path || '';
+            let html = `**UPLINK COMPLETE** — \`${name}\`\n`;
+            if (att.is_image && path) {
+                html += `![${name}](${path})`;
+            } else {
+                html += `Stored at \`${path}\``;
+            }
+            appendChatMessage('assistant', html);
+        }
+
+        function buildAttachmentContext() {
+            if (!pendingAttachments.length) return '';
+            const lines = pendingAttachments.map((a) => {
+                const kind = a.is_image ? 'image' : 'file';
+                return `- (${kind}) ${a.original_name || 'upload'} → ${a.file_path}`;
+            });
+            return (
+                '\n\n[ATTACHED UPLOADS — local Mac paths; use tools if needed to analyze]\n'
+                + lines.join('\n')
+            );
+        }
+
+        async function uploadSelectedFile(file) {
+            if (!file) return null;
+            if (authRequired && !sessionToken) {
+                showAuthGate(true);
+                appendChatMessage('assistant', 'Authentication required before uplink, Sir.');
+                return null;
+            }
+            const form = new FormData();
+            form.append('file', file, file.name);
+
+            // Relative /upload works for localhost, Render, and Cloudflare tunnel hosts.
+            const headers = authHeaders();
+            // Do NOT set Content-Type — browser sets multipart boundary.
+
+            const res = await fetch('/upload', {
+                method: 'POST',
+                headers,
+                body: form,
+            });
+            let data = {};
+            try { data = await res.json(); } catch (_) { data = {}; }
+            if (!res.ok || data.status !== 'success') {
+                throw new Error(data.detail || data.error || `Upload failed (HTTP ${res.status})`);
+            }
+            return data;
+        }
+
+        async function handleFileSelection(fileList) {
+            const files = Array.from(fileList || []);
+            if (!files.length) return;
+
+            isThinking = true;
+            setInputBusy(true);
+            if (attachBtnEl) attachBtnEl.disabled = true;
+            document.getElementById('agent-status').innerText = 'UPLINK';
+            showLoadingMessage();
+            // Replace loading label with upload state
+            if (loadingMsgEl) {
+                const label = loadingMsgEl.querySelector('.chat-typing__row span');
+                if (label) label.textContent = 'UPLOADING DATA';
+            }
+
+            try {
+                for (const file of files) {
+                    const data = await uploadSelectedFile(file);
+                    if (!data) continue;
+                    const att = {
+                        file_path: data.file_path,
+                        original_name: data.original_name || file.name,
+                        is_image: !!data.is_image,
+                        content_type: data.content_type || file.type || '',
+                        size_bytes: data.size_bytes || file.size || 0,
+                    };
+                    pendingAttachments.push(att);
+                    removeLoadingMessage();
+                    appendUploadConfirmBubble(att);
+                    showLoadingMessage();
+                    if (loadingMsgEl) {
+                        const label = loadingMsgEl.querySelector('.chat-typing__row span');
+                        if (label) label.textContent = 'UPLOADING DATA';
+                    }
+                }
+            } catch (e) {
+                console.warn('upload failed', e);
+                removeLoadingMessage();
+                appendChatMessage(
+                    'assistant',
+                    `Uplink failed, Sir. ${e && e.message ? e.message : 'Unknown error.'}`,
+                );
+            } finally {
+                removeLoadingMessage();
+                renderPendingAttachments();
+                isThinking = false;
+                setInputBusy(false);
+                if (attachBtnEl) attachBtnEl.disabled = false;
+                document.getElementById('agent-status').innerText = 'STANDBY';
+                if (fileInputEl) fileInputEl.value = '';
+            }
+        }
+
+        attachBtnEl?.addEventListener('click', () => {
+            if (isThinking) return;
+            fileInputEl?.click();
+        });
+        fileInputEl?.addEventListener('change', () => {
+            handleFileSelection(fileInputEl.files);
+        });
+
+        async function processCommand(text) {
+            const promptBase = (text || '').trim();
+            const attachCtx = buildAttachmentContext();
+            if (!promptBase && !attachCtx) return;
+
+            const prompt = (promptBase || 'Please review the attached upload(s).') + attachCtx;
+            const displayUser = promptBase
+                + (pendingAttachments.length
+                    ? `\n\n[attached: ${pendingAttachments.map((a) => a.original_name).join(', ')}]`
+                    : '');
+
+            appendChatMessage('user', displayUser);
+            // Consume attachments into this turn
+            const usedAttachments = pendingAttachments.splice(0, pendingAttachments.length);
+            renderPendingAttachments();
+
             isThinking = true;
             setInputBusy(true);
             document.getElementById('agent-status').innerText = "PROCESSING";
@@ -1633,12 +1907,23 @@
                     removeLoadingMessage();
                     showAuthGate(true);
                     appendChatMessage('assistant', 'Authentication required, Sir. Complete email OTP first.');
+                    // restore attachments if chat blocked
+                    usedAttachments.forEach((a) => pendingAttachments.push(a));
+                    renderPendingAttachments();
                     isThinking = false;
                     setInputBusy(false);
                     document.getElementById('agent-status').innerText = 'STANDBY';
                     return;
                 }
-                const body = { text: prompt };
+                const body = {
+                    text: prompt,
+                    attachments: usedAttachments.map((a) => ({
+                        file_path: a.file_path,
+                        original_name: a.original_name,
+                        content_type: a.content_type,
+                        is_image: a.is_image,
+                    })),
+                };
                 if (conversationId) body.conversation_id = conversationId;
                 const res = await fetch('/chat', {
                     method: 'POST',

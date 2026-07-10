@@ -38,7 +38,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AI
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite import SqliteSaver
 from groq import RateLimitError
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -395,6 +395,15 @@ if os.path.isdir(_legacy_generated) and os.path.abspath(_legacy_generated) != os
         app.mount("/generated_images", StaticFiles(directory=_legacy_generated), name="generated_images_legacy")
     except Exception:
         pass
+
+# Operator file / image uploads (frontend → FastAPI → Mac disk)
+_uploads_dir = os.path.join(_base_dir, "agent_data", "uploads")
+os.makedirs(_uploads_dir, exist_ok=True)
+app.mount(
+    "/agent_data/uploads",
+    StaticFiles(directory=_uploads_dir),
+    name="agent_uploads",
+)
 
 # ---------------------------------------------------------------------------
 # Permission — thin wrappers around permissions.py (single source of truth)
@@ -2295,6 +2304,114 @@ async def chat_new_conversation(request: Request):
     email = (sess or {}).get("email") or "local@localhost"
     cid = session_store.new_conversation(email, title="New session")
     return {"ok": True, "conversation_id": cid, "email": email}
+
+
+@app.post("/upload")
+async def upload_file_endpoint(
+    request: Request,
+    file: UploadFile = File(...),
+):
+    """
+    Ingest a multipart file from the HUD into agent_data/uploads/.
+
+    Returns a public path under /agent_data/uploads/{uuid}{ext} for preview
+    and for attaching context to the next /chat prompt.
+    When hybrid routing is healthy, the edge proxies the bytes to the Mac brain
+    so tools operate on the same disk as the rest of the agent.
+    """
+    import uuid
+    from pathlib import Path
+
+    # Soft auth: when OTP is required, demand a session (localhost bypass OK).
+    _sess, auth_err = _require_user_session(request, strict=operator_auth.auth_required() or None)
+    if auth_err is not None and operator_auth.auth_required():
+        return auth_err
+
+    original = (file.filename or "upload.bin").strip() or "upload.bin"
+    original = Path(original).name  # strip client path components
+    content_type = file.content_type or "application/octet-stream"
+    try:
+        data = await file.read()
+    except Exception as exc:
+        return JSONResponse(
+            {"status": "error", "detail": f"Failed to read upload: {exc}"},
+            status_code=400,
+        )
+    if not data:
+        return JSONResponse(
+            {"status": "error", "detail": "Empty upload."},
+            status_code=400,
+        )
+    max_bytes = int(os.getenv("UPLOAD_MAX_BYTES", str(25 * 1024 * 1024)) or str(25 * 1024 * 1024))
+    if len(data) > max_bytes:
+        return JSONResponse(
+            {"status": "error", "detail": f"File exceeds limit ({max_bytes} bytes)."},
+            status_code=413,
+        )
+
+    already = (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1"
+    if not already and should_proxy_chat_to_brain():
+        # Forward multipart to Mac so uploads land on the brain SSD.
+        try:
+            import httpx
+
+            base = get_local_instance_url()
+            if base:
+                headers = {
+                    "User-Agent": "TESrACT-edge-proxy/1.0",
+                    "X-TESrACT-Proxied": "1",
+                    "ngrok-skip-browser-warning": "true",
+                }
+                tok = _session_token_from_request(request)
+                if tok:
+                    headers["X-Session-Token"] = tok
+                timeout = float(os.getenv("LOCAL_INSTANCE_TIMEOUT", "120") or "120")
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                    res = await client.post(
+                        f"{base.rstrip('/')}/upload",
+                        headers=headers,
+                        files={"file": (original, data, content_type)},
+                    )
+                try:
+                    body = res.json()
+                except Exception:
+                    body = {"status": "error", "detail": res.text[:400]}
+                if isinstance(body, dict):
+                    body.setdefault("brain_route", "mac_proxy")
+                if res.status_code < 400 and isinstance(body, dict) and body.get("status") == "success":
+                    return JSONResponse(body, status_code=res.status_code)
+                print(f"[TESrACT:upload] proxy HTTP {res.status_code}: {str(body)[:200]}")
+        except Exception as exc:
+            print(f"[TESrACT:upload] proxy failed: {exc}")
+            # Fall through to local save on edge
+
+    ext = Path(original).suffix.lower()
+    if ext and not re.fullmatch(r"\.[a-z0-9]{1,12}", ext):
+        ext = ""
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    dest = os.path.join(_uploads_dir, safe_name)
+
+    try:
+        with open(dest, "wb") as fh:
+            fh.write(data)
+    except Exception as exc:
+        print(f"[TESrACT:upload] write failed: {exc}")
+        return JSONResponse(
+            {"status": "error", "detail": f"Failed to store file: {exc}"},
+            status_code=500,
+        )
+
+    public_path = f"/agent_data/uploads/{safe_name}"
+    print(f"[TESrACT:upload] saved {original} → {public_path} ({len(data)} bytes)")
+    return {
+        "status": "success",
+        "file_path": public_path,
+        "original_name": original,
+        "content_type": content_type,
+        "size_bytes": len(data),
+        "is_image": content_type.startswith("image/")
+        or ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"),
+    }
 
 
 @app.post("/chat")
