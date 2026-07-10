@@ -90,11 +90,11 @@ AUTH_ALLOWED_EMAILS=you@gmail.com   # optional allow-list
 ### API
 
 - `GET /auth/status` — auth/smtp flags  
-- `POST /auth/request-otp` `{ "email" }`  
-- `POST /auth/verify-otp` `{ "email", "code" }` → `{ token, conversation_id }`  
-- `GET /auth/me` — Bearer session  
-- `GET /chat/history` — restore messages  
-- `POST /chat` — stores user + assistant turns when a session is present  
+- `POST /request-auth` `{ "email" }` — smtplib OTP (Mac); aliases: `/auth/request-otp`  
+- `POST /verify-auth` `{ "email", "otp" }` → `{ session_token, email }`; aliases: `/auth/verify-otp`  
+- `GET /auth/me` — Bearer / `X-Session-Token`  
+- `GET /chat/history` — restore messages (SQLite on Mac)  
+- `POST /chat` — requires `session_token`; LangGraph `thread_id` = operator email  
 
 On Render, these routes are **proxied to the Mac** whenever the tunnel is healthy.
 

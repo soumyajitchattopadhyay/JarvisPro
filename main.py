@@ -44,10 +44,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import actions
+import auth as operator_auth
 import brain_auth
 import llm_router
 import mac_access
-import session_auth
 import session_store
 from llm_router import (
     route_and_invoke,
@@ -1795,19 +1795,18 @@ def graph_thread_id_for_operator(
     conversation_id: str | None = None,
 ) -> str:
     """
-    Stable LangGraph thread_id so multi-turn tool/agent state persists per operator.
+    LangGraph SQLite thread_id for the authenticated operator.
 
-    Prefer conversation_id when present so "New session" starts a clean graph.
+    Spec: use the user email as the hive-mind key so multi-turn tool state
+    is isolated per operator and survives process restarts via SqliteSaver.
     """
-    safe_email = re.sub(
-        r"[^a-zA-Z0-9_]+",
-        "_",
-        (email or "anon").replace("@", "_at_").lower(),
-    ).strip("_") or "anon"
+    user_email = (email or "").strip().lower()
+    if user_email:
+        return user_email
+    # Unauthenticated fallback only (should not hit /chat when auth is required)
     if conversation_id:
-        safe_conv = re.sub(r"[^a-zA-Z0-9_]+", "_", str(conversation_id))[:48]
-        return f"operator_{safe_email}_{safe_conv}"
-    return f"operator_{safe_email}_main"
+        return f"anon:{conversation_id}"
+    return "operator_session_1"
 
 # ============================================
 # FULL WEB API ROUTES (Serves Three.js HUD + /chat)
@@ -1972,11 +1971,28 @@ async def _proxy_chat_to_mac_brain(
     return data
 
 
-def _user_session_from_request(request: Request) -> dict | None:
-    return session_auth.session_from_request_headers(
+def _session_token_from_request(request: Request, payload: dict | None = None) -> str | None:
+    payload = payload if isinstance(payload, dict) else {}
+    return operator_auth.resolve_session_token(
         request.headers.get("Authorization"),
-        request.headers.get("X-Session-Token"),
+        x_session_token=request.headers.get("X-Session-Token"),
+        payload_token=(
+            payload.get("session_token")
+            or payload.get("token")
+            or None
+        ),
     )
+
+
+def _user_session_from_request(
+    request: Request,
+    payload: dict | None = None,
+) -> dict | None:
+    token = _session_token_from_request(request, payload)
+    email = operator_auth.email_for_token(token)
+    if not token or not email:
+        return None
+    return {"token": token, "email": email}
 
 
 def _auth_localhost_ok(request: Request) -> bool:
@@ -1986,29 +2002,42 @@ def _auth_localhost_ok(request: Request) -> bool:
     return brain_auth.is_localhost_request(request)
 
 
-def _require_user_session(request: Request) -> tuple[dict | None, JSONResponse | None]:
+def _require_user_session(
+    request: Request,
+    payload: dict | None = None,
+    *,
+    strict: bool | None = None,
+) -> tuple[dict | None, JSONResponse | None]:
     """
-    Enforce operator OTP session when AUTH_REQUIRED.
-    Localhost HUD may bypass (AUTH_LOCALHOST_BYPASS, default true).
+    Require a valid OTP session_token for protected routes.
+
+    - AUTH_REQUIRED (or SMTP configured) → 401 without token
+    - Localhost HUD may bypass (AUTH_LOCALHOST_BYPASS, default true)
+    - strict=True always demands a token (used by /chat per architecture)
     """
-    if not session_auth.auth_required():
+    require = operator_auth.auth_required() if strict is None else bool(strict)
+    if not require and not operator_auth.auth_enabled():
         return None, None
-    if _auth_localhost_ok(request):
+    if not require and strict is not True:
+        # Soft mode: attach session if present, else allow anonymous
+        sess = _user_session_from_request(request, payload)
+        return sess, None
+    if _auth_localhost_ok(request) and not _session_token_from_request(request, payload):
         return {
             "email": "local@localhost",
             "token": "localhost-bypass",
             "localhost": True,
         }, None
-    sess = _user_session_from_request(request)
+    sess = _user_session_from_request(request, payload)
     if sess:
         return sess, None
     return None, JSONResponse(
         {
             "status": "error",
-            "error": "auth_required",
-            "detail": "Sign in with email OTP to continue.",
+            "error": "unauthorized",
+            "detail": "Valid session_token required. Complete email OTP first.",
             "reply": "Authentication required, Sir. Please verify your email OTP.",
-            "auth": session_auth.status_public(),
+            "auth": operator_auth.status_public(),
         },
         status_code=401,
     )
@@ -2047,132 +2076,156 @@ def _persist_chat_turn(
 
 
 # ---------------------------------------------------------------------------
-# Auth + history (Mac-local SQLite; edge proxies to Mac when hybrid is healthy)
+# Zero-cost Email OTP (auth.py / smtplib) + SQLite chat history
+# Edge proxies to Mac when hybrid tunnel is healthy.
 # ---------------------------------------------------------------------------
+
+def _parse_json_body(raw: bytes) -> dict:
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _maybe_proxy_auth(request: Request, method: str, path: str, raw: bytes | None = None):
+    already = (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1"
+    if already or not should_proxy_chat_to_brain():
+        return None
+    extra: dict[str, str] = {}
+    if request.headers.get("Authorization"):
+        extra["Authorization"] = request.headers.get("Authorization") or ""
+    if request.headers.get("X-Session-Token"):
+        extra["X-Session-Token"] = request.headers.get("X-Session-Token") or ""
+    return await _proxy_to_mac_brain(
+        method,
+        path,
+        body=raw if raw is not None else b"",
+        extra_headers=extra or None,
+        timeout=45.0 if method.upper() == "POST" else 20.0,
+    )
+
 
 @app.get("/auth/status")
 async def auth_status_endpoint(request: Request):
-    already = (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1"
-    if not already and should_proxy_chat_to_brain():
-        proxied = await _proxy_to_mac_brain("GET", "/auth/status", timeout=20.0)
-        if proxied is not None:
-            code, data = proxied
-            return JSONResponse(data if isinstance(data, dict) else {"ok": False}, status_code=code)
+    proxied = await _maybe_proxy_auth(request, "GET", "/auth/status")
+    if proxied is not None:
+        code, data = proxied
+        return JSONResponse(data if isinstance(data, dict) else {"ok": False}, status_code=code)
     return {
         "ok": True,
-        **session_auth.status_public(),
+        **operator_auth.status_public(),
         "brain_host": bool(llm_router.is_brain_host()),
     }
 
 
-@app.post("/auth/request-otp")
-async def auth_request_otp(request: Request):
+@app.post("/request-auth")
+async def request_auth_endpoint(request: Request):
+    """
+    Generate + email a 6-digit OTP via Mac smtplib (auth.send_otp_email).
+    Body: { "email": "you@domain.com" }
+    """
     raw = await request.body()
-    already = (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1"
-    if not already and should_proxy_chat_to_brain():
-        proxied = await _proxy_to_mac_brain("POST", "/auth/request-otp", body=raw, timeout=45.0)
-        if proxied is not None:
-            code, data = proxied
-            return JSONResponse(data if isinstance(data, dict) else {"ok": False}, status_code=code)
+    proxied = await _maybe_proxy_auth(request, "POST", "/request-auth", raw)
+    if proxied is not None:
+        code, data = proxied
+        return JSONResponse(data if isinstance(data, dict) else {"ok": False}, status_code=code)
+    if should_proxy_chat_to_brain() and (request.headers.get("X-TESrACT-Proxied") or "").strip() != "1":
+        # Hybrid expected but proxy failed
         return JSONResponse(
             {
                 "ok": False,
                 "error": "mac_offline",
-                "detail": "Mac brain offline — start TESrACT + tunnel_manager on the Mac to send OTP.",
+                "detail": "Mac brain offline — start TESrACT + tunnel_manager to send OTP.",
             },
             status_code=503,
         )
-    try:
-        payload = json.loads(raw.decode("utf-8")) if raw else {}
-    except Exception:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    result = session_auth.request_otp(str(payload.get("email") or ""))
+    payload = _parse_json_body(raw)
+    email = str(payload.get("email") or "")
+    result = operator_auth.send_otp_email(email)
     return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 
 
-@app.post("/auth/verify-otp")
-async def auth_verify_otp(request: Request):
+@app.post("/verify-auth")
+async def verify_auth_endpoint(request: Request):
+    """
+    Verify OTP and return a UUID session_token.
+    Body: { "email": "...", "otp": "123456" }  (also accepts "code")
+    """
     raw = await request.body()
-    already = (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1"
-    if not already and should_proxy_chat_to_brain():
-        proxied = await _proxy_to_mac_brain("POST", "/auth/verify-otp", body=raw, timeout=30.0)
-        if proxied is not None:
-            code, data = proxied
-            return JSONResponse(data if isinstance(data, dict) else {"ok": False}, status_code=code)
+    proxied = await _maybe_proxy_auth(request, "POST", "/verify-auth", raw)
+    if proxied is not None:
+        code, data = proxied
+        return JSONResponse(data if isinstance(data, dict) else {"ok": False}, status_code=code)
+    if should_proxy_chat_to_brain() and (request.headers.get("X-TESrACT-Proxied") or "").strip() != "1":
         return JSONResponse(
             {"ok": False, "error": "mac_offline", "detail": "Mac brain offline."},
             status_code=503,
         )
-    try:
-        payload = json.loads(raw.decode("utf-8")) if raw else {}
-    except Exception:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    result = session_auth.verify_otp(
+    payload = _parse_json_body(raw)
+    result = operator_auth.verify_otp(
         str(payload.get("email") or ""),
-        str(payload.get("code") or payload.get("otp") or ""),
+        str(payload.get("otp") or payload.get("code") or ""),
     )
+    if result.get("ok"):
+        # Seed SQLite conversation for free message history
+        try:
+            email = str(result.get("email") or "")
+            if email:
+                cid = session_store.ensure_conversation(email)
+                result["conversation_id"] = cid
+        except Exception as exc:
+            print(f"[TESrACT:auth] conversation seed skipped: {exc}")
     return JSONResponse(result, status_code=200 if result.get("ok") else 400)
+
+
+# HUD-compatible aliases (same handlers as /request-auth and /verify-auth)
+@app.post("/auth/request-otp")
+async def auth_request_otp_alias(request: Request):
+    return await request_auth_endpoint(request)
+
+
+@app.post("/auth/verify-otp")
+async def auth_verify_otp_alias(request: Request):
+    return await verify_auth_endpoint(request)
 
 
 @app.get("/auth/me")
 async def auth_me(request: Request):
-    already = (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1"
-    if not already and should_proxy_chat_to_brain():
-        extra = {}
-        if request.headers.get("Authorization"):
-            extra["Authorization"] = request.headers.get("Authorization") or ""
-        if request.headers.get("X-Session-Token"):
-            extra["X-Session-Token"] = request.headers.get("X-Session-Token") or ""
-        proxied = await _proxy_to_mac_brain("GET", "/auth/me", extra_headers=extra, timeout=20.0)
-        if proxied is not None:
-            code, data = proxied
-            return JSONResponse(data if isinstance(data, dict) else {"ok": False}, status_code=code)
+    proxied = await _maybe_proxy_auth(request, "GET", "/auth/me")
+    if proxied is not None:
+        code, data = proxied
+        return JSONResponse(data if isinstance(data, dict) else {"ok": False}, status_code=code)
     if _auth_localhost_ok(request) and not _user_session_from_request(request):
         return {
             "ok": True,
             "email": "local@localhost",
             "localhost": True,
-            "auth": session_auth.status_public(),
+            "auth": operator_auth.status_public(),
         }
     sess = _user_session_from_request(request)
     if not sess:
         return JSONResponse(
-            {"ok": False, "error": "unauthorized", "auth": session_auth.status_public()},
+            {"ok": False, "error": "unauthorized", "auth": operator_auth.status_public()},
             status_code=401,
         )
     return {
         "ok": True,
         "email": sess["email"],
-        "expires_at": sess.get("expires_at"),
-        "auth": session_auth.status_public(),
+        "auth": operator_auth.status_public(),
     }
 
 
 @app.post("/auth/logout")
 async def auth_logout(request: Request):
-    already = (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1"
     raw = await request.body()
-    if not already and should_proxy_chat_to_brain():
-        extra = {}
-        if request.headers.get("Authorization"):
-            extra["Authorization"] = request.headers.get("Authorization") or ""
-        if request.headers.get("X-Session-Token"):
-            extra["X-Session-Token"] = request.headers.get("X-Session-Token") or ""
-        proxied = await _proxy_to_mac_brain(
-            "POST", "/auth/logout", body=raw or b"{}", extra_headers=extra, timeout=15.0
-        )
-        if proxied is not None:
-            code, data = proxied
-            return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=code)
-    token = session_auth.resolve_bearer_token(
-        request.headers.get("Authorization"),
-        alt_header=request.headers.get("X-Session-Token"),
-    )
-    session_store.revoke_session(token)
+    proxied = await _maybe_proxy_auth(request, "POST", "/auth/logout", raw or b"{}")
+    if proxied is not None:
+        code, data = proxied
+        return JSONResponse(data if isinstance(data, dict) else {"ok": True}, status_code=code)
+    payload = _parse_json_body(raw)
+    token = _session_token_from_request(request, payload)
+    operator_auth.revoke_session(token)
     return {"ok": True}
 
 
@@ -2196,10 +2249,9 @@ async def chat_history_endpoint(request: Request):
             status_code=503,
         )
 
-    sess, err = _require_user_session(request)
+    sess, err = _require_user_session(request, strict=operator_auth.auth_required())
     if err is not None:
-        # Soft: return empty history when auth optional
-        if not session_auth.auth_required():
+        if not operator_auth.auth_required():
             return {"ok": True, "messages": [], "auth_required": False}
         return err
     email = (sess or {}).get("email") or "local@localhost"
@@ -2237,8 +2289,8 @@ async def chat_new_conversation(request: Request):
         if proxied is not None:
             code, data = proxied
             return JSONResponse(data if isinstance(data, dict) else {"ok": False}, status_code=code)
-    sess, err = _require_user_session(request)
-    if err is not None and session_auth.auth_required():
+    sess, err = _require_user_session(request, strict=operator_auth.auth_required())
+    if err is not None and operator_auth.auth_required():
         return err
     email = (sess or {}).get("email") or "local@localhost"
     cid = session_store.new_conversation(email, title="New session")
@@ -2250,7 +2302,8 @@ async def chat_endpoint(request: Request):
     """
     Main chat endpoint for the public HUD (Render + tunnel + localhost).
 
-    Operator email-OTP sessions (Mac-local SQLite) gate access when AUTH_REQUIRED.
+    Requires a valid session_token (header or body) from /verify-auth OTP.
+    LangGraph thread_id = authenticated user email (SQLite checkpointer).
     Edge proxies full turns + history to the Mac brain when the tunnel is healthy.
 
     Physical host actions are never executed — returned as client execution intents.
@@ -2266,22 +2319,33 @@ async def chat_endpoint(request: Request):
         if not isinstance(payload, dict):
             payload = {}
 
-        # Operator session (OTP) — independent of brain HMAC
-        user_sess, user_auth_err = _require_user_session(request)
-        if user_auth_err is not None:
+        # Operator session_token required (OTP via /request-auth + /verify-auth)
+        user_sess, user_auth_err = _require_user_session(
+            request,
+            payload,
+            strict=True if operator_auth.auth_required() else None,
+        )
+        # When auth is configured / required, refuse without a valid token
+        if operator_auth.auth_required() and user_auth_err is not None:
             return user_auth_err
+        if operator_auth.auth_required() and not user_sess:
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "error": "unauthorized",
+                    "detail": "Valid session_token required.",
+                    "reply": "Authentication required, Sir. Please verify your email OTP.",
+                },
+                status_code=401,
+            )
         session_email = (user_sess or {}).get("email")
         session_token = (user_sess or {}).get("token")
         if session_token == "localhost-bypass":
-            session_token = session_auth.resolve_bearer_token(
-                request.headers.get("Authorization"),
-                alt_header=request.headers.get("X-Session-Token"),
-            )
+            session_token = _session_token_from_request(request, payload)
         conversation_id = str(payload.get("conversation_id") or "").strip() or None
 
         user_text = (payload.get("text") or "").strip()
-        # Persistent SQLite checkpointer key — must be stable across requests
-        # for the same operator/conversation so tool multi-turn state survives.
+        # Hive-mind key: authenticated email → SqliteSaver thread_id
         thread_id = graph_thread_id_for_operator(session_email, conversation_id)
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
@@ -2321,10 +2385,7 @@ async def chat_endpoint(request: Request):
             proxied = await _proxy_chat_to_mac_brain(
                 proxy_payload,
                 session_token=session_token if session_token and session_token != "localhost-bypass" else (
-                    session_auth.resolve_bearer_token(
-                        request.headers.get("Authorization"),
-                        alt_header=request.headers.get("X-Session-Token"),
-                    )
+                    _session_token_from_request(request, proxy_payload)
                 ),
             )
             if proxied is not None and (proxied.get("reply") or proxied.get("status") == "success"):

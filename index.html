@@ -1170,7 +1170,7 @@
             btn.disabled = true;
             setAuthMsg('Dispatching code via Mac brain…');
             try {
-                const res = await fetch('/auth/request-otp', {
+                const res = await fetch('/request-auth', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email }),
@@ -1201,17 +1201,21 @@
             btn.disabled = true;
             setAuthMsg('Verifying…');
             try {
-                const res = await fetch('/auth/verify-otp', {
+                const res = await fetch('/verify-auth', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email, code }),
+                    body: JSON.stringify({ email, otp: code, code }),
                 });
                 const data = await res.json();
                 if (!data.ok) {
                     setAuthMsg(data.detail || data.error || 'Invalid code.', true);
                     return;
                 }
-                saveSession(data.token, data.email || email, data.conversation_id || '');
+                saveSession(
+                    data.session_token || data.token,
+                    data.email || email,
+                    data.conversation_id || '',
+                );
                 setAuthMsg('Session unlocked.');
                 showAuthGate(false);
                 await loadChatHistory();
