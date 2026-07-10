@@ -63,6 +63,41 @@ https://YOUR-APP.onrender.com/go
 When the free tunnel drops, `tunnel_manager` restarts cloudflared, scrapes the new
 URL, and updates Render again — no manual `.env` edits.
 
+## Free operator auth + chat history (Mac SSD)
+
+No paid identity provider and no cloud database:
+
+| Piece | Where it runs | Cost |
+|--------|----------------|------|
+| Email OTP | Mac `smtplib` → Gmail App Password | Free |
+| Session tokens | SQLite `agent_data/tesract_sessions.db` on Mac | Free |
+| Chat history | Same SQLite (conversations + messages) | Free |
+| Second-laptop UI | Render → Cloudflare tunnel → Mac | Free tunnel |
+
+### Setup (Mac `.env`)
+
+```bash
+AUTH_SMTP_HOST=smtp.gmail.com
+AUTH_SMTP_PORT=587
+AUTH_SMTP_USER=you@gmail.com
+AUTH_SMTP_PASSWORD=your-app-password
+AUTH_SMTP_FROM=you@gmail.com
+AUTH_ALLOWED_EMAILS=you@gmail.com   # optional allow-list
+# Local testing without mail:
+# AUTH_DEV_ECHO_OTP=true
+```
+
+### API
+
+- `GET /auth/status` — auth/smtp flags  
+- `POST /auth/request-otp` `{ "email" }`  
+- `POST /auth/verify-otp` `{ "email", "code" }` → `{ token, conversation_id }`  
+- `GET /auth/me` — Bearer session  
+- `GET /chat/history` — restore messages  
+- `POST /chat` — stores user + assistant turns when a session is present  
+
+On Render, these routes are **proxied to the Mac** whenever the tunnel is healthy.
+
 ## Hybrid: Render edge → Mac brain
 
 When `ENABLE_HYBRID_ROUTING=true` on Render and `tunnel_manager.py` is healthy:

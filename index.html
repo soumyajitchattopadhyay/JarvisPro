@@ -9,7 +9,26 @@
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; font-family: 'Michroma', sans-serif; }
         #canvas-container { position: fixed; inset: 0; z-index: 1; }
-        #hud { position: relative; z-index: 10; width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; padding: 40px; box-sizing: border-box; }
+        #hud {
+            position: relative;
+            z-index: 10;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 22px 28px 18px;
+            box-sizing: border-box;
+        }
+        @media (max-width: 900px) {
+            #hud { padding: 14px 12px 12px; }
+            .chat-panel {
+                height: min(78vh, 720px);
+                max-height: calc(100vh - 170px);
+            }
+            #title-main { display: none; }
+        }
         
         /* STARK ALERT HUD */
         #system-alert { position: fixed; inset: 0; z-index: 100; display: none; flex-direction: column; align-items: center; justify-content: center; background: rgba(255, 0, 0, 0.1); border: 20px solid rgba(255, 0, 0, 0.4); animation: alert-pulse 0.5s infinite alternate; }
@@ -20,40 +39,45 @@
             display: flex;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
+            justify-content: flex-start;
             min-height: 0;
-            gap: 22px;
+            gap: 12px;
+            padding-top: 4px;
         }
         #title-main {
             font-family: 'Syncopate';
-            font-size: clamp(2.2rem, 5vw, 4rem);
+            font-size: clamp(1.1rem, 2.2vw, 1.65rem);
             color: #fff;
-            letter-spacing: clamp(12px, 3vw, 30px);
+            letter-spacing: clamp(8px, 2vw, 18px);
             text-align: center;
-            text-shadow: 0 0 15px #00fbff;
+            text-shadow: 0 0 12px #00fbff;
             transition: 0.5s;
             margin: 0;
             flex-shrink: 0;
+            opacity: 0.92;
         }
 
-        /* ── CHAT PANEL ── */
+        /* ── CHAT PANEL (premium command-center footprint) ── */
         .chat-panel {
             pointer-events: auto;
-            width: min(720px, 92vw);
-            max-height: min(52vh, 460px);
+            width: min(1050px, 95vw);
+            height: min(85vh, 920px);
+            max-height: calc(100vh - 200px);
             display: flex;
             flex-direction: column;
-            border-radius: 16px;
+            border-radius: 14px;
             overflow: hidden;
-            background: linear-gradient(145deg, rgba(4, 12, 18, 0.72) 0%, rgba(0, 0, 0, 0.58) 100%);
-            border: 1px solid rgba(0, 251, 255, 0.14);
+            background: rgba(5, 10, 15, 0.88);
+            border: 1px solid rgba(0, 255, 255, 0.2);
             box-shadow:
-                0 8px 32px rgba(0, 0, 0, 0.45),
-                0 0 0 1px rgba(0, 251, 255, 0.04) inset,
-                0 0 40px rgba(0, 251, 255, 0.04);
-            backdrop-filter: blur(14px) saturate(1.4);
-            -webkit-backdrop-filter: blur(14px) saturate(1.4);
+                0 0 40px rgba(0, 0, 0, 0.8),
+                inset 0 0 20px rgba(0, 255, 255, 0.05),
+                0 0 0 1px rgba(0, 251, 255, 0.04) inset;
+            backdrop-filter: blur(10px) saturate(1.35);
+            -webkit-backdrop-filter: blur(10px) saturate(1.35);
             position: relative;
+            flex-shrink: 1;
+            min-height: 280px;
         }
         .chat-panel::before {
             content: '';
@@ -62,18 +86,19 @@
             height: 1px;
             background: linear-gradient(90deg, transparent, rgba(0, 251, 255, 0.45), transparent);
             pointer-events: none;
+            z-index: 2;
         }
         .chat-panel__header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 12px 18px;
-            border-bottom: 1px solid rgba(0, 251, 255, 0.08);
-            background: rgba(0, 251, 255, 0.03);
-            font-family: 'Orbitron';
+            padding: 12px 20px;
+            border-bottom: 1px solid rgba(0, 255, 255, 0.1);
+            background: rgba(0, 251, 255, 0.025);
+            font-family: 'Orbitron', monospace;
             font-size: 9px;
-            letter-spacing: 3px;
-            color: rgba(0, 251, 255, 0.65);
+            letter-spacing: 2px;
+            color: rgba(0, 251, 255, 0.7);
             flex-shrink: 0;
         }
         .chat-panel__title {
@@ -81,13 +106,30 @@
             align-items: center;
             gap: 10px;
         }
-        .chat-status-dot {
-            width: 7px;
-            height: 7px;
+        .chat-panel__title .status-text {
+            letter-spacing: 2.5px;
+            color: rgba(0, 251, 255, 0.78);
+        }
+        .chat-status-dot,
+        .pulse-dot {
+            width: 8px;
+            height: 8px;
             border-radius: 50%;
-            background: #00fbff;
-            box-shadow: 0 0 8px #00fbff;
+            background: #00ffff;
+            box-shadow: 0 0 8px #00ffff;
+            display: inline-block;
+            flex-shrink: 0;
             animation: status-pulse 2s ease-in-out infinite;
+        }
+        .session-timer {
+            font-family: 'JetBrains Mono', 'Orbitron', monospace;
+            font-size: 10px;
+            letter-spacing: 1.5px;
+            color: rgba(0, 251, 255, 0.55);
+            min-width: 7.5em;
+            text-align: right;
+            tabular-nums: true;
+            font-variant-numeric: tabular-nums;
         }
         .chat-count-badge {
             padding: 3px 10px;
@@ -100,9 +142,11 @@
         }
         .chat-messages-wrap {
             position: relative;
-            flex: 1;
+            flex: 1 1 auto;
             min-height: 0;
             overflow: hidden;
+            display: flex;
+            flex-direction: column;
         }
         .chat-messages-wrap::before,
         .chat-messages-wrap::after {
@@ -110,25 +154,27 @@
             position: absolute;
             left: 0;
             right: 0;
-            height: 20px;
+            height: 24px;
             z-index: 2;
             pointer-events: none;
         }
         .chat-messages-wrap::before {
             top: 0;
-            background: linear-gradient(to bottom, rgba(4, 12, 18, 0.9), transparent);
+            background: linear-gradient(to bottom, rgba(5, 10, 15, 0.95), transparent);
         }
         .chat-messages-wrap::after {
             bottom: 0;
-            background: linear-gradient(to top, rgba(4, 12, 18, 0.9), transparent);
+            background: linear-gradient(to top, rgba(5, 10, 15, 0.95), transparent);
         }
         .chat-messages {
             overflow-y: auto;
-            padding: 16px 18px;
+            padding: 22px 25px;
             display: flex;
             flex-direction: column;
-            gap: 14px;
+            gap: 20px;
             scroll-behavior: smooth;
+            flex: 1 1 auto;
+            min-height: 0;
             height: 100%;
         }
         .chat-messages::-webkit-scrollbar { width: 4px; }
@@ -204,15 +250,36 @@
             text-transform: uppercase;
         }
         .chat-msg--user .chat-msg__label { color: rgba(0, 251, 255, 0.7); margin-bottom: 4px; }
+        /* Cyberpunk holographic image matrix */
         .chat-msg__body img.chat-gen-img,
-        .md-content img {
-            max-width: 100%;
-            border-radius: 4px;
-            border: 1px solid #00ffff;
-            box-shadow: 0 0 10px rgba(0, 255, 255, 0.2);
-            margin-top: 10px;
+        .md-content img,
+        .chat-msg img {
+            max-width: min(650px, 100%);
+            width: auto;
+            height: auto;
+            border-radius: 6px;
+            border: 1px solid rgba(0, 255, 255, 0.3);
+            box-shadow:
+                0 0 25px rgba(0, 255, 255, 0.12),
+                inset 0 0 0 1px rgba(0, 255, 255, 0.06);
+            margin-top: 12px;
             display: block;
-            background: rgba(0, 20, 30, 0.6);
+            background: rgba(0, 20, 30, 0.65);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            cursor: zoom-in;
+        }
+        .chat-msg__body img.chat-gen-img:hover,
+        .md-content img:hover,
+        .chat-msg img:hover {
+            transform: scale(1.02);
+            box-shadow:
+                0 0 32px rgba(0, 255, 255, 0.22),
+                0 0 0 1px rgba(0, 255, 255, 0.35);
+        }
+        /* Soft holographic frame around generated images */
+        .chat-msg__body img.chat-gen-img {
+            outline: 1px solid rgba(0, 255, 255, 0.08);
+            outline-offset: 4px;
         }
         .chat-msg__body {
             color: rgba(210, 248, 255, 0.94);
@@ -481,8 +548,8 @@
             to { opacity: 1; transform: translateY(0) scale(1); }
         }
         @keyframes status-pulse {
-            0%, 100% { opacity: 1; box-shadow: 0 0 8px #00fbff; }
-            50% { opacity: 0.5; box-shadow: 0 0 4px #00fbff; }
+            0%, 100% { opacity: 0.4; box-shadow: 0 0 4px #00ffff; }
+            50% { opacity: 1; box-shadow: 0 0 10px #00ffff; }
         }
         @keyframes typing-bounce {
             0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
@@ -504,9 +571,9 @@
             align-items: center;
             justify-content: center;
             gap: 12px;
-            margin-bottom: 16px;
+            margin-bottom: 12px;
             flex-shrink: 0;
-            width: min(720px, 92vw);
+            width: min(1050px, 95vw);
             margin-left: auto;
             margin-right: auto;
         }
@@ -750,9 +817,152 @@
         .chat-ctrl-mini.is-elevated {
             color: rgba(255, 120, 120, 0.9);
         }
+
+        /* ── AUTH GATE (email OTP) ── */
+        #auth-gate {
+            position: fixed;
+            inset: 0;
+            z-index: 200;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.72);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            pointer-events: auto;
+        }
+        #auth-gate.is-open { display: flex; }
+        .auth-card {
+            width: min(420px, 92vw);
+            padding: 28px 26px 24px;
+            border-radius: 14px;
+            border: 1px solid rgba(0, 255, 255, 0.28);
+            background: rgba(5, 12, 18, 0.95);
+            box-shadow: 0 0 40px rgba(0, 255, 255, 0.08), 0 20px 60px rgba(0, 0, 0, 0.65);
+            font-family: 'Michroma', sans-serif;
+            color: #d2f8ff;
+        }
+        .auth-card__eyebrow {
+            font-family: 'Orbitron', monospace;
+            font-size: 10px;
+            letter-spacing: 3px;
+            color: #00ffff;
+            margin-bottom: 10px;
+        }
+        .auth-card h2 {
+            margin: 0 0 8px;
+            font-family: 'Syncopate', sans-serif;
+            font-size: 1.05rem;
+            letter-spacing: 3px;
+            color: #fff;
+        }
+        .auth-card p {
+            margin: 0 0 18px;
+            font-size: 11px;
+            line-height: 1.55;
+            opacity: 0.7;
+        }
+        .auth-card label {
+            display: block;
+            font-family: 'Orbitron', monospace;
+            font-size: 8px;
+            letter-spacing: 2px;
+            color: rgba(0, 251, 255, 0.55);
+            margin-bottom: 6px;
+        }
+        .auth-card input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 12px 14px;
+            margin-bottom: 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(0, 255, 255, 0.22);
+            background: rgba(0, 0, 0, 0.45);
+            color: #e8feff;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            outline: none;
+            letter-spacing: 0.5px;
+        }
+        .auth-card input:focus {
+            border-color: rgba(0, 255, 255, 0.55);
+            box-shadow: 0 0 16px rgba(0, 255, 255, 0.12);
+        }
+        .auth-card__row {
+            display: flex;
+            gap: 10px;
+            margin-top: 4px;
+        }
+        .auth-card button {
+            flex: 1;
+            padding: 12px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(0, 255, 255, 0.35);
+            background: rgba(0, 255, 255, 0.1);
+            color: #00fbff;
+            font-family: 'Orbitron', monospace;
+            font-size: 10px;
+            letter-spacing: 2px;
+            cursor: pointer;
+            transition: background 0.2s, box-shadow 0.2s;
+        }
+        .auth-card button:hover {
+            background: rgba(0, 255, 255, 0.18);
+            box-shadow: 0 0 18px rgba(0, 255, 255, 0.15);
+        }
+        .auth-card button:disabled {
+            opacity: 0.45;
+            cursor: wait;
+        }
+        .auth-card__msg {
+            min-height: 1.2em;
+            margin-top: 12px;
+            font-size: 11px;
+            color: rgba(0, 251, 255, 0.75);
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .auth-card__msg.is-error { color: #ff7a7a; }
+        .auth-operator {
+            font-family: 'Orbitron', monospace;
+            font-size: 8px;
+            letter-spacing: 1.5px;
+            color: rgba(0, 251, 255, 0.5);
+            max-width: 140px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .auth-logout {
+            background: transparent;
+            border: 1px solid rgba(0, 255, 255, 0.2);
+            color: rgba(0, 251, 255, 0.55);
+            font-family: 'Orbitron', monospace;
+            font-size: 8px;
+            letter-spacing: 1px;
+            padding: 3px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .auth-logout:hover { color: #00fbff; border-color: rgba(0, 255, 255, 0.45); }
     </style>
 </head>
 <body>
+    <div id="auth-gate" aria-hidden="true">
+        <div class="auth-card" role="dialog" aria-labelledby="auth-title">
+            <div class="auth-card__eyebrow">TESrACT // SECURE UPLINK</div>
+            <h2 id="auth-title">OPERATOR ACCESS</h2>
+            <p>Zero-cost email OTP verified by your Mac brain. Chat history stays on your SSD — no cloud DB.</p>
+            <label for="auth-email">EMAIL</label>
+            <input id="auth-email" type="email" autocomplete="email" placeholder="you@domain.com" />
+            <label for="auth-otp">ONE-TIME CODE</label>
+            <input id="auth-otp" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6-digit code" />
+            <div class="auth-card__row">
+                <button type="button" id="auth-send-otp">SEND CODE</button>
+                <button type="button" id="auth-verify">UNLOCK</button>
+            </div>
+            <div class="auth-card__msg" id="auth-msg"></div>
+        </div>
+    </div>
     <div id="system-alert"><div class="alert-text">TESrACT OVERRIDE</div></div>
     <div id="canvas-container"></div>
     <div id="hud">
@@ -771,18 +981,21 @@
         </div>
         <div id="title-container">
             <h1 id="title-main">TESrACT</h1>
-            <div class="chat-panel">
-                <div class="chat-panel__header">
-                    <span class="chat-panel__title">
-                        <span class="chat-status-dot"></span>
-                        COMMS // UPLINK
-                    </span>
+            <div class="chat-panel" role="region" aria-label="TESrACT command center">
+                <div class="chat-panel__header terminal-header">
+                    <div class="chat-panel__title status-indicator">
+                        <span class="chat-status-dot pulse-dot" aria-hidden="true"></span>
+                        <span class="status-text">CORE // ONLINE</span>
+                    </div>
                     <div class="chat-panel__header-actions">
+                        <div class="session-timer" id="hud-clock" aria-label="Session clock">--:--:--</div>
+                        <span class="auth-operator" id="auth-operator" title="Signed-in operator"></span>
+                        <button type="button" class="auth-logout" id="auth-logout" style="display:none" title="Sign out">LOGOUT</button>
                         <span class="chat-ctrl-mini" id="chat-ctrl-mini">CTRL OFF</span>
                         <span id="chat-count" class="chat-count-badge">1 MSG</span>
                     </div>
                 </div>
-                <div class="chat-messages-wrap">
+                <div class="chat-messages-wrap message-history">
                     <div id="chat-messages" class="chat-messages"></div>
                 </div>
             </div>
@@ -824,6 +1037,207 @@
         let isThinking = false, isListening = false, lerpFactor = 0, currentCtrl = false, ctrlToggleBusy = false;
         const chatMessages = document.getElementById('chat-messages');
         const chatCountEl = document.getElementById('chat-count');
+
+        // ── Operator session (email OTP + Mac-local history) ──
+        const SESSION_KEY = 'tesract_session_token';
+        const EMAIL_KEY = 'tesract_session_email';
+        const CONV_KEY = 'tesract_conversation_id';
+        let sessionToken = localStorage.getItem(SESSION_KEY) || '';
+        let sessionEmail = localStorage.getItem(EMAIL_KEY) || '';
+        let conversationId = localStorage.getItem(CONV_KEY) || '';
+        let authRequired = true;
+        let historyLoaded = false;
+
+        function authHeaders(extra = {}) {
+            const h = { ...extra };
+            if (sessionToken) {
+                h['Authorization'] = `Bearer ${sessionToken}`;
+                h['X-Session-Token'] = sessionToken;
+            }
+            return h;
+        }
+
+        function setAuthMsg(text, isError = false) {
+            const el = document.getElementById('auth-msg');
+            if (!el) return;
+            el.textContent = text || '';
+            el.classList.toggle('is-error', !!isError);
+        }
+
+        function showAuthGate(show) {
+            const gate = document.getElementById('auth-gate');
+            if (!gate) return;
+            gate.classList.toggle('is-open', !!show);
+            gate.setAttribute('aria-hidden', show ? 'false' : 'true');
+            const emailEl = document.getElementById('auth-email');
+            if (show && emailEl && sessionEmail) emailEl.value = sessionEmail;
+        }
+
+        function updateAuthChrome() {
+            const op = document.getElementById('auth-operator');
+            const logout = document.getElementById('auth-logout');
+            if (op) op.textContent = sessionEmail ? sessionEmail : '';
+            if (logout) logout.style.display = sessionToken ? 'inline-block' : 'none';
+        }
+
+        function clearSession() {
+            sessionToken = '';
+            sessionEmail = '';
+            conversationId = '';
+            localStorage.removeItem(SESSION_KEY);
+            localStorage.removeItem(EMAIL_KEY);
+            localStorage.removeItem(CONV_KEY);
+            updateAuthChrome();
+        }
+
+        function saveSession(token, email, convId) {
+            sessionToken = token || '';
+            sessionEmail = email || '';
+            if (convId) conversationId = convId;
+            if (sessionToken) localStorage.setItem(SESSION_KEY, sessionToken);
+            else localStorage.removeItem(SESSION_KEY);
+            if (sessionEmail) localStorage.setItem(EMAIL_KEY, sessionEmail);
+            else localStorage.removeItem(EMAIL_KEY);
+            if (conversationId) localStorage.setItem(CONV_KEY, conversationId);
+            updateAuthChrome();
+        }
+
+        async function loadChatHistory() {
+            try {
+                const qs = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}&limit=200` : '?limit=200';
+                const res = await fetch(`/chat/history${qs}`, { headers: authHeaders() });
+                if (res.status === 401) {
+                    clearSession();
+                    if (authRequired) showAuthGate(true);
+                    return;
+                }
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data.conversation_id) {
+                    conversationId = data.conversation_id;
+                    localStorage.setItem(CONV_KEY, conversationId);
+                }
+                const msgs = data.messages || [];
+                if (!msgs.length) return;
+                // Replace welcome-only stream with persisted history
+                chatMessages.innerHTML = '';
+                for (const m of msgs) {
+                    const role = (m.role === 'user') ? 'user' : 'assistant';
+                    appendChatMessage(role, m.content || '');
+                }
+                historyLoaded = true;
+            } catch (e) {
+                console.warn('history load failed', e);
+            }
+        }
+
+        async function bootstrapAuth() {
+            updateAuthChrome();
+            try {
+                const st = await fetch('/auth/status').then((r) => r.json()).catch(() => ({}));
+                authRequired = st.auth_required !== false && st.auth_enabled !== false;
+                if (!authRequired) {
+                    showAuthGate(false);
+                    await loadChatHistory();
+                    return;
+                }
+                if (!sessionToken) {
+                    showAuthGate(true);
+                    return;
+                }
+                const me = await fetch('/auth/me', { headers: authHeaders() });
+                if (!me.ok) {
+                    clearSession();
+                    showAuthGate(true);
+                    return;
+                }
+                const data = await me.json();
+                if (data.email) sessionEmail = data.email;
+                updateAuthChrome();
+                showAuthGate(false);
+                await loadChatHistory();
+            } catch (e) {
+                console.warn('auth bootstrap', e);
+                // Localhost / offline brain: allow HUD without lock when status fails
+                if (!sessionToken) showAuthGate(false);
+            }
+        }
+
+        document.getElementById('auth-send-otp')?.addEventListener('click', async () => {
+            const email = (document.getElementById('auth-email')?.value || '').trim();
+            const btn = document.getElementById('auth-send-otp');
+            if (!email) { setAuthMsg('Enter your email.', true); return; }
+            btn.disabled = true;
+            setAuthMsg('Dispatching code via Mac brain…');
+            try {
+                const res = await fetch('/auth/request-otp', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email }),
+                });
+                const data = await res.json();
+                if (!data.ok) {
+                    setAuthMsg(data.detail || data.error || 'Failed to send code.', true);
+                    return;
+                }
+                sessionEmail = data.email || email;
+                localStorage.setItem(EMAIL_KEY, sessionEmail);
+                let msg = data.detail || 'Code sent.';
+                if (data.dev_code) msg += ` DEV code: ${data.dev_code}`;
+                setAuthMsg(msg, false);
+                document.getElementById('auth-otp')?.focus();
+            } catch (e) {
+                setAuthMsg('Network error — is the Mac tunnel online?', true);
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('auth-verify')?.addEventListener('click', async () => {
+            const email = (document.getElementById('auth-email')?.value || sessionEmail || '').trim();
+            const code = (document.getElementById('auth-otp')?.value || '').trim();
+            const btn = document.getElementById('auth-verify');
+            if (!email || !code) { setAuthMsg('Email and 6-digit code required.', true); return; }
+            btn.disabled = true;
+            setAuthMsg('Verifying…');
+            try {
+                const res = await fetch('/auth/verify-otp', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, code }),
+                });
+                const data = await res.json();
+                if (!data.ok) {
+                    setAuthMsg(data.detail || data.error || 'Invalid code.', true);
+                    return;
+                }
+                saveSession(data.token, data.email || email, data.conversation_id || '');
+                setAuthMsg('Session unlocked.');
+                showAuthGate(false);
+                await loadChatHistory();
+            } catch (e) {
+                setAuthMsg('Verify failed — check tunnel / Mac brain.', true);
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('auth-logout')?.addEventListener('click', async () => {
+            try {
+                await fetch('/auth/logout', { method: 'POST', headers: authHeaders(), body: '{}' });
+            } catch (_) {}
+            clearSession();
+            chatMessages.innerHTML = '';
+            appendChatMessage('assistant', 'AT YOUR SERVICE');
+            if (authRequired) showAuthGate(true);
+        });
+
+        document.getElementById('auth-otp')?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') document.getElementById('auth-verify')?.click();
+        });
+        document.getElementById('auth-email')?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') document.getElementById('auth-send-otp')?.click();
+        });
         const sysAlert = document.getElementById('system-alert');
         const confirmBanner = document.getElementById('confirm-banner');
         const confirmBannerText = document.getElementById('confirm-banner-text');
@@ -1087,17 +1501,13 @@
             return t;
         }
 
-        const GEN_IMG_STYLE =
-            'max-width: 100%; border-radius: 4px; border: 1px solid #00ffff; '
-            + 'box-shadow: 0 0 10px rgba(0, 255, 255, 0.2); margin-top: 10px; display: block;';
-
         function enhanceGeneratedImages(root) {
             if (!root) return;
             root.querySelectorAll('img').forEach((img) => {
                 const src = img.getAttribute('src') || '';
                 if (/\/generated\//i.test(src) || img.classList.contains('chat-gen-img')) {
                     img.classList.add('chat-gen-img');
-                    img.style.cssText = GEN_IMG_STYLE;
+                    // Styling lives in CSS (.chat-gen-img) — holographic frame + hover
                     img.loading = 'lazy';
                     img.alt = img.alt || 'Generated Image';
                     img.onerror = () => {
@@ -1118,8 +1528,7 @@
                 span.innerHTML = val.replace(
                     /(\/generated\/[A-Za-z0-9._/-]+\.(?:png|jpe?g|webp|gif))/gi,
                     (path) =>
-                        `<img class="chat-gen-img" src="${path}" alt="Generated Image" `
-                        + `style="${GEN_IMG_STYLE}" loading="lazy" />`
+                        `<img class="chat-gen-img" src="${path}" alt="Generated Image" loading="lazy" />`
                 );
                 node.parentNode.replaceChild(span, node);
             });
@@ -1203,6 +1612,7 @@
         }
 
         appendChatMessage('assistant', 'AT YOUR SERVICE');
+        bootstrapAuth();
 
         async function processCommand(text) {
             const prompt = (text || '').trim();
@@ -1215,12 +1625,35 @@
             showLoadingMessage();
 
             try {
-                const res = await fetch('/chat', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: prompt}) });
+                if (authRequired && !sessionToken) {
+                    removeLoadingMessage();
+                    showAuthGate(true);
+                    appendChatMessage('assistant', 'Authentication required, Sir. Complete email OTP first.');
+                    isThinking = false;
+                    setInputBusy(false);
+                    document.getElementById('agent-status').innerText = 'STANDBY';
+                    return;
+                }
+                const body = { text: prompt };
+                if (conversationId) body.conversation_id = conversationId;
+                const res = await fetch('/chat', {
+                    method: 'POST',
+                    headers: authHeaders({ 'Content-Type': 'application/json' }),
+                    body: JSON.stringify(body),
+                });
                 let data = {};
                 try {
                     data = await res.json();
                 } catch (_) {
                     data = {};
+                }
+                if (res.status === 401 || data.error === 'auth_required') {
+                    clearSession();
+                    showAuthGate(true);
+                }
+                if (data.conversation_id) {
+                    conversationId = data.conversation_id;
+                    localStorage.setItem(CONV_KEY, conversationId);
                 }
                 // Prefer server `reply`; fall back to auth/error detail so 401s are not silent.
                 let reply = (data && (data.reply || data.detail || data.error)) || '';
@@ -1490,15 +1923,17 @@
 
         // Dedicated reliable clock updater (independent of Three.js loop)
         function updateClock() {
+            const now = new Date();
+            const stamp = now.toLocaleTimeString([], {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+            });
             const clockEl = document.getElementById('clock');
-            if (clockEl) {
-                const now = new Date();
-                clockEl.innerText = now.toLocaleTimeString([], { 
-                    hour: '2-digit', 
-                    minute: '2-digit', 
-                    second: '2-digit' 
-                });
-            }
+            if (clockEl) clockEl.innerText = stamp;
+            // Minimal header session timer (CORE // ONLINE bar)
+            const hudClock = document.getElementById('hud-clock');
+            if (hudClock) hudClock.textContent = stamp;
         }
         updateClock();
         setInterval(updateClock, 1000);
