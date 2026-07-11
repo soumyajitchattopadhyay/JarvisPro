@@ -721,10 +721,14 @@ def extract_pdf_context(file_path: str) -> str:
     """
     Extract full text from a local PDF into active memory.
 
-    Use when Sir uploads a document, provides a path under /agent_data/uploads/,
-    or asks about a PDF/file contents. Call this BEFORE answering from the file.
+    Use ONLY for .pdf paths under /agent_data/uploads/ (or other project-local PDFs).
+    NEVER call this on images (.jpg/.jpeg/.png) — use analyze_uploaded_image instead.
     Large extracts are middle-truncated (~3k chars) to protect Render RAM / checkpointer.
     """
+    # Hard gate on extension so image uploads never enter the PDF parser
+    if not (file_path or "").strip().lower().endswith(".pdf"):
+        return "Error: This tool is for PDFs only. Use the image tool for images."
+
     try:
         path = _resolve_project_file_path(file_path)
     except FileNotFoundError as exc:
@@ -736,10 +740,7 @@ def extract_pdf_context(file_path: str) -> str:
         return _tool_err("extract_pdf_context", f"Invalid path: {exc}")
 
     if path.suffix.lower() != ".pdf":
-        return _tool_err(
-            "extract_pdf_context",
-            f"Not a PDF file: {path.name}. Provide a .pdf path (e.g. /agent_data/uploads/….pdf).",
-        )
+        return "Error: This tool is for PDFs only. Use the image tool for images."
 
     try:
         from pypdf import PdfReader
@@ -822,6 +823,241 @@ def extract_pdf_context(file_path: str) -> str:
         except Exception:
             pass
         gc.collect()
+
+
+_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
+# Prefer env override; try common local vision tags in order.
+_VISION_MODEL_CANDIDATES = (
+    os.getenv("OLLAMA_VISION_MODEL", "").strip(),
+    "llama3.2-vision",
+    "llava",
+    "llava:latest",
+    "moondream",
+)
+
+
+def _ollama_host() -> str:
+    return (os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
+
+
+def _vision_model_candidates() -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in _VISION_MODEL_CANDIDATES:
+        key = (name or "").strip()
+        if not key:
+            continue
+        low = key.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(key)
+    return out or ["llava", "llama3.2-vision"]
+
+
+def _call_ollama_vision(image_path: Path, prompt: str) -> tuple[str, str]:
+    """
+    Send image + prompt to a local Ollama vision model.
+
+    Returns (model_used, response_text). Raises RuntimeError with a user-facing
+    message when Ollama is down or no vision model is pulled.
+    """
+    models = _vision_model_candidates()
+    last_err: Exception | None = None
+    missing_models: list[str] = []
+
+    # Prefer official Ollama Python client (local daemon).
+    try:
+        import ollama  # type: ignore
+    except ImportError:
+        ollama = None  # type: ignore
+
+    if ollama is not None:
+        try:
+            client = ollama.Client(host=_ollama_host())
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not connect to local Ollama at {_ollama_host()}: {exc}. "
+                "Start Ollama (e.g. `ollama serve`) and pull a vision model."
+            ) from exc
+
+        for model in models:
+            try:
+                response = client.chat(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt,
+                            "images": [str(image_path)],
+                        }
+                    ],
+                )
+                # ollama>=0.4 returns ChatResponse; older returns dict
+                if isinstance(response, dict):
+                    content = (
+                        (response.get("message") or {}).get("content")
+                        or response.get("response")
+                        or ""
+                    )
+                else:
+                    msg = getattr(response, "message", None)
+                    content = (
+                        getattr(msg, "content", None)
+                        if msg is not None
+                        else str(response)
+                    ) or ""
+                content = str(content).strip()
+                if not content:
+                    raise RuntimeError(f"Empty response from vision model {model!r}")
+                return model, content
+            except Exception as exc:
+                last_err = exc
+                err_s = str(exc).lower()
+                if (
+                    "not found" in err_s
+                    or "pull" in err_s
+                    or "model" in err_s and "404" in err_s
+                    or "try pulling" in err_s
+                ):
+                    missing_models.append(model)
+                    continue
+                # Connection refused / daemon down
+                if any(
+                    k in err_s
+                    for k in ("connection", "refused", "connect", "unreachable", "timed out")
+                ):
+                    raise RuntimeError(
+                        f"Local Ollama is not reachable at {_ollama_host()}: {exc}. "
+                        "Start Ollama, then run: ollama pull llava  (or llama3.2-vision)"
+                    ) from exc
+                # Other model errors — try next candidate
+                missing_models.append(model)
+                continue
+
+    # httpx fallback (same API the rest of TESrACT uses for health checks)
+    try:
+        import base64
+
+        raw = image_path.read_bytes()
+        # Soft cap ~8MB encoded payload to avoid OOM on free tier
+        max_bytes = int(os.getenv("VISION_MAX_IMAGE_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024))
+        if len(raw) > max_bytes:
+            raise RuntimeError(
+                f"Image too large for vision tool ({len(raw)} bytes; limit {max_bytes})."
+            )
+        b64 = base64.b64encode(raw).decode("ascii")
+        del raw
+        host = _ollama_host()
+        for model in models:
+            try:
+                with httpx.Client(timeout=float(os.getenv("OLLAMA_TIMEOUT", "90") or "90")) as client:
+                    res = client.post(
+                        f"{host}/api/chat",
+                        json={
+                            "model": model,
+                            "stream": False,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": prompt,
+                                    "images": [b64],
+                                }
+                            ],
+                        },
+                    )
+                if res.status_code == 404 or (
+                    res.status_code >= 400
+                    and "not found" in (res.text or "").lower()
+                ):
+                    missing_models.append(model)
+                    last_err = RuntimeError(res.text[:300])
+                    continue
+                res.raise_for_status()
+                data = res.json()
+                content = (
+                    (data.get("message") or {}).get("content")
+                    or data.get("response")
+                    or ""
+                ).strip()
+                if not content:
+                    raise RuntimeError(f"Empty response from vision model {model!r}")
+                return model, content
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                last_err = exc
+                err_s = str(exc).lower()
+                if any(k in err_s for k in ("connection", "refused", "connect", "unreachable")):
+                    raise RuntimeError(
+                        f"Local Ollama is not reachable at {host}: {exc}. "
+                        "Start Ollama, then run: ollama pull llava  (or llama3.2-vision)"
+                    ) from exc
+                missing_models.append(model)
+                continue
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        last_err = exc
+
+    tried = ", ".join(models) if models else "(none)"
+    pull_hint = "ollama pull llava" if "llava" in tried else f"ollama pull {models[0]}"
+    detail = f" Last error: {last_err}" if last_err else ""
+    raise RuntimeError(
+        f"No local vision model available (tried: {tried}). "
+        f"Please pull a vision model on this Mac, e.g. `{pull_hint}` "
+        f"or `ollama pull llama3.2-vision`, then retry.{detail}"
+    )
+
+
+@tool
+def analyze_uploaded_image(file_path: str, prompt: str = "") -> str:
+    """
+    Analyze an uploaded image with a local Ollama vision model (llava / llama3.2-vision).
+
+    Use when Sir uploads an image (.jpg, .jpeg, .png, …) under /agent_data/uploads/
+    or asks what is in a picture. NEVER use extract_pdf_context on image files.
+    `prompt` is the question about the image (defaults to a general describe request).
+    """
+    try:
+        path = _resolve_project_file_path(file_path)
+    except FileNotFoundError as exc:
+        return _tool_err(
+            "analyze_uploaded_image",
+            f"FileNotFoundError: could not open image at {file_path!r} ({exc}).",
+        )
+    except Exception as exc:
+        return _tool_err("analyze_uploaded_image", f"Invalid path: {exc}")
+
+    if path.suffix.lower() not in _IMAGE_EXTENSIONS:
+        return _tool_err(
+            "analyze_uploaded_image",
+            f"Not an image file: {path.name}. "
+            "Use extract_pdf_context for PDFs, or provide .jpg/.jpeg/.png.",
+        )
+
+    question = (prompt or "").strip() or (
+        "Describe this image in detail. Note any text, objects, people, and context."
+    )
+
+    try:
+        model, content = _call_ollama_vision(path, question)
+        # Bound tool output so LangGraph checkpoints stay lean
+        max_chars = int(os.getenv("VISION_RESULT_MAX_CHARS", "4000") or "4000")
+        truncated = False
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n\n[…truncated…]"
+            truncated = True
+        body = (
+            f"Source: {path.name}\n"
+            f"Model: {model}\n"
+            f"Prompt: {question}\n"
+            f"Truncated: {truncated}\n\n"
+            f"{content}"
+        )
+        return _tool_ok("analyze_uploaded_image", body)
+    except Exception as exc:
+        return _tool_err("analyze_uploaded_image", str(exc))
 
 
 @tool
@@ -1199,6 +1435,7 @@ tools = [
     generate_free_image,
     generate_image,
     extract_pdf_context,
+    analyze_uploaded_image,
     execute_python_code,
     read_file,
     write_file,
@@ -1448,6 +1685,7 @@ _PSEUDO_TOOL_CALL_RE = re.compile(
 _KNOWN_TOOL_NAMES = frozenset({
     "web_search", "search_and_summarize", "recall_memory", "save_memory_note",
     "manage_task_plan", "generate_free_image", "generate_image", "extract_pdf_context",
+    "analyze_uploaded_image",
     "execute_python_code",
     "read_file", "write_file", "create_directory", "list_directory",
     "run_terminal_command", "open_url_in_browser", "get_current_time",
@@ -1867,6 +2105,51 @@ def infer_forced_tools(user_text: str) -> list[tuple[str, dict]]:
         elif not path.startswith("/") and ("uploads" in text or "ATTACHED" in text):
             path = f"/agent_data/uploads/{Path(path).name}"
         inferred.append(("extract_pdf_context", {"file_path": path}))
+
+    # Uploaded / mentioned image → vision tool (never extract_pdf_context)
+    img_match = (
+        re.search(
+            r"(/agent_data/uploads/[A-Za-z0-9._/-]+\.(?:png|jpe?g|gif|webp|bmp))",
+            text,
+            re.I,
+        )
+        or re.search(
+            r"(agent_data/uploads/[A-Za-z0-9._/-]+\.(?:png|jpe?g|gif|webp|bmp))",
+            text,
+            re.I,
+        )
+        or re.search(r"\b([A-Za-z0-9._-]+\.(?:png|jpe?g|gif|webp|bmp))\b", text, re.I)
+    )
+    if img_match and (
+        re.search(
+            r"\b(image|picture|photo|png|jpe?g|upload|file|describe|analyze|what(?:'s| is)|see|look)\b",
+            text,
+            re.I,
+        )
+        or "/agent_data/uploads/" in text
+        or "ATTACHED UPLOADS" in text
+        or "(image)" in text.lower()
+    ):
+        path = img_match.group(1)
+        if path.startswith("agent_data/"):
+            path = "/" + path
+        elif not path.startswith("/") and ("uploads" in text or "ATTACHED" in text):
+            path = f"/agent_data/uploads/{Path(path).name}"
+        # Strip attachment boilerplate for a cleaner vision prompt
+        vision_prompt = re.sub(
+            r"\n*\[ATTACHED UPLOADS[^\]]*\][\s\S]*$",
+            "",
+            text,
+            flags=re.I,
+        ).strip()
+        if not vision_prompt or vision_prompt.lower() in {"analyze", "describe", "what is this"}:
+            vision_prompt = (
+                "Describe this image in detail. Note any text, objects, people, and context."
+            )
+        inferred.append(
+            ("analyze_uploaded_image", {"file_path": path, "prompt": vision_prompt})
+        )
+
     if _RECALL_QUERY_RE.search(text):
         inferred.append(("recall_memory", {"query": _clean_search_query(text) or text}))
     if _TASK_VIEW_RE.search(text):
