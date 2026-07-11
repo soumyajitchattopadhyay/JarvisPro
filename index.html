@@ -1160,6 +1160,67 @@
         let authRequired = true;
         let historyLoaded = false;
 
+        // ── Mac brain / Cloudflare tunnel base (hybrid edge → local disk) ──
+        // When the HUD is served from Render, relative /upload lands on cloud disk.
+        // Resolve the live trycloudflare URL and POST uploads (and media) there.
+        let brainBaseUrl = ''; // e.g. https://….trycloudflare.com ; '' = same-origin
+        let brainBaseCheckedAt = 0;
+        const BRAIN_BASE_TTL_MS = 60_000;
+
+        function isLocalOrTunnelHost(hostname) {
+            const h = String(hostname || '').toLowerCase();
+            return (
+                h === 'localhost'
+                || h === '127.0.0.1'
+                || h === '0.0.0.0'
+                || h.endsWith('.trycloudflare.com')
+                || h.endsWith('.cfargotunnel.com')
+                || h.endsWith('.ngrok-free.app')
+                || h.endsWith('.ngrok.io')
+                || h.endsWith('.ngrok-free.dev')
+            );
+        }
+
+        async function resolveBrainBaseUrl(force = false) {
+            // Already on Mac / tunnel — relative paths hit the edge node.
+            if (isLocalOrTunnelHost(window.location.hostname)) {
+                brainBaseUrl = '';
+                brainBaseCheckedAt = Date.now();
+                return brainBaseUrl;
+            }
+            const now = Date.now();
+            if (!force && brainBaseCheckedAt && (now - brainBaseCheckedAt) < BRAIN_BASE_TTL_MS) {
+                return brainBaseUrl;
+            }
+            try {
+                const res = await fetch('/api/global-brain');
+                const data = await res.json().catch(() => ({}));
+                if (res.ok && data && data.online && data.url) {
+                    brainBaseUrl = String(data.url).replace(/\/+$/, '');
+                } else {
+                    brainBaseUrl = '';
+                }
+            } catch (_) {
+                brainBaseUrl = '';
+            }
+            brainBaseCheckedAt = now;
+            return brainBaseUrl;
+        }
+
+        /** Absolute API URL on the active Mac tunnel when hybrid; else same-origin. */
+        function apiUrl(path) {
+            const p = (!path || path.startsWith('/')) ? (path || '/') : `/${path}`;
+            if (!brainBaseUrl) return p;
+            return `${brainBaseUrl}${p}`;
+        }
+
+        /** Media / static path (uploads previews) — same hybrid prefix as apiUrl. */
+        function mediaUrl(path) {
+            if (!path) return path;
+            if (/^https?:\/\//i.test(path)) return path;
+            return apiUrl(path.startsWith('/') ? path : `/${path}`);
+        }
+
         function authHeaders(extra = {}) {
             const h = { ...extra };
             if (sessionToken) {
@@ -1245,6 +1306,8 @@
 
         async function bootstrapAuth() {
             updateAuthChrome();
+            // Resolve live Mac tunnel early so /upload does not land on Render disk.
+            await resolveBrainBaseUrl(true);
             try {
                 const st = await fetch('/auth/status').then((r) => r.json()).catch(() => ({}));
                 authRequired = st.auth_required !== false && st.auth_enabled !== false;
@@ -1749,7 +1812,8 @@
                 chip.className = 'upload-chip';
                 let thumb = '';
                 if (att.is_image && att.file_path) {
-                    thumb = `<img src="${att.file_path}" alt="" />`;
+                    const src = mediaUrl(att.file_path).replace(/"/g, '&quot;');
+                    thumb = `<img src="${src}" alt="" />`;
                 } else {
                     thumb = '<i class="fa-solid fa-file" style="color:#00fbff;opacity:.8"></i>';
                 }
@@ -1774,7 +1838,8 @@
             const path = att.file_path || '';
             let html = `**UPLINK COMPLETE** — \`${name}\`\n`;
             if (att.is_image && path) {
-                html += `![${name}](${path})`;
+                // Preview via tunnel host when HUD is on Render; tools still get relative path.
+                html += `![${name}](${mediaUrl(path)})`;
             } else {
                 html += `Stored at \`${path}\``;
             }
@@ -1803,19 +1868,32 @@
             const form = new FormData();
             form.append('file', file, file.name);
 
-            // Relative /upload works for localhost, Render, and Cloudflare tunnel hosts.
+            // Prefer live Mac tunnel URL (same hybrid edge node as chat tools).
+            // Relative /upload on Render would save to cloud disk → split-brain with tools.
+            await resolveBrainBaseUrl();
+            const uploadUrl = apiUrl('/upload');
             const headers = authHeaders();
             // Do NOT set Content-Type — browser sets multipart boundary.
+            // Cross-origin tunnel posts are allowed (backend CORS *).
 
-            const res = await fetch('/upload', {
+            const res = await fetch(uploadUrl, {
                 method: 'POST',
                 headers,
                 body: form,
+                mode: 'cors',
             });
             let data = {};
             try { data = await res.json(); } catch (_) { data = {}; }
             if (!res.ok || data.status !== 'success') {
-                throw new Error(data.detail || data.error || `Upload failed (HTTP ${res.status})`);
+                const where = brainBaseUrl ? `tunnel ${brainBaseUrl}` : 'this host';
+                throw new Error(
+                    data.detail || data.error || `Upload failed (HTTP ${res.status}) via ${where}`,
+                );
+            }
+            // Keep canonical relative path for agent tools; tag routing for debugging.
+            if (data && typeof data === 'object') {
+                data.brain_base = brainBaseUrl || window.location.origin;
+                data.upload_url = uploadUrl;
             }
             return data;
         }
