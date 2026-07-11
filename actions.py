@@ -671,32 +671,68 @@ def generate_image(prompt: str, style: str = ""):
 
 def _resolve_project_file_path(file_path: str) -> Path:
     """
-    Resolve upload / project-local paths for document extraction.
+    Resolve upload / project-local paths for document / image tools.
 
-    Accepts HUD paths like /agent_data/uploads/uuid.pdf or relative agent_data/...
+    The HUD passes URL-style paths with a leading slash
+    (e.g. ``/agent_data/uploads/uuid.jpeg``). Treating that as a filesystem
+    absolute path looks under the server root and raises FileNotFoundError.
+    Strip leading slashes and join against the process CWD (project root).
     Blocks path escape outside the project tree.
     """
     raw = (file_path or "").strip().strip("'\"")
     if not raw:
         raise FileNotFoundError("empty file_path")
-    # URL-style path from the upload endpoint
-    if raw.startswith("/agent_data/"):
-        candidate = WORKSPACE_ROOT / raw.lstrip("/")
-    elif raw.startswith("agent_data/") or raw.startswith("generated/"):
-        candidate = WORKSPACE_ROOT / raw
-    else:
-        p = Path(raw).expanduser()
-        candidate = p if p.is_absolute() else (WORKSPACE_ROOT / p)
-    try:
-        resolved = candidate.resolve()
-        root = WORKSPACE_ROOT.resolve()
-        # Allow only project-local files (uploads, generated, agent_data)
-        resolved.relative_to(root)
-    except Exception as exc:
-        raise FileNotFoundError(f"path not allowed or not found: {raw}") from exc
-    if not resolved.is_file():
-        raise FileNotFoundError(str(resolved))
-    return resolved
+
+    root = WORKSPACE_ROOT.resolve()
+    cwd_root = Path(os.getcwd()).resolve()
+    candidates: list[Path] = []
+
+    # Prefer already-resolved absolute paths under project/CWD (no double-join)
+    expanded = Path(raw).expanduser()
+    if expanded.is_absolute():
+        try:
+            exp_res = expanded.resolve(strict=False)
+            under_project = False
+            try:
+                exp_res.relative_to(root)
+                under_project = True
+            except ValueError:
+                try:
+                    exp_res.relative_to(cwd_root)
+                    under_project = True
+                except ValueError:
+                    under_project = False
+            if under_project:
+                candidates.append(expanded)
+        except Exception:
+            pass
+
+    # Frontend: /agent_data/uploads/... → agent_data/uploads/... under CWD
+    clean_path = raw.lstrip("/")
+    actual_path = os.path.join(os.getcwd(), clean_path)
+    for c in (Path(actual_path), WORKSPACE_ROOT / clean_path):
+        if c not in candidates:
+            candidates.append(c)
+
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            # Must stay under project root or current working directory
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                resolved.relative_to(cwd_root)
+            if resolved.is_file():
+                return resolved
+            last_err = FileNotFoundError(str(resolved))
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    raise FileNotFoundError(
+        f"path not allowed or not found: {raw!r} (tried under CWD and project root)"
+    ) from last_err
 
 
 def _truncate_middle_for_memory(text: str, max_chars: int = 3000) -> tuple[str, bool]:
@@ -729,12 +765,17 @@ def extract_pdf_context(file_path: str) -> str:
     if not (file_path or "").strip().lower().endswith(".pdf"):
         return "Error: This tool is for PDFs only. Use the image tool for images."
 
+    # HUD paths arrive as /agent_data/... (URL-absolute). Never open as FS root.
+    clean_path = (file_path or "").lstrip("/")
+    actual_path = os.path.join(os.getcwd(), clean_path)
+
     try:
-        path = _resolve_project_file_path(file_path)
+        path = _resolve_project_file_path(actual_path)
     except FileNotFoundError as exc:
         return _tool_err(
             "extract_pdf_context",
-            f"FileNotFoundError: could not open PDF at {file_path!r} ({exc}).",
+            f"FileNotFoundError: could not open PDF at {file_path!r} "
+            f"(resolved {actual_path!r}: {exc}).",
         )
     except Exception as exc:
         return _tool_err("extract_pdf_context", f"Invalid path: {exc}")
@@ -756,11 +797,13 @@ def extract_pdf_context(file_path: str) -> str:
     pages_text: list[str] = []
     page_count = 0
     try:
+        # Open via resolved absolute path under project/CWD (not server root)
+        open_path = str(path)
         # strict=False reduces some validation overhead on damaged PDFs
         try:
-            reader = PdfReader(str(path), strict=False)
+            reader = PdfReader(open_path, strict=False)
         except TypeError:
-            reader = PdfReader(str(path))
+            reader = PdfReader(open_path)
         page_count = len(reader.pages)
         # Gather only a bit more than max_chars so middle-truncate still has tail context
         gather_budget = max(max_chars * 3, max_chars + 512)
@@ -1019,12 +1062,17 @@ def analyze_uploaded_image(file_path: str, prompt: str = "") -> str:
     or asks what is in a picture. NEVER use extract_pdf_context on image files.
     `prompt` is the question about the image (defaults to a general describe request).
     """
+    # HUD paths arrive as /agent_data/... (URL-absolute). Never open as FS root.
+    clean_path = (file_path or "").lstrip("/")
+    actual_path = os.path.join(os.getcwd(), clean_path)
+
     try:
-        path = _resolve_project_file_path(file_path)
+        path = _resolve_project_file_path(actual_path)
     except FileNotFoundError as exc:
         return _tool_err(
             "analyze_uploaded_image",
-            f"FileNotFoundError: could not open image at {file_path!r} ({exc}).",
+            f"FileNotFoundError: could not open image at {file_path!r} "
+            f"(resolved {actual_path!r}: {exc}).",
         )
     except Exception as exc:
         return _tool_err("analyze_uploaded_image", f"Invalid path: {exc}")
@@ -1041,6 +1089,7 @@ def analyze_uploaded_image(file_path: str, prompt: str = "") -> str:
     )
 
     try:
+        # Pass resolved absolute path so Ollama never sees a leading-slash URL path
         model, content = _call_ollama_vision(path, question)
         # Bound tool output so LangGraph checkpoints stay lean
         max_chars = int(os.getenv("VISION_RESULT_MAX_CHARS", "4000") or "4000")
