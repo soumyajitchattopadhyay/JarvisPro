@@ -2320,11 +2320,10 @@ async def upload_file_endpoint(
     """
     Ingest a multipart file from the HUD into agent_data/uploads/.
 
-    Returns a public path under /agent_data/uploads/{uuid}{ext} for preview
-    and for attaching context to the next /chat prompt.
-    When hybrid routing is healthy, the edge proxies the bytes to the Mac brain
-    so tools operate on the same disk as the rest of the agent.
+    Streams to disk with shutil.copyfileobj (chunked) — never await file.read()
+    into a single RAM buffer (Render OOM guard).
     """
+    import shutil
     import uuid
     from pathlib import Path
 
@@ -2336,20 +2335,49 @@ async def upload_file_endpoint(
     original = (file.filename or "upload.bin").strip() or "upload.bin"
     original = Path(original).name  # strip client path components
     content_type = file.content_type or "application/octet-stream"
+    max_bytes = int(os.getenv("UPLOAD_MAX_BYTES", str(25 * 1024 * 1024)) or str(25 * 1024 * 1024))
+    chunk_size = int(os.getenv("UPLOAD_CHUNK_BYTES", str(64 * 1024)) or str(64 * 1024))
+
+    ext = Path(original).suffix.lower()
+    if ext and not re.fullmatch(r"\.[a-z0-9]{1,12}", ext):
+        ext = ""
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    dest = os.path.join(_uploads_dir, safe_name)
+
+    # Stream upload → disk in chunks (no full-file RAM buffer).
     try:
-        data = await file.read()
+        with open(dest, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer, length=max(8 * 1024, chunk_size))
     except Exception as exc:
+        try:
+            if os.path.isfile(dest):
+                os.remove(dest)
+        except Exception:
+            pass
         return JSONResponse(
-            {"status": "error", "detail": f"Failed to read upload: {exc}"},
-            status_code=400,
+            {"status": "error", "detail": f"Failed to stream upload to disk: {exc}"},
+            status_code=500,
         )
-    if not data:
+
+    try:
+        size_bytes = os.path.getsize(dest)
+    except OSError:
+        size_bytes = 0
+
+    if size_bytes <= 0:
+        try:
+            os.remove(dest)
+        except Exception:
+            pass
         return JSONResponse(
             {"status": "error", "detail": "Empty upload."},
             status_code=400,
         )
-    max_bytes = int(os.getenv("UPLOAD_MAX_BYTES", str(25 * 1024 * 1024)) or str(25 * 1024 * 1024))
-    if len(data) > max_bytes:
+    if size_bytes > max_bytes:
+        try:
+            os.remove(dest)
+        except Exception:
+            pass
         return JSONResponse(
             {"status": "error", "detail": f"File exceeds limit ({max_bytes} bytes)."},
             status_code=413,
@@ -2357,7 +2385,7 @@ async def upload_file_endpoint(
 
     already = (request.headers.get("X-TESrACT-Proxied") or "").strip() == "1"
     if not already and should_proxy_chat_to_brain():
-        # Forward multipart to Mac so uploads land on the brain SSD.
+        # Stream disk file to Mac (file object — not bytes()) so edge RAM stays flat.
         try:
             import httpx
 
@@ -2372,12 +2400,13 @@ async def upload_file_endpoint(
                 if tok:
                     headers["X-Session-Token"] = tok
                 timeout = float(os.getenv("LOCAL_INSTANCE_TIMEOUT", "120") or "120")
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                    res = await client.post(
-                        f"{base.rstrip('/')}/upload",
-                        headers=headers,
-                        files={"file": (original, data, content_type)},
-                    )
+                with open(dest, "rb") as stream_fh:
+                    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                        res = await client.post(
+                            f"{base.rstrip('/')}/upload",
+                            headers=headers,
+                            files={"file": (original, stream_fh, content_type)},
+                        )
                 try:
                     body = res.json()
                 except Exception:
@@ -2385,36 +2414,25 @@ async def upload_file_endpoint(
                 if isinstance(body, dict):
                     body.setdefault("brain_route", "mac_proxy")
                 if res.status_code < 400 and isinstance(body, dict) and body.get("status") == "success":
+                    # Drop edge-local temp copy; Mac owns the canonical file
+                    try:
+                        os.remove(dest)
+                    except Exception:
+                        pass
                     return JSONResponse(body, status_code=res.status_code)
                 print(f"[TESrACT:upload] proxy HTTP {res.status_code}: {str(body)[:200]}")
         except Exception as exc:
             print(f"[TESrACT:upload] proxy failed: {exc}")
-            # Fall through to local save on edge
-
-    ext = Path(original).suffix.lower()
-    if ext and not re.fullmatch(r"\.[a-z0-9]{1,12}", ext):
-        ext = ""
-    safe_name = f"{uuid.uuid4().hex}{ext}"
-    dest = os.path.join(_uploads_dir, safe_name)
-
-    try:
-        with open(dest, "wb") as fh:
-            fh.write(data)
-    except Exception as exc:
-        print(f"[TESrACT:upload] write failed: {exc}")
-        return JSONResponse(
-            {"status": "error", "detail": f"Failed to store file: {exc}"},
-            status_code=500,
-        )
+            # Keep local dest as fallback when proxy fails
 
     public_path = f"/agent_data/uploads/{safe_name}"
-    print(f"[TESrACT:upload] saved {original} → {public_path} ({len(data)} bytes)")
+    print(f"[TESrACT:upload] streamed {original} → {public_path} ({size_bytes} bytes)")
     return {
         "status": "success",
         "file_path": public_path,
         "original_name": original,
         "content_type": content_type,
-        "size_bytes": len(data),
+        "size_bytes": size_bytes,
         "is_image": content_type.startswith("image/")
         or ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"),
     }

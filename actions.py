@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import re
@@ -698,6 +699,23 @@ def _resolve_project_file_path(file_path: str) -> Path:
     return resolved
 
 
+def _truncate_middle_for_memory(text: str, max_chars: int = 3000) -> tuple[str, bool]:
+    """
+    Keep head + tail of a large extraction so LangGraph/SQLite state stays small.
+    """
+    if max_chars < 64:
+        max_chars = 64
+    if len(text) <= max_chars:
+        return text, False
+    marker = "\n\n[...TRUNCATED FOR MEMORY...]\n\n"
+    budget = max_chars - len(marker)
+    if budget < 32:
+        return text[:max_chars], True
+    head_n = budget // 2
+    tail_n = budget - head_n
+    return text[:head_n] + marker + text[-tail_n:], True
+
+
 @tool
 def extract_pdf_context(file_path: str) -> str:
     """
@@ -705,6 +723,7 @@ def extract_pdf_context(file_path: str) -> str:
 
     Use when Sir uploads a document, provides a path under /agent_data/uploads/,
     or asks about a PDF/file contents. Call this BEFORE answering from the file.
+    Large extracts are middle-truncated (~3k chars) to protect Render RAM / checkpointer.
     """
     try:
         path = _resolve_project_file_path(file_path)
@@ -730,9 +749,21 @@ def extract_pdf_context(file_path: str) -> str:
             "pypdf is not installed. Run: pip install pypdf",
         )
 
+    # Default 3000 chars — keeps tool output + LangGraph SQLite checkpoints lean on 512MB Render
+    max_chars = int(os.getenv("PDF_EXTRACT_MAX_CHARS", "3000") or "3000")
+    reader = None
+    pages_text: list[str] = []
+    page_count = 0
     try:
-        reader = PdfReader(str(path))
-        pages_text: list[str] = []
+        # strict=False reduces some validation overhead on damaged PDFs
+        try:
+            reader = PdfReader(str(path), strict=False)
+        except TypeError:
+            reader = PdfReader(str(path))
+        page_count = len(reader.pages)
+        # Gather only a bit more than max_chars so middle-truncate still has tail context
+        gather_budget = max(max_chars * 3, max_chars + 512)
+        total = 0
         for i, page in enumerate(reader.pages):
             try:
                 text = page.extract_text() or ""
@@ -740,26 +771,38 @@ def extract_pdf_context(file_path: str) -> str:
                 text = f"[page {i + 1} extract error: {page_exc}]"
             text = text.strip()
             if text:
-                pages_text.append(f"--- Page {i + 1} ---\n{text}")
+                block = f"--- Page {i + 1} ---\n{text}"
+                pages_text.append(block)
+                total += len(block)
+            # Stop early — no need to parse the whole book into RAM on free tier
+            if total >= gather_budget:
+                pages_text.append(
+                    f"\n[…stopped after page {i + 1}/{page_count} for memory limits…]"
+                )
+                break
+            # Drop page reference promptly
+            del page
+
         combined = "\n\n".join(pages_text).strip()
+        pages_text.clear()
+        del pages_text
+
         if not combined:
-            return _tool_ok(
-                "extract_pdf_context",
-                f"PDF opened ({path.name}, {len(reader.pages)} page(s)) but no extractable text "
-                "(may be scanned/image-only).",
+            body = (
+                f"PDF opened ({path.name}, {page_count} page(s)) but no extractable text "
+                "(may be scanned/image-only)."
             )
-        # Soft cap so tool output does not blow the context window
-        max_chars = int(os.getenv("PDF_EXTRACT_MAX_CHARS", "80000") or "80000")
-        truncated = False
-        if len(combined) > max_chars:
-            combined = combined[:max_chars] + "\n\n[…truncated…]"
-            truncated = True
+            return _tool_ok("extract_pdf_context", body)
+
+        combined, truncated = _truncate_middle_for_memory(combined, max_chars=max_chars)
         body = (
-            f"Source: {path.as_posix()}\n"
-            f"Pages: {len(reader.pages)}\n"
+            f"Source: {path.name}\n"
+            f"Pages: {page_count}\n"
             f"Truncated: {truncated}\n\n"
             f"{combined}"
         )
+        # Free large string intermediate before packaging tool result
+        del combined
         return _tool_ok("extract_pdf_context", body)
     except FileNotFoundError as exc:
         return _tool_err(
@@ -768,6 +811,17 @@ def extract_pdf_context(file_path: str) -> str:
         )
     except Exception as exc:
         return _tool_err("extract_pdf_context", f"Failed to read PDF: {exc}")
+    finally:
+        # Ruthlessly dump PDF parser / page objects (Render 512MB OOM guard)
+        try:
+            del reader
+        except Exception:
+            pass
+        try:
+            del pages_text
+        except Exception:
+            pass
+        gc.collect()
 
 
 @tool
