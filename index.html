@@ -281,6 +281,117 @@
             outline: 1px solid rgba(0, 255, 255, 0.08);
             outline-offset: 4px;
         }
+        /* Downloadable asset frame (images, files, rubric cards) */
+        .asset-frame {
+            position: relative;
+            display: inline-block;
+            max-width: min(650px, 100%);
+            margin-top: 12px;
+            vertical-align: top;
+        }
+        .asset-frame img {
+            margin-top: 0 !important;
+            max-width: 100%;
+            display: block;
+        }
+        .asset-frame__bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px;
+            margin-top: 8px;
+        }
+        .asset-dl-btn,
+        .code-block__dl {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 5px 11px;
+            border-radius: 7px;
+            border: 1px solid rgba(0, 251, 255, 0.28);
+            background: rgba(0, 12, 20, 0.75);
+            color: rgba(0, 251, 255, 0.8);
+            font-family: 'Orbitron', sans-serif;
+            font-size: 7.5px;
+            letter-spacing: 1.4px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            text-decoration: none;
+            user-select: none;
+        }
+        .asset-dl-btn:hover,
+        .code-block__dl:hover {
+            color: #00fbff;
+            border-color: rgba(0, 251, 255, 0.55);
+            background: rgba(0, 251, 255, 0.12);
+            box-shadow: 0 0 14px rgba(0, 251, 255, 0.18);
+        }
+        .asset-dl-btn.done,
+        .code-block__dl.done {
+            color: #00ff88;
+            border-color: rgba(0, 255, 136, 0.45);
+        }
+        .asset-frame__meta {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 7px;
+            letter-spacing: 1.2px;
+            color: rgba(0, 251, 255, 0.4);
+            margin-left: 2px;
+        }
+        .rubric-card {
+            margin-top: 10px;
+            max-width: min(650px, 100%);
+            border-radius: 10px;
+            border: 1px solid rgba(0, 251, 255, 0.18);
+            background: linear-gradient(160deg, rgba(0, 20, 32, 0.85) 0%, rgba(0, 8, 14, 0.9) 100%);
+            overflow: hidden;
+        }
+        .rubric-card__head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 8px 12px;
+            border-bottom: 1px solid rgba(0, 251, 255, 0.1);
+            font-family: 'Orbitron', sans-serif;
+            font-size: 8px;
+            letter-spacing: 1.8px;
+            color: rgba(0, 251, 255, 0.7);
+            text-transform: uppercase;
+        }
+        .rubric-card table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11.5px;
+        }
+        .rubric-card th,
+        .rubric-card td {
+            padding: 6px 10px;
+            border-bottom: 1px solid rgba(0, 251, 255, 0.06);
+            text-align: left;
+            color: rgba(210, 248, 255, 0.88);
+        }
+        .rubric-card th {
+            font-family: 'Orbitron', sans-serif;
+            font-size: 7px;
+            letter-spacing: 1.2px;
+            color: rgba(0, 251, 255, 0.5);
+            text-transform: uppercase;
+        }
+        .rubric-card tr:last-child td { border-bottom: none; }
+        .rubric-score {
+            font-family: 'Orbitron', sans-serif;
+            color: #00fbff;
+            white-space: nowrap;
+        }
+        .rubric-composite {
+            padding: 8px 12px;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 8px;
+            letter-spacing: 1.5px;
+            color: rgba(0, 255, 136, 0.85);
+            border-top: 1px solid rgba(0, 251, 255, 0.08);
+        }
         .chat-msg__body {
             color: rgba(210, 248, 255, 0.94);
             font-size: 13px;
@@ -407,6 +518,12 @@
             letter-spacing: 2px;
             text-transform: uppercase;
             color: rgba(0, 251, 255, 0.55);
+        }
+        .code-block__actions {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-left: auto;
         }
         .code-block__copy {
             display: flex;
@@ -1610,6 +1727,113 @@
             }, 1600);
         }
 
+        function filenameFromUrl(url, fallback = 'download.bin') {
+            try {
+                const clean = String(url || '').split('?')[0].split('#')[0];
+                const base = clean.split('/').filter(Boolean).pop();
+                if (base && /\.[a-z0-9]{1,12}$/i.test(base)) return base;
+            } catch (_) { /* ignore */ }
+            return fallback;
+        }
+
+        function extForLang(lang) {
+            const map = {
+                python: 'py', javascript: 'js', typescript: 'ts', bash: 'sh', shell: 'sh',
+                json: 'json', yaml: 'yml', html: 'html', css: 'css', sql: 'sql',
+                markdown: 'md', plaintext: 'txt', text: 'txt',
+            };
+            return map[String(lang || '').toLowerCase()] || 'txt';
+        }
+
+        /**
+         * Download any generated/uploaded asset (image, file, blob, data URL).
+         * Uses the hybrid media host so Render HUD can pull Mac-local bytes.
+         */
+        async function downloadAsset(urlOrPath, filename, btn) {
+            const name = filename || filenameFromUrl(urlOrPath, 'tesract-asset.bin');
+            let href = urlOrPath;
+            if (href && !/^https?:\/\//i.test(href) && !href.startsWith('blob:') && !href.startsWith('data:')) {
+                href = mediaUrl(href.startsWith('/') ? href : `/${href}`);
+            }
+            const markDone = () => {
+                if (!btn) return;
+                const prev = btn.innerHTML;
+                btn.classList.add('done');
+                btn.innerHTML = '<i class="fa-solid fa-check"></i> SAVED';
+                setTimeout(() => {
+                    btn.classList.remove('done');
+                    btn.innerHTML = prev;
+                }, 1600);
+            };
+            try {
+                // Prefer fetch→blob so cross-origin tunnel URLs still download with a filename
+                const res = await fetch(href, { mode: 'cors', credentials: 'omit' });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const blob = await res.blob();
+                const obj = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = obj;
+                a.download = name;
+                a.rel = 'noopener';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(obj), 2500);
+                markDone();
+                return true;
+            } catch (err) {
+                // Fallback: direct anchor (same-origin / download attribute)
+                try {
+                    const a = document.createElement('a');
+                    a.href = href;
+                    a.download = name;
+                    a.target = '_blank';
+                    a.rel = 'noopener';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    markDone();
+                    return true;
+                } catch (_) {
+                    console.warn('download failed', err);
+                    if (btn) {
+                        btn.title = `Download failed: ${err && err.message ? err.message : err}`;
+                    }
+                    return false;
+                }
+            }
+        }
+
+        function downloadTextFile(text, filename, btn) {
+            const blob = new Blob([text || ''], { type: 'text/plain;charset=utf-8' });
+            const obj = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = obj;
+            a.download = filename || 'snippet.txt';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(obj), 2500);
+            if (btn) {
+                const prev = btn.innerHTML;
+                btn.classList.add('done');
+                btn.innerHTML = '<i class="fa-solid fa-check"></i> SAVED';
+                setTimeout(() => {
+                    btn.classList.remove('done');
+                    btn.innerHTML = prev;
+                }, 1600);
+            }
+        }
+
+        function makeDownloadButton(label, title) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'asset-dl-btn';
+            btn.title = title || 'Download';
+            btn.innerHTML = `<i class="fa-solid fa-download"></i> ${label || 'DOWNLOAD'}`;
+            return btn;
+        }
+
         function detectLanguage(codeEl) {
             const cls = [...codeEl.classList].find((c) => c.startsWith('language-'));
             if (cls) return cls.slice(9).toLowerCase();
@@ -1642,13 +1866,29 @@
                 const langLabel = document.createElement('span');
                 langLabel.className = 'code-block__lang';
                 langLabel.textContent = LANG_LABELS[lang] || lang.toUpperCase();
+                const actions = document.createElement('div');
+                actions.className = 'code-block__actions';
                 const copyBtn = document.createElement('button');
                 copyBtn.type = 'button';
                 copyBtn.className = 'code-block__copy';
                 copyBtn.title = 'Copy code';
                 copyBtn.innerHTML = '<i class="fa-solid fa-copy"></i> COPY';
                 copyBtn.onclick = () => copyToClipboard(codeEl.textContent, copyBtn, false);
-                header.append(langLabel, copyBtn);
+                const dlBtn = document.createElement('button');
+                dlBtn.type = 'button';
+                dlBtn.className = 'code-block__dl';
+                dlBtn.title = 'Download code file';
+                dlBtn.innerHTML = '<i class="fa-solid fa-download"></i> DL';
+                dlBtn.onclick = () => {
+                    const ext = extForLang(lang);
+                    downloadTextFile(
+                        codeEl.textContent || '',
+                        `tesract-snippet.${ext}`,
+                        dlBtn,
+                    );
+                };
+                actions.append(copyBtn, dlBtn);
+                header.append(langLabel, actions);
                 pre.parentNode.insertBefore(wrapper, pre);
                 wrapper.append(header, pre);
                 if (window.Prism) Prism.highlightElement(codeEl);
@@ -1715,6 +1955,142 @@
             });
         }
 
+        function isDownloadableAssetUrl(src) {
+            if (!src) return false;
+            if (/^data:image\//i.test(src) || /^blob:/i.test(src)) return true;
+            if (/\/generated\//i.test(src)) return true;
+            if (/\/agent_data\/uploads\//i.test(src)) return true;
+            if (/\/generated_images\//i.test(src)) return true;
+            if (/\.(png|jpe?g|webp|gif|bmp|svg|pdf|zip|txt|md|csv|json|mp4|webm|wav|mp3)(\?|#|$)/i.test(src)) {
+                return true;
+            }
+            return false;
+        }
+
+        /** Wrap chat images + file links with DOWNLOAD controls. */
+        function enhanceDownloadableAssets(root) {
+            if (!root) return;
+
+            // Images (generated, uploads, any remote preview)
+            root.querySelectorAll('img').forEach((img) => {
+                if (img.closest('.asset-frame')) return;
+                const src = img.getAttribute('src') || '';
+                if (!src || !isDownloadableAssetUrl(src)) {
+                    // Still wrap any visible chat image so operators can save it
+                    if (!img.classList.contains('chat-gen-img') && !/\/(generated|agent_data)\//i.test(src)) {
+                        if (!src.startsWith('http') && !src.startsWith('data:') && !src.startsWith('blob:')) {
+                            return;
+                        }
+                    }
+                }
+                const frame = document.createElement('div');
+                frame.className = 'asset-frame';
+                const parent = img.parentNode;
+                parent.insertBefore(frame, img);
+                frame.appendChild(img);
+
+                // Prefer hybrid media host for relative paths
+                if (src.startsWith('/') && typeof mediaUrl === 'function') {
+                    img.src = mediaUrl(src);
+                }
+
+                const bar = document.createElement('div');
+                bar.className = 'asset-frame__bar';
+                const name = filenameFromUrl(src, 'tesract-image.png');
+                const dl = makeDownloadButton('DOWNLOAD', `Download ${name}`);
+                dl.onclick = () => downloadAsset(img.currentSrc || img.src || src, name, dl);
+
+                // Sidecar rubric JSON for training datasets (if generated image)
+                let rubricBtn = null;
+                if (/\/generated\//i.test(src)) {
+                    const rubricPath = src.replace(/\.(png|jpe?g|webp|gif)$/i, '.rubric.json');
+                    if (rubricPath !== src) {
+                        rubricBtn = makeDownloadButton('RUBRIC', 'Download evaluation rubric JSON');
+                        rubricBtn.onclick = () =>
+                            downloadAsset(
+                                rubricPath,
+                                filenameFromUrl(rubricPath, 'image.rubric.json'),
+                                rubricBtn,
+                            );
+                    }
+                }
+                const meta = document.createElement('span');
+                meta.className = 'asset-frame__meta';
+                meta.textContent = name;
+                bar.append(dl);
+                if (rubricBtn) bar.append(rubricBtn);
+                bar.append(meta);
+                frame.appendChild(bar);
+            });
+
+            // Anchors pointing at generated/uploaded files
+            root.querySelectorAll('a[href]').forEach((a) => {
+                if (a.closest('.asset-frame__bar') || a.dataset.dlEnhanced === '1') return;
+                const href = a.getAttribute('href') || '';
+                if (!isDownloadableAssetUrl(href)) return;
+                a.dataset.dlEnhanced = '1';
+                const name = filenameFromUrl(href, 'tesract-file.bin');
+                const btn = makeDownloadButton('DOWNLOAD', `Download ${name}`);
+                btn.style.marginLeft = '8px';
+                btn.onclick = (ev) => {
+                    ev.preventDefault();
+                    downloadAsset(href, name, btn);
+                };
+                a.insertAdjacentElement('afterend', btn);
+            });
+        }
+
+        /** Style IMAGE_RUBRICS markdown tables into compact training-score cards. */
+        function enhanceRubricBlocks(root) {
+            if (!root) return;
+            root.querySelectorAll('table').forEach((table) => {
+                if (table.closest('.rubric-card')) return;
+                const headText = (table.querySelector('th')?.textContent || '').toLowerCase();
+                const prev = table.previousElementSibling;
+                const prevText = (prev?.textContent || '').toLowerCase();
+                const looksRubric =
+                    headText.includes('dimension')
+                    || headText.includes('rubric')
+                    || prevText.includes('image rubric')
+                    || prevText.includes('training rubric')
+                    || prevText.includes('image_rubrics');
+                if (!looksRubric) return;
+
+                const card = document.createElement('div');
+                card.className = 'rubric-card';
+                const head = document.createElement('div');
+                head.className = 'rubric-card__head';
+                head.innerHTML = '<span><i class="fa-solid fa-chart-simple"></i> IMAGE RUBRICS · LLM TRAINING</span>';
+
+                // Highlight score cells
+                table.querySelectorAll('tbody tr').forEach((tr) => {
+                    const cells = tr.querySelectorAll('td');
+                    if (cells.length >= 2) {
+                        cells[1].classList.add('rubric-score');
+                    }
+                });
+
+                table.parentNode.insertBefore(card, table);
+                card.append(head, table);
+
+                // Pull composite line if next sibling mentions COMPOSITE
+                let sib = card.nextSibling;
+                while (sib && sib.nodeType === 3 && !String(sib.textContent || '').trim()) {
+                    sib = sib.nextSibling;
+                }
+                if (sib && sib.nodeType === 1) {
+                    const t = (sib.textContent || '');
+                    if (/composite|overall preference|pick.?score/i.test(t)) {
+                        const foot = document.createElement('div');
+                        foot.className = 'rubric-composite';
+                        foot.textContent = t.trim();
+                        card.appendChild(foot);
+                        sib.remove();
+                    }
+                }
+            });
+        }
+
         function populateMessageBody(body, role, text) {
             if (role === 'assistant') {
                 body.classList.add('md-content');
@@ -1722,6 +2098,8 @@
                 body.innerHTML = renderMarkdown(normalized);
                 enhanceCodeBlocks(body);
                 enhanceGeneratedImages(body);
+                enhanceDownloadableAssets(body);
+                enhanceRubricBlocks(body);
             } else {
                 body.textContent = text;
             }

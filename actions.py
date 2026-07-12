@@ -514,6 +514,372 @@ def _run_web_search(query: str, *, max_results: int = 5, focus: str = "") -> str
     return header + (prior + formatted if prior else formatted)
 
 
+# ---------------------------------------------------------------------------
+# Image generation rubrics (preference / VLM training labels)
+# Axes align with common T2I eval stacks: CLIPScore, LAION Aesthetics,
+# ImageReward, PickScore, HPSv2, GenEval composition, safety filters.
+# ---------------------------------------------------------------------------
+IMAGE_RUBRIC_SCHEMA = "tesract.image_rubric.v1"
+
+# (key, display name, weight for composite 0–100, short training note)
+IMAGE_RUBRIC_AXES: list[tuple[str, str, float, str]] = [
+    (
+        "prompt_alignment",
+        "Prompt alignment",
+        0.22,
+        "CLIPScore / text–image fidelity — primary signal for SFT & RLHF",
+    ),
+    (
+        "aesthetic_quality",
+        "Aesthetic quality",
+        0.16,
+        "LAION Aesthetics predictor style overall appeal",
+    ),
+    (
+        "composition",
+        "Composition",
+        0.12,
+        "GenEval / spatial layout, framing, subject placement",
+    ),
+    (
+        "detail_sharpness",
+        "Detail & sharpness",
+        0.10,
+        "Texture fidelity, edge clarity, fine structure",
+    ),
+    (
+        "color_lighting",
+        "Color & lighting",
+        0.10,
+        "Palette harmony, exposure, cinematic light",
+    ),
+    (
+        "style_consistency",
+        "Style consistency",
+        0.10,
+        "Requested medium/style held across the frame",
+    ),
+    (
+        "artifact_freedom",
+        "Artifact freedom",
+        0.10,
+        "Hands/faces/text glitches, distortion, compression",
+    ),
+    (
+        "safety_suitability",
+        "Safety suitability",
+        0.10,
+        "NSFW / violence / disallowed content (training filter)",
+    ),
+]
+
+
+def _png_dimensions(path: Path) -> tuple[int, int] | None:
+    """Read width/height from PNG/JPEG headers without heavy deps."""
+    try:
+        data = path.read_bytes()[:64]
+    except Exception:
+        return None
+    # PNG: IHDR at offset 16 after 8-byte signature
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        w = int.from_bytes(data[16:20], "big")
+        h = int.from_bytes(data[20:24], "big")
+        if w > 0 and h > 0:
+            return w, h
+    # JPEG SOF0/SOF2 scan (best-effort)
+    if len(data) >= 2 and data[:2] == b"\xff\xd8":
+        try:
+            raw = path.read_bytes()
+            i = 2
+            while i < len(raw) - 9:
+                if raw[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = raw[i + 1]
+                if marker in (0xC0, 0xC2):  # SOF0 / SOF2
+                    h = int.from_bytes(raw[i + 5 : i + 7], "big")
+                    w = int.from_bytes(raw[i + 7 : i + 9], "big")
+                    if w > 0 and h > 0:
+                        return w, h
+                    break
+                if marker == 0xD9:
+                    break
+                if marker in (0xD8, 0x01) or (0xD0 <= marker <= 0xD7):
+                    i += 2
+                    continue
+                seglen = int.from_bytes(raw[i + 2 : i + 4], "big")
+                i += 2 + seglen
+        except Exception:
+            return None
+    return None
+
+
+def _clamp_score(v: float, lo: float = 1.0, hi: float = 5.0) -> float:
+    return max(lo, min(hi, round(v, 2)))
+
+
+def _heuristic_image_rubrics(
+    prompt: str,
+    image_path: Path | None,
+    *,
+    backend: str = "pollinations",
+) -> dict:
+    """
+    Deterministic 1–5 scores usable as weak labels for preference datasets.
+    Not a substitute for human/CLIP/ImageReward judges — export as `method=heuristic`.
+    """
+    p = (prompt or "").strip()
+    words = re.findall(r"[A-Za-z0-9']+", p.lower())
+    n_words = len(words)
+    style_hits = sum(
+        1
+        for k in (
+            "cinematic", "photorealistic", "photo", "oil", "watercolor", "anime",
+            "pixel", "3d", "render", "studio", "bokeh", "neon", "cyberpunk",
+            "illustration", "sketch", "macro", "portrait", "landscape",
+        )
+        if k in p.lower()
+    )
+    composition_hits = sum(
+        1
+        for k in (
+            "wide", "close-up", "closeup", "rule of thirds", "centered",
+            "overhead", "low angle", "symmetry", "depth of field", "foreground",
+            "background", "panorama", "isometric",
+        )
+        if k in p.lower()
+    )
+    lighting_hits = sum(
+        1
+        for k in (
+            "golden hour", "sunset", "sunrise", "rim light", "soft light",
+            "dramatic", "volumetric", "neon", "moonlight", "studio lighting",
+            "overcast", "hdr",
+        )
+        if k in p.lower()
+    )
+    safety_flags = sum(
+        1
+        for k in (
+            "nsfw", "nude", "naked", "gore", "blood", "explicit", "porn",
+            "violence", "bloody", "erotic",
+        )
+        if k in p.lower()
+    )
+
+    size_bytes = 0
+    dims = None
+    if image_path and image_path.is_file():
+        try:
+            size_bytes = image_path.stat().st_size
+        except OSError:
+            size_bytes = 0
+        dims = _png_dimensions(image_path)
+
+    # Base quality from bytes (empty / tiny = low)
+    if size_bytes <= 0:
+        size_factor = 1.5
+    elif size_bytes < 20_000:
+        size_factor = 2.5
+    elif size_bytes < 80_000:
+        size_factor = 3.3
+    elif size_bytes < 250_000:
+        size_factor = 4.0
+    else:
+        size_factor = 4.4
+
+    res_factor = 3.5
+    if dims:
+        px = dims[0] * dims[1]
+        if px >= 1024 * 1024:
+            res_factor = 4.5
+        elif px >= 512 * 512:
+            res_factor = 4.0
+        else:
+            res_factor = 3.0
+
+    prompt_specificity = _clamp_score(2.2 + min(n_words, 40) * 0.05 + style_hits * 0.15)
+    alignment = _clamp_score(prompt_specificity + (0.2 if n_words >= 6 else -0.4))
+    aesthetic = _clamp_score((size_factor + res_factor) / 2 + style_hits * 0.08)
+    composition = _clamp_score(3.2 + composition_hits * 0.25 + (0.2 if n_words >= 8 else 0))
+    detail = _clamp_score(size_factor * 0.55 + res_factor * 0.45)
+    color = _clamp_score(3.3 + lighting_hits * 0.22 + style_hits * 0.05)
+    style = _clamp_score(3.0 + style_hits * 0.35 + (0.3 if backend == "openai" else 0))
+    artifacts = _clamp_score(size_factor - 0.1 + (0.2 if backend == "openai" else 0))
+    safety = 1.5 if safety_flags else 4.8
+
+    scores = {
+        "prompt_alignment": alignment,
+        "aesthetic_quality": aesthetic,
+        "composition": composition,
+        "detail_sharpness": detail,
+        "color_lighting": color,
+        "style_consistency": style,
+        "artifact_freedom": artifacts,
+        "safety_suitability": safety,
+    }
+    rationales = {
+        "prompt_alignment": (
+            f"Prompt specificity ~{n_words} tokens; style cues={style_hits}. "
+            "Proxy for CLIP-style text–image alignment."
+        ),
+        "aesthetic_quality": (
+            f"File {size_bytes} B"
+            + (f", {dims[0]}×{dims[1]}" if dims else "")
+            + "; aesthetic proxy from resolution/size + style keywords."
+        ),
+        "composition": f"Composition cues in prompt: {composition_hits}.",
+        "detail_sharpness": f"Detail proxy from payload size={size_bytes} and resolution.",
+        "color_lighting": f"Lighting/style keywords: {lighting_hits}/{style_hits}.",
+        "style_consistency": f"Backend={backend}; style keywords={style_hits}.",
+        "artifact_freedom": "Heuristic — true artifact checks need a vision judge.",
+        "safety_suitability": (
+            "Flagged risk terms in prompt." if safety_flags else "No hard safety keywords detected."
+        ),
+    }
+    return {
+        "scores": scores,
+        "rationales": rationales,
+        "dims": dims,
+        "size_bytes": size_bytes,
+    }
+
+
+def build_image_rubric(
+    prompt: str,
+    image_path: Path | None,
+    *,
+    backend: str = "pollinations",
+    public_url: str = "",
+) -> dict:
+    """
+    Build a structured rubric payload for VLM / preference training pipelines.
+    Writes ``*.rubric.json`` next to the image when possible.
+    """
+    heuristic = _heuristic_image_rubrics(prompt, image_path, backend=backend)
+    scores: dict[str, float] = heuristic["scores"]
+    rationales: dict[str, str] = heuristic["rationales"]
+
+    dimensions: dict[str, dict] = {}
+    weighted = 0.0
+    for key, label, weight, note in IMAGE_RUBRIC_AXES:
+        s = float(scores.get(key, 3.0))
+        dimensions[key] = {
+            "label": label,
+            "score": s,
+            "scale": "1-5",
+            "weight": weight,
+            "rationale": rationales.get(key, ""),
+            "training_note": note,
+        }
+        weighted += s * weight
+
+    # Map weighted 1–5 → 0–100 preference-style composite (PickScore/ImageReward-like)
+    composite = round(max(0.0, min(100.0, (weighted - 1.0) / 4.0 * 100.0)), 2)
+
+    image_rel = ""
+    resolved_image: Path | None = None
+    if image_path is not None:
+        try:
+            resolved_image = Path(image_path).expanduser().resolve()
+        except Exception:
+            resolved_image = Path(image_path)
+        if resolved_image.is_file():
+            try:
+                image_rel = resolved_image.relative_to(WORKSPACE_ROOT.resolve()).as_posix()
+            except ValueError:
+                image_rel = resolved_image.as_posix()
+
+    payload = {
+        "schema": IMAGE_RUBRIC_SCHEMA,
+        "use": "preference_and_vlm_training_labels",
+        "prompt": (prompt or "").strip(),
+        "backend": backend,
+        "image_path": image_rel,
+        "public_url": public_url or "",
+        "width": heuristic["dims"][0] if heuristic["dims"] else None,
+        "height": heuristic["dims"][1] if heuristic["dims"] else None,
+        "size_bytes": heuristic["size_bytes"],
+        "method": "heuristic_v1",
+        "dimensions": dimensions,
+        "composite_score": composite,
+        "composite_scale": "0-100",
+        "preference_label": (
+            "preferred" if composite >= 72 else "borderline" if composite >= 55 else "reject"
+        ),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+    if resolved_image is not None and resolved_image.is_file():
+        # Prefer clean stem.rubric.json next to image
+        side = resolved_image.with_name(resolved_image.stem + ".rubric.json")
+        try:
+            side.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            try:
+                payload["rubric_sidecar"] = side.relative_to(WORKSPACE_ROOT.resolve()).as_posix()
+            except ValueError:
+                payload["rubric_sidecar"] = side.as_posix()
+        except Exception as exc:
+            print(f"[TESrACT:rubric] sidecar write skipped: {exc}")
+
+    return payload
+
+
+def format_image_rubric_markdown(payload: dict) -> str:
+    """Human + LLM readable rubric table for chat / training export."""
+    lines = [
+        "### Image rubrics (LLM training labels)",
+        "",
+        "| Dimension | Score (1–5) | Training note |",
+        "|---|---:|---|",
+    ]
+    dims = payload.get("dimensions") or {}
+    for key, label, _w, note in IMAGE_RUBRIC_AXES:
+        d = dims.get(key) or {}
+        score = d.get("score", "—")
+        lines.append(f"| {label} | **{score}** | {note} |")
+    composite = payload.get("composite_score", "—")
+    pref = payload.get("preference_label", "—")
+    lines.append("")
+    lines.append(
+        f"**Composite preference score:** {composite}/100 "
+        f"· label=`{pref}` · schema=`{payload.get('schema', IMAGE_RUBRIC_SCHEMA)}`"
+    )
+    if payload.get("rubric_sidecar"):
+        lines.append(f"**Rubric JSON:** `/{payload['rubric_sidecar']}` (downloadable)")
+    lines.append(
+        "_Axes inspired by CLIPScore, LAION Aesthetics, ImageReward, PickScore, "
+        "HPSv2, and GenEval — heuristic weak labels for dataset building._"
+    )
+    return "\n".join(lines)
+
+
+def _attach_image_rubric(
+    body: str,
+    prompt: str,
+    *,
+    backend: str,
+    public_url: str = "",
+    image_path: Path | None = None,
+) -> str:
+    """Append rubric markdown + ensure sidecar exists."""
+    path = image_path
+    if path is None and public_url:
+        # Map /generated/foo.png → project file
+        rel = public_url.lstrip("/")
+        candidate = WORKSPACE_ROOT / rel
+        if candidate.is_file():
+            path = candidate
+    try:
+        payload = build_image_rubric(
+            prompt, path, backend=backend, public_url=public_url,
+        )
+        return body.rstrip() + "\n\n" + format_image_rubric_markdown(payload)
+    except Exception as exc:
+        print(f"[TESrACT:rubric] attach failed: {exc}")
+        return body
+
+
 def _generate_via_pollinations(prompt: str, *, width: int = 1024, height: int = 1024) -> str:
     """
     Free Pollinations path — delegates to mac_access.generate_free_image.
@@ -531,12 +897,16 @@ def _generate_via_pollinations(prompt: str, *, width: int = 1024, height: int = 
         store_image_memory(prompt, md, backend="pollinations", image_ref=local_url.lstrip("/"))
     except Exception as mem_exc:
         print(f"[TESrACT:image] memory store skipped: {mem_exc}")
-    return (
+    body = (
         f"STATUS: SUCCESS\n"
         f"Image generated successfully (free Pollinations pipeline).\n"
         f"Prompt: {prompt}\n"
         f"Local URL: {local_url}\n"
+        f"Download: {local_url}\n"
         f"{md}"
+    )
+    return _attach_image_rubric(
+        body, prompt, backend="pollinations", public_url=local_url,
     )
 
 
@@ -573,10 +943,17 @@ def _generate_via_openai(prompt: str) -> str:
         f"Prompt: {prompt}\n"
         f"Saved to: {rel}\n"
         f"Local URL: /generated/{filename}\n"
+        f"Download: /generated/{filename}\n"
         f"{md}"
     )
     store_image_memory(prompt, result, backend="openai", image_ref=rel)
-    return result
+    return _attach_image_rubric(
+        result,
+        prompt,
+        backend="openai",
+        public_url=f"/generated/{filename}",
+        image_path=local_path,
+    )
 
 
 @tool
@@ -609,6 +986,8 @@ def generate_free_image(prompt: str) -> str:
     Free local image generation via Pollinations AI (no API key).
     Always use this (or generate_image) when Sir asks to create, draw, or generate an image.
     Returns markdown the HUD renders inline: ![Generated Image](/generated/img_….png)
+    Also attaches multi-axis image rubrics (CLIP / aesthetics / ImageReward-style)
+    and a downloadable .rubric.json sidecar for VLM preference training.
     """
     prompt = (prompt or "").strip()
     if not prompt:
@@ -617,21 +996,28 @@ def generate_free_image(prompt: str) -> str:
         md = _mac_generate_free_image(prompt)
         if md.startswith("Image Error:"):
             return _tool_err("generate_free_image", md)
+        local_url = ""
         try:
             m = re.search(r"\((/generated/[^)]+)\)", md)
+            local_url = m.group(1) if m else ""
             store_image_memory(
                 prompt,
                 md,
                 backend="pollinations",
-                image_ref=(m.group(1).lstrip("/") if m else ""),
+                image_ref=(local_url.lstrip("/") if local_url else ""),
             )
         except Exception as mem_exc:
             print(f"[TESrACT:image] memory store skipped: {mem_exc}")
-        # Tool envelope + strict markdown for synthesis / HUD
-        return _tool_ok(
-            "generate_free_image",
-            f"Image ready for Sir.\n{md}",
+        body = (
+            f"Image ready for Sir.\n"
+            f"Download: {local_url or '/generated/'}\n"
+            f"{md}"
         )
+        body = _attach_image_rubric(
+            body, prompt, backend="pollinations", public_url=local_url,
+        )
+        # Tool envelope + strict markdown for synthesis / HUD
+        return _tool_ok("generate_free_image", body)
     except Exception as exc:
         return _tool_err("generate_free_image", str(exc))
 

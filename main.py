@@ -721,7 +721,8 @@ When a user uploads a file, inspect the file path extension. If it is a .pdf, us
 
 ## Tool guide
 - Generate image → generate_free_image (or generate_image) | Research → search_and_summarize / web_search
-- After generate_free_image, include the exact markdown ![Generated Image](/generated/…) in your reply so the HUD renders it.
+- After generate_free_image / generate_image, include the exact markdown ![Generated Image](/generated/…) in your reply so the HUD renders it with a DOWNLOAD control.
+- Also surface the **Image rubrics** table from the tool RESULT (CLIP/aesthetics/ImageReward-style training labels) and mention the `.rubric.json` sidecar path when present — useful for building preference datasets for other VLMs.
 - Uploaded PDF → extract_pdf_context | Uploaded image → analyze_uploaded_image
 - Memory → recall_memory / save_memory_note | Tasks → manage_task_plan
 - Files/folders/shell/URL → corresponding tools (client intents only)
