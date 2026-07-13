@@ -13,12 +13,20 @@ Routing (llm_router.py) — local-first on Apple Silicon unified RAM:
   - Groq / Colab → cloud fallbacks
   - Web search memory in Chroma (in-RAM)
 
-Configure via .env: OLLAMA_* , GROQ_API_KEY, BRAIN_REGISTRY_SECRET, LLM_ROUTING_MODE.
+Configure via .env: OLLAMA_* , GROQ_API_KEY, BRAIN_REGISTRY_SECRET, LLM_ROUTING_MODE,
+AUTH_SMTP_* (Email OTP).
 """
 from __future__ import annotations
+
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()  # Must run before any other import — llm_router reads env at import time.
+# Must run before any other import — auth / llm_router read env at import time.
+# Prefer the project-root .env (not process CWD) so gunicorn/Render chdir is safe.
+_PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(_PROJECT_ROOT / ".env")
+load_dotenv()
 
 import os
 import sys

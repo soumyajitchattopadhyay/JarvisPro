@@ -7,6 +7,15 @@ the authenticated email as LangGraph thread_id.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env before ANY os.getenv reads (works even if CWD is not the repo root).
+_PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(_PROJECT_ROOT / ".env")
+load_dotenv()  # optional CWD override
+
 import os
 import random
 import re
@@ -46,12 +55,19 @@ def email_allowed(email: str) -> bool:
 
 
 def smtp_credentials() -> tuple[str, str, str, int, bool]:
-    """Return (host, user, password, port, use_ssl)."""
+    """Return (host, user, password, port, use_ssl).
+
+    Re-loads project ``.env`` so late-edited credentials are picked up without
+    a full process restart when the module is re-imported in tests/scripts.
+    """
+    load_dotenv(_PROJECT_ROOT / ".env", override=False)
     host = (os.getenv("AUTH_SMTP_HOST") or "smtp.gmail.com").strip()
     user = (os.getenv("AUTH_SMTP_USER") or os.getenv("AUTH_SMTP_FROM") or "").strip()
-    password = (os.getenv("AUTH_SMTP_PASSWORD") or "").strip()
+    # Strip spaces that Gmail App Password UIs sometimes insert for display
+    password = re.sub(r"\s+", "", (os.getenv("AUTH_SMTP_PASSWORD") or "").strip())
     port = int(os.getenv("AUTH_SMTP_PORT", "587") or "587")
     use_ssl = (os.getenv("AUTH_SMTP_SSL") or "").strip().lower() in ("1", "true", "yes")
+    # Port 465 → implicit SSL; 587 → STARTTLS (use_ssl=False)
     return host, user, password, port, use_ssl or port == 465
 
 
