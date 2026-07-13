@@ -1277,12 +1277,13 @@
         let authRequired = true;
         let historyLoaded = false;
 
-        // ── Mac brain / Cloudflare tunnel base (hybrid edge → local disk) ──
-        // When the HUD is served from Render, relative /upload lands on cloud disk.
-        // Resolve the live trycloudflare URL and POST uploads (and media) there.
-        let brainBaseUrl = ''; // e.g. https://….trycloudflare.com ; '' = same-origin
+        // ── Direct Ingestion: browser → Mac tunnel (bypass Render data plane) ──
+        // Heavy chat + uploads must NOT double-hop via Render (proxy deadlock / OOM).
+        // Startup fetches GET /api/global-brain and caches window.mac_brain_url.
+        // window.mac_brain_url = 'https://….pinggy…' | '' (same-origin / offline fallback)
+        window.mac_brain_url = window.mac_brain_url || '';
         let brainBaseCheckedAt = 0;
-        const BRAIN_BASE_TTL_MS = 60_000;
+        const BRAIN_BASE_TTL_MS = 45_000;
 
         function isLocalOrTunnelHost(hostname) {
             const h = String(hostname || '').toLowerCase();
@@ -1295,47 +1296,103 @@
                 || h.endsWith('.ngrok-free.app')
                 || h.endsWith('.ngrok.io')
                 || h.endsWith('.ngrok-free.dev')
+                || h.includes('pinggy')
+                || h.endsWith('.loca.lt')
             );
         }
 
-        async function resolveBrainBaseUrl(force = false) {
-            // Already on Mac / tunnel — relative paths hit the edge node.
+        function setMacBrainUrl(url) {
+            const cleaned = (url || '').toString().trim().replace(/\/+$/, '');
+            window.mac_brain_url = cleaned;
+            // Keep legacy alias in sync for any older helpers
+            window.brainBaseUrl = cleaned;
+            return cleaned;
+        }
+
+        /**
+         * Resolve live Mac endpoint from Render registry (or clear when offline).
+         * Cached on window.mac_brain_url for Direct Ingestion routing.
+         */
+        async function resolveMacBrainUrl(force = false) {
+            // Already served from Mac / tunnel — relative paths ARE the brain.
             if (isLocalOrTunnelHost(window.location.hostname)) {
-                brainBaseUrl = '';
+                setMacBrainUrl('');
                 brainBaseCheckedAt = Date.now();
-                return brainBaseUrl;
+                return window.mac_brain_url;
             }
             const now = Date.now();
             if (!force && brainBaseCheckedAt && (now - brainBaseCheckedAt) < BRAIN_BASE_TTL_MS) {
-                return brainBaseUrl;
+                return window.mac_brain_url || '';
             }
             try {
-                const res = await fetch('/api/global-brain');
+                // Always hit Render (same-origin) for the registry lookup
+                const res = await fetch('/api/global-brain', {
+                    method: 'GET',
+                    cache: 'no-store',
+                });
                 const data = await res.json().catch(() => ({}));
                 if (res.ok && data && data.online && data.url) {
-                    brainBaseUrl = String(data.url).replace(/\/+$/, '');
+                    setMacBrainUrl(data.url);
+                    console.info('[TESrACT] Direct Ingestion → Mac brain', window.mac_brain_url);
                 } else {
-                    brainBaseUrl = '';
+                    setMacBrainUrl('');
+                    console.warn('[TESrACT] Mac brain offline — using Render relative routes');
                 }
-            } catch (_) {
-                brainBaseUrl = '';
+            } catch (err) {
+                setMacBrainUrl('');
+                console.warn('[TESrACT] /api/global-brain failed — Render fallback', err);
             }
             brainBaseCheckedAt = now;
-            return brainBaseUrl;
+            return window.mac_brain_url || '';
         }
 
-        /** Absolute API URL on the active Mac tunnel when hybrid; else same-origin. */
+        // Back-compat name used by earlier upload code
+        async function resolveBrainBaseUrl(force = false) {
+            return resolveMacBrainUrl(force);
+        }
+
+        /** Absolute URL on active Mac tunnel when set; else same-origin relative path. */
         function apiUrl(path) {
             const p = (!path || path.startsWith('/')) ? (path || '/') : `/${path}`;
-            if (!brainBaseUrl) return p;
-            return `${brainBaseUrl}${p}`;
+            const base = (window.mac_brain_url || '').replace(/\/+$/, '');
+            if (!base) return p;
+            return `${base}${p}`;
         }
 
-        /** Media / static path (uploads previews) — same hybrid prefix as apiUrl. */
+        /** Media / static path (uploads, /generated previews) via Direct Ingestion host. */
         function mediaUrl(path) {
             if (!path) return path;
             if (/^https?:\/\//i.test(path)) return path;
             return apiUrl(path.startsWith('/') ? path : `/${path}`);
+        }
+
+        /**
+         * Data-plane fetch: prefer browser → Mac tunnel; fall back to relative Render path
+         * when tunnel is unset or unreachable (avoids double-upload proxy deadlocks).
+         */
+        async function dataPlaneFetch(path, options = {}) {
+            const p = (!path || path.startsWith('/')) ? (path || '/') : `/${path}`;
+            await resolveMacBrainUrl(false);
+            const base = (window.mac_brain_url || '').replace(/\/+$/, '');
+            const directUrl = base ? `${base}${p}` : p;
+            const opts = { mode: 'cors', ...options };
+
+            if (base) {
+                try {
+                    const res = await fetch(directUrl, opts);
+                    // Tunnel answered — use it (even 4xx). Only gateway failures retry via Render.
+                    if (res.status !== 502 && res.status !== 503 && res.status !== 504) {
+                        return res;
+                    }
+                    console.warn(
+                        `[TESrACT] Mac brain ${res.status} on ${p} — falling back to Render`,
+                    );
+                } catch (err) {
+                    console.warn('[TESrACT] Direct Mac fetch failed — falling back to Render', p, err);
+                }
+            }
+            // Relative /chat | /upload on Render (edge may still proxy when healthy)
+            return fetch(p, options);
         }
 
         function authHeaders(extra = {}) {
@@ -1395,7 +1452,8 @@
         async function loadChatHistory() {
             try {
                 const qs = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}&limit=200` : '?limit=200';
-                const res = await fetch(`/chat/history${qs}`, { headers: authHeaders() });
+                // History lives on Mac SSD — Direct Ingestion when tunnel is known
+                const res = await dataPlaneFetch(`/chat/history${qs}`, { headers: authHeaders() });
                 if (res.status === 401) {
                     clearSession();
                     if (authRequired) showAuthGate(true);
@@ -1423,8 +1481,8 @@
 
         async function bootstrapAuth() {
             updateAuthChrome();
-            // Resolve live Mac tunnel early so /upload does not land on Render disk.
-            await resolveBrainBaseUrl(true);
+            // Direct Ingestion: cache window.mac_brain_url before any chat/upload.
+            await resolveMacBrainUrl(true);
             try {
                 const st = await fetch('/auth/status').then((r) => r.json()).catch(() => ({}));
                 authRequired = st.auth_required !== false && st.auth_enabled !== false;
@@ -1596,9 +1654,9 @@
             // Fallback: chat short-circuit ("Allow Control" / "Stop Control")
             // Used when the server process is stale and does not expose /permission yet.
             if (res.status === 404 || res.status === 405) {
-                res = await fetch('/chat', {
+                res = await dataPlaneFetch('/chat', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: authHeaders({ 'Content-Type': 'application/json' }),
                     body: JSON.stringify({
                         text: enabled ? 'Allow Control' : 'Stop Control',
                     }),
@@ -2246,32 +2304,29 @@
             const form = new FormData();
             form.append('file', file, file.name);
 
-            // Prefer live Mac tunnel URL (same hybrid edge node as chat tools).
-            // Relative /upload on Render would save to cloud disk → split-brain with tools.
-            await resolveBrainBaseUrl();
-            const uploadUrl = apiUrl('/upload');
-            const headers = authHeaders();
+            // Direct Ingestion: browser → Mac tunnel /upload (never double-hop via Render).
             // Do NOT set Content-Type — browser sets multipart boundary.
-            // Cross-origin tunnel posts are allowed (backend CORS *).
-
-            const res = await fetch(uploadUrl, {
+            const headers = authHeaders();
+            const res = await dataPlaneFetch('/upload', {
                 method: 'POST',
                 headers,
                 body: form,
-                mode: 'cors',
             });
             let data = {};
             try { data = await res.json(); } catch (_) { data = {}; }
             if (!res.ok || data.status !== 'success') {
-                const where = brainBaseUrl ? `tunnel ${brainBaseUrl}` : 'this host';
+                const where = window.mac_brain_url
+                    ? `Mac tunnel ${window.mac_brain_url}`
+                    : 'Render relative /upload';
                 throw new Error(
                     data.detail || data.error || `Upload failed (HTTP ${res.status}) via ${where}`,
                 );
             }
             // Keep canonical relative path for agent tools; tag routing for debugging.
             if (data && typeof data === 'object') {
-                data.brain_base = brainBaseUrl || window.location.origin;
-                data.upload_url = uploadUrl;
+                data.brain_base = window.mac_brain_url || window.location.origin;
+                data.upload_url = apiUrl('/upload');
+                data.direct_ingestion = !!window.mac_brain_url;
             }
             return data;
         }
@@ -2381,7 +2436,8 @@
                     })),
                 };
                 if (conversationId) body.conversation_id = conversationId;
-                const res = await fetch('/chat', {
+                // Direct Ingestion: POST → ${window.mac_brain_url}/chat when tunnel is live
+                const res = await dataPlaneFetch('/chat', {
                     method: 'POST',
                     headers: authHeaders({ 'Content-Type': 'application/json' }),
                     body: JSON.stringify(body),
@@ -2403,9 +2459,10 @@
                 // Prefer server `reply`; fall back to auth/error detail so 401s are not silent.
                 let reply = (data && (data.reply || data.detail || data.error)) || '';
                 if (!reply) {
+                    const via = window.mac_brain_url ? 'Mac tunnel' : 'Render';
                     reply = res.ok
                         ? 'No response received.'
-                        : `Request failed (HTTP ${res.status}). Is the Mac brain online?`;
+                        : `Request failed (HTTP ${res.status}) via ${via}. Is the Mac brain online?`;
                 }
                 removeLoadingMessage();
                 appendChatMessage('assistant', reply);
