@@ -1,24 +1,13 @@
 #!/usr/bin/env python3
 """
-Self-healing Cloudflare quick-tunnel manager for TESrACT.
+Self-healing Pinggy SSH quick-tunnel manager for TESrACT.
 
 What it does:
-  1. Launches `cloudflared tunnel --url http://localhost:<PORT>` against your local TESrACT.
-  2. Scrapes the ephemeral https://*.trycloudflare.com URL from cloudflared logs.
-  3. POSTs it to your stable Render app: POST /api/update-brain
-  4. When the tunnel dies (~24h free limit, Wi-Fi blip, process crash), restarts and re-registers.
-
-Usage (on your Mac, while TESrACT is running on the local port):
-    python tunnel_manager.py
-
-Env (see .env.example):
-    TESRACT_LOCAL_PORT=8000
-    TESRACT_RENDER_URL=https://your-app.onrender.com
-    BRAIN_REGISTRY_SECRET=long-random-secret   # must match Render
-    LOCAL_INSTANCE_API_KEY=...                # fallback secret if BRAIN_REGISTRY_SECRET unset
-    CLOUDFLARED_BIN=cloudflared               # optional path override
-    TUNNEL_HEARTBEAT_SECONDS=300              # re-post URL so Render restarts recover
-    TUNNEL_RESTART_DELAY_SECONDS=5
+  1. Generates a dedicated SSH key to bypass Pinggy password prompts automatically.
+  2. Launches an SSH reverse tunnel to Pinggy (unlimited bandwidth).
+  3. Scrapes the ephemeral https://*.pinggy.link URL from the terminal output.
+  4. POSTs it to your stable Render app: POST /api/update-brain
+  5. Proactively restarts the tunnel every 55 minutes to prevent Pinggy's 60m drop limit.
 """
 from __future__ import annotations
 
@@ -40,12 +29,12 @@ except Exception:
 
 try:
     import httpx
-except ImportError:  # pragma: no cover
-    httpx = None  # type: ignore
+except ImportError: 
+    httpx = None 
 
-# cloudflared prints the public URL on stdout/stderr — match common formats
+# Match Pinggy's secure URLs
 _URL_RE = re.compile(
-    r"https://[a-zA-Z0-9-]+\.trycloudflare\.com",
+    r"https://[a-zA-Z0-9-]+\.(?:free\.pinggy\.net|run\.pinggy-free\.link)",
     re.IGNORECASE,
 )
 
@@ -90,23 +79,6 @@ def registry_secret() -> str:
     ).strip()
 
 
-def cloudflared_bin() -> str:
-    override = (os.getenv("CLOUDFLARED_BIN") or "").strip()
-    if override:
-        return override
-    found = shutil.which("cloudflared")
-    if found:
-        return found
-    # common Homebrew locations
-    for candidate in (
-        "/opt/homebrew/bin/cloudflared",
-        "/usr/local/bin/cloudflared",
-    ):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return "cloudflared"
-
-
 def heartbeat_seconds() -> int:
     return max(60, _env_int("TUNNEL_HEARTBEAT_SECONDS", 300))
 
@@ -122,29 +94,25 @@ def post_brain_url(tunnel_url: str, *, heartbeat: bool = False) -> bool:
         _log("TESRACT_RENDER_URL is not set — cannot register tunnel with Render")
         return False
     if not secret:
-        _log(
-            "BRAIN_REGISTRY_SECRET (or LOCAL_INSTANCE_API_KEY) is not set — "
-            "cannot authenticate with Render"
-        )
+        _log("BRAIN_REGISTRY_SECRET is not set — cannot authenticate with Render")
         return False
 
     endpoint = f"{base}/api/update-brain"
     path = "/api/update-brain"
     payload = {
         "brain_url": tunnel_url.rstrip("/"),
-        "secret_key": secret,  # legacy body field (HMAC headers preferred)
+        "secret_key": secret, 
         "heartbeat": heartbeat,
         "source": "tunnel_manager",
     }
     body_bytes = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "TESrACT-tunnel-manager/1.0",
+        "User-Agent": "TESrACT-tunnel-manager/2.0-Pinggy",
     }
-    # Cryptographic handshake — HMAC-SHA256 + static token + Bearer
+    
     try:
         import brain_auth
-
         headers.update(
             brain_auth.sign(
                 method="POST",
@@ -185,7 +153,6 @@ def post_brain_url(tunnel_url: str, *, heartbeat: bool = False) -> bool:
 
 
 def wait_for_local_server(port: int, timeout: float = 60.0) -> bool:
-    """Optional: wait until local TESrACT answers /health."""
     if httpx is None:
         return True
     deadline = time.time() + timeout
@@ -216,17 +183,34 @@ def _handle_signal(signum: int, _frame: object) -> None:
 
 
 def run_one_tunnel(port: int) -> int:
-    """
-    Start cloudflared, register URL, heartbeat until process exits.
-    Returns cloudflared exit code.
-    """
     global _child
     import threading
 
-    bin_path = cloudflared_bin()
-    target = f"http://127.0.0.1:{port}"
-    cmd = [bin_path, "tunnel", "--protocol", "http2", "--no-autoupdate", "--url", target]
-    _log(f"Starting: {' '.join(cmd)}")
+    # 1. Generate SSH Key Pair to bypass password prompt
+    key_path = os.path.expanduser("~/.ssh/tesract_pinggy")
+    if not os.path.exists(key_path):
+        _log("Generating dedicated SSH key for Pinggy to bypass password prompts...")
+        os.makedirs(os.path.dirname(key_path), exist_ok=True)
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", key_path, "-N", ""],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+    # 2. Configure SSH Command
+    target = f"localhost:{port}"
+    cmd = [
+        "ssh",
+        "-i", key_path,
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ServerAliveInterval=30",
+        "-o", "BatchMode=yes",
+        "-p", "443",
+        f"-R0:{target}",
+        "a.pinggy.io"
+    ]
+    _log(f"Starting SSH: {' '.join(cmd)}")
 
     try:
         process = subprocess.Popen(
@@ -237,14 +221,11 @@ def run_one_tunnel(port: int) -> int:
             bufsize=1,
         )
     except FileNotFoundError:
-        _log(
-            f"cloudflared not found ({bin_path}). "
-            "Install: brew install cloudflare/cloudflare/cloudflared"
-        )
+        _log("SSH binary not found. This is impossible on a Mac. Matrix is broken.")
         return 127
 
     _child = process
-    tunnel_url: list[str | None] = [None]  # mutable cell for reader thread
+    tunnel_url: list[str | None] = [None]  
     url_event = threading.Event()
 
     def _reader() -> None:
@@ -256,8 +237,14 @@ def run_one_tunnel(port: int) -> int:
             if not text:
                 continue
             lower = text.lower()
-            if any(k in lower for k in ("err", "fail", "trycloudflare", "registered", "disconnected", "retry")):
-                _log(f"cloudflared| {text}")
+            
+            # Catch errors but ignore massive ASCII art
+            if any(k in lower for k in ("err", "fail", "expire", "refused")):
+                clean_text = re.sub(r'\s+', ' ', text).strip()
+                if clean_text:
+                    _log(f"ssh| {clean_text}")
+                    
+            # Scrape the URL
             match = _URL_RE.search(text)
             if match:
                 found = match.group(0).rstrip("/")
@@ -272,37 +259,42 @@ def run_one_tunnel(port: int) -> int:
                         _log(f"Tunnel URL changed: {found}")
                         post_brain_url(found, heartbeat=False)
                         url_event.set()
-        url_event.set()  # unblock waiter on process exit
+        url_event.set() 
 
-    reader = threading.Thread(target=_reader, daemon=True, name="cloudflared-reader")
+    reader = threading.Thread(target=_reader, daemon=True, name="ssh-reader")
     reader.start()
 
     try:
-        # Wait up to 90s for first public URL
         if not url_event.wait(timeout=90.0) or not tunnel_url[0]:
             if process.poll() is not None:
-                _log("No trycloudflare.com URL seen — tunnel process ended early")
+                _log("No pinggy URL seen — tunnel process ended early")
                 return int(process.returncode or 1)
-            # Still running but no URL yet — keep waiting until process dies
-            _log("Still waiting for trycloudflare.com URL…")
+            _log("Still waiting for pinggy URL…")
             while _running and process.poll() is None and not tunnel_url[0]:
                 time.sleep(0.5)
             if not tunnel_url[0]:
-                _log("Tunnel never published a public URL")
                 return int(process.returncode or 1)
 
-        # Heartbeat until cloudflared exits
+        # 3. The 55-Minute Auto-Recycle Loop
+        start_time = time.time()
         next_beat = time.time() + heartbeat_seconds()
+        
         while _running and process.poll() is None:
             time.sleep(1.0)
+            now = time.time()
+            
+            if now - start_time >= 3300: # 55 minutes
+                _log("55-minute Pinggy limit reached. Proactively recycling tunnel...")
+                break
+
             current = tunnel_url[0]
-            if current and time.time() >= next_beat:
+            if current and now >= next_beat:
                 post_brain_url(current, heartbeat=True)
-                next_beat = time.time() + heartbeat_seconds()
+                next_beat = now + heartbeat_seconds()
 
         code = process.wait() if process.poll() is None else (process.returncode or 0)
-        _log(f"cloudflared exited with code {code}")
         return int(code or 0)
+        
     finally:
         if process.poll() is None:
             try:
@@ -328,19 +320,10 @@ def main() -> int:
     base = render_base_url()
     secret = registry_secret()
 
-    _log("=== TESrACT Self-Healing Tunnel Manager ===")
+    _log("=== TESrACT Self-Healing Tunnel Manager (Pinggy SSH) ===")
     _log(f"local target : http://127.0.0.1:{port}")
-    _log(f"render base  : {base or '(NOT SET — set TESRACT_RENDER_URL)'}")
-    _log(f"secret set   : {'yes' if secret else 'NO — set BRAIN_REGISTRY_SECRET'}")
-    _log(f"cloudflared  : {cloudflared_bin()}")
     if base:
         _log(f"global link  : {base}/go")
-
-    if not base or not secret:
-        _log(
-            "WARNING: registration will fail until TESRACT_RENDER_URL and "
-            "BRAIN_REGISTRY_SECRET are set in .env (matching Render env vars)."
-        )
 
     wait_for_local_server(port, timeout=30.0)
 
@@ -354,7 +337,6 @@ def main() -> int:
 
     _log("Stopped.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

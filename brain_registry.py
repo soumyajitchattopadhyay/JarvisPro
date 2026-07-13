@@ -43,6 +43,12 @@ _ALLOWED_HOST_SUFFIXES = (
     ".ngrok-free.dev",
     ".ngrok.io",
     ".loca.lt",
+    # Pinggy SSH tunnels (tunnel_manager.py)
+    ".free.pinggy.net",
+    ".run.pinggy-free.link",
+    ".a.free.pinggy.link",
+    ".pinggy.link",
+    ".pinggy.io",
 )
 
 
@@ -104,7 +110,7 @@ def validate_brain_url(url: str) -> tuple[bool, str]:
         return True, "ok"
     return (
         False,
-        "host not in allow-list (trycloudflare / ngrok). "
+        "host not in allow-list (trycloudflare / ngrok / pinggy). "
         "Set BRAIN_URL_ALLOW_ANY=true to accept other https hosts.",
     )
 
