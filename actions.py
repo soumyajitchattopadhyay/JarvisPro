@@ -4,8 +4,10 @@ import gc
 import json
 import os
 import re
+import shutil
 import time
 import urllib.parse
+import urllib.request
 import datetime
 from pathlib import Path
 from typing import Optional
@@ -13,6 +15,9 @@ from typing import Optional
 import httpx
 from langchain_core.tools import tool
 from langchain_experimental.utilities import PythonREPL
+
+# Local ComfyUI img2img API (Mac host)
+COMFYUI_API_URL = "http://127.0.0.1:8188/prompt"
 
 # Package was renamed duckduckgo_search → ddgs; support both.
 try:
@@ -1496,6 +1501,148 @@ def analyze_uploaded_image(file_path: str, prompt: str = "") -> str:
 
 
 @tool
+def modify_user_image(image_path: str, modification_prompt: str) -> str:
+    """
+    Image-to-image edit via local ComfyUI (epicrealism + LoadImage → VAEEncode → KSampler).
+
+    Use when Sir uploads an image and asks to enhance, restyle, or modify it.
+    Copies the file into ~/Desktop/ComfyUI/input and queues a prompt on
+    http://127.0.0.1:8188. Output is saved by ComfyUI as TESrACT_enhanced_*.
+    """
+    prompt_text = (modification_prompt or "").strip()
+    if not prompt_text:
+        return _tool_err("modify_user_image", "modification_prompt cannot be empty.")
+
+    try:
+        # Resolve HUD /agent_data/uploads/... paths under the project
+        try:
+            resolved = _resolve_project_file_path(image_path)
+            abs_image = str(resolved)
+        except FileNotFoundError:
+            # Allow absolute paths that already exist on the Mac
+            candidate = os.path.abspath(os.path.expanduser((image_path or "").strip()))
+            if not os.path.isfile(candidate):
+                return _tool_err(
+                    "modify_user_image",
+                    f"Image not found: {image_path!r}",
+                )
+            abs_image = candidate
+
+        comfy_input_dir = os.path.expanduser("~/Desktop/ComfyUI/input")
+        os.makedirs(comfy_input_dir, exist_ok=True)
+        shutil.copy(abs_image, comfy_input_dir)
+        filename = os.path.basename(abs_image)
+
+        positive = (
+            f"high quality, professional aesthetic, photographic clarity, {prompt_text}"
+        )
+        negative = (
+            "blurry, low quality, distorted, bad anatomy, deformed eyes, artifacts"
+        )
+
+        workflow = {
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": 801357388726926,
+                    "steps": 4,
+                    "cfg": 1.5,
+                    "sampler_name": "dpmpp_sde",
+                    "scheduler": "sgm_uniform",
+                    "denoise": 0.55,
+                    "model": ["4", 0],
+                    "positive": ["6", 0],
+                    "negative": ["7", 0],
+                    "latent_image": ["10", 0],
+                },
+            },
+            "4": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {
+                    "ckpt_name": "epicrealism_naturalSinRC1VAE.safetensors",
+                },
+            },
+            "6": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": positive,
+                    "clip": ["4", 1],
+                },
+            },
+            "7": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": negative,
+                    "clip": ["4", 1],
+                },
+            },
+            "10": {
+                "class_type": "VAEEncode",
+                "inputs": {
+                    "pixels": ["14", 0],
+                    "vae": ["4", 2],
+                },
+            },
+            "14": {
+                "class_type": "LoadImage",
+                "inputs": {
+                    "image": filename,
+                },
+            },
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": {
+                    "samples": ["3", 0],
+                    "vae": ["4", 2],
+                },
+            },
+            "9": {
+                "class_type": "SaveImage",
+                "inputs": {
+                    "filename_prefix": "TESrACT_enhanced",
+                    "images": ["8", 0],
+                },
+            },
+        }
+
+        payload = json.dumps({"prompt": workflow}).encode("utf-8")
+        req = urllib.request.Request(
+            COMFYUI_API_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            result = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            result = {"raw": raw[:500]}
+
+        prompt_id = ""
+        if isinstance(result, dict):
+            prompt_id = str(result.get("prompt_id") or result.get("promptId") or "")
+
+        body = (
+            f"ComfyUI img2img queued successfully.\n"
+            f"Source: {filename}\n"
+            f"Copied to: {os.path.join(comfy_input_dir, filename)}\n"
+            f"Modification: {prompt_text}\n"
+            f"API: {COMFYUI_API_URL}\n"
+            f"Prompt ID: {prompt_id or '(see ComfyUI history)'}\n"
+            f"Output prefix: TESrACT_enhanced (check ComfyUI output folder)\n"
+            f"Response: {json.dumps(result)[:800]}"
+        )
+        return _tool_ok("modify_user_image", body)
+    except Exception as exc:
+        return _tool_err(
+            "modify_user_image",
+            f"ComfyUI img2img failed: {exc}. "
+            "Is ComfyUI running on 127.0.0.1:8188 with epicrealism_naturalSinRC1VAE.safetensors?",
+        )
+
+
+@tool
 def execute_python_code(code: str, control_allowed: bool = False):
     """
     Run process-local Python for math, logic, data transforms, or code experiments.
@@ -1871,6 +2018,7 @@ tools = [
     generate_image,
     extract_pdf_context,
     analyze_uploaded_image,
+    modify_user_image,
     execute_python_code,
     read_file,
     write_file,
@@ -2120,7 +2268,7 @@ _PSEUDO_TOOL_CALL_RE = re.compile(
 _KNOWN_TOOL_NAMES = frozenset({
     "web_search", "search_and_summarize", "recall_memory", "save_memory_note",
     "manage_task_plan", "generate_free_image", "generate_image", "extract_pdf_context",
-    "analyze_uploaded_image",
+    "analyze_uploaded_image", "modify_user_image",
     "execute_python_code",
     "read_file", "write_file", "create_directory", "list_directory",
     "run_terminal_command", "open_url_in_browser", "get_current_time",

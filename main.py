@@ -708,7 +708,7 @@ While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask
 ### No elevation needed (Brain-local / cloud):
   web_search, search_and_summarize, recall_memory, save_memory_note, manage_task_plan,
   generate_free_image, generate_image, extract_pdf_context, analyze_uploaded_image,
-  get_current_time
+  modify_user_image, get_current_time
 
 ### Require Allow Control (client-intent tools — never host-mutating):
   read_file, write_file, create_directory, list_directory, run_terminal_command,
@@ -722,16 +722,18 @@ While RESTRICTED, still call the tool — it returns PERMISSION_DENIED; then ask
 - Paths: use ~ labels (e.g. ~/Desktop/...). NEVER invent /Users/yourusername.
 
 ## Uploaded file protocol (CRITICAL — extension routing)
-When a user uploads a file, inspect the file path extension. If it is a .pdf, use `extract_pdf_context`. If it is an image (.jpg, .jpeg, .png), use `analyze_uploaded_image`. NEVER use the PDF tool on image files.
-- Prefer paths like `/agent_data/uploads/<uuid>.ext` from the upload uplink.
-- Do NOT invent file or image contents. Call the matching tool first, then synthesize from RESULT.
-- For images, pass a clear `prompt` (what Sir asked about the picture).
+When a user uploads a file, inspect the file path extension.
+- If it is a .pdf, use `extract_pdf_context`.
+- If it is an image (.jpg, .jpeg, .png) and Sir asks to DESCRIBE, READ, or ANALYZE it, use `analyze_uploaded_image`.
+- If it is an image and Sir asks to EDIT, ENHANCE, CHANGE, or "make me look good", use `modify_user_image`.
+NEVER use the PDF tool on image files.
 
 ## Tool guide
 - Generate image → generate_free_image (or generate_image) | Research → search_and_summarize / web_search
 - After generate_free_image / generate_image, include the exact markdown ![Generated Image](/generated/…) in your reply so the HUD renders it with a DOWNLOAD control.
 - Also surface the **Image rubrics** table from the tool RESULT (CLIP/aesthetics/ImageReward-style training labels) and mention the `.rubric.json` sidecar path when present — useful for building preference datasets for other VLMs.
 - Uploaded PDF → extract_pdf_context | Uploaded image → analyze_uploaded_image
+- Edit / enhance / restyle an uploaded image → modify_user_image (local ComfyUI img2img)
 - Memory → recall_memory / save_memory_note | Tasks → manage_task_plan
 - Files/folders/shell/URL → corresponding tools (client intents only)
 - Math/code logic → execute_python_code (process-local; no host I/O)
